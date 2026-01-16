@@ -4,8 +4,12 @@ RAG Agent для поиска по базе знаний и интернету.
 """
 
 import os
+import pathlib
 from dotenv import load_dotenv
-load_dotenv('/home/admin/telegram_logger_bot/.env')
+
+# Ищем .env в директории скрипта или в текущей директории
+env_path = pathlib.Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path if env_path.exists() else None)
 
 import json
 import logging

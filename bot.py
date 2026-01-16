@@ -24,7 +24,10 @@ from rag_agent import process_rag_query, index_new_message
 from telegram.helpers import escape_markdown
 
 # Загружаем переменные окружения
-load_dotenv()
+# Ищем .env в директории скрипта или в текущей директории
+import pathlib
+env_path = pathlib.Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path if env_path.exists() else None)
 
 # Настройка логирования
 logging.basicConfig(
