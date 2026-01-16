@@ -21,6 +21,7 @@ from psycopg2 import sql
 from dotenv import load_dotenv
 import anthropic
 from rag_agent import process_rag_query, index_new_message
+from telegram.helpers import escape_markdown
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -1084,27 +1085,31 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Отправляем результат анализа в чат
         if media_analysis:
             try:
-                MAX_LENGTH = 4000
-                full_text = f"📄 Анализ документа:\n\n{media_analysis}"
+                lines = media_analysis.split('\n')
                 
-                parts = []
-                while len(full_text) > MAX_LENGTH:
-                    split_pos = full_text.rfind('\n', 0, MAX_LENGTH)
-                    if split_pos == -1:
-                        split_pos = full_text.rfind('. ', 0, MAX_LENGTH)
-                    if split_pos == -1:
-                        split_pos = MAX_LENGTH
-                    parts.append(full_text[:split_pos])
-                    full_text = full_text[split_pos:].lstrip()
-                if full_text:
-                    parts.append(full_text)
-                
-                for i, part in enumerate(parts):
-                    if len(parts) > 1:
-                        part = f"{part}\n\n[{i+1}/{len(parts)}]"
-                    await message.reply_text(part)
+                # Если анализ короткий — отправляем как есть
+                if len(lines) <= 5 or len(media_analysis) <= 500:
+                    await message.reply_text(f"📄 Анализ документа:\n\n{media_analysis}")
+                else:
+                    # Краткое резюме (первые 3 строки) + остальное в спойлере
+                    summary = '\n'.join(lines[:3])
+                    details = '\n'.join(lines[3:])
+                    
+                    # Ограничиваем длину
+                    if len(details) > 3500:
+                        details = details[:3500] + "..."
+                    
+                    formatted = f"📄 Анализ документа:\n\n{summary}\n\n▼ Подробнее (нажмите):\n<tg-spoiler>{details}</tg-spoiler>"
+                    
+                    await message.reply_text(formatted, parse_mode="HTML")
+                    
             except Exception as e:
                 logger.error(f"Ошибка отправки анализа: {e}")
+                # Fallback — отправляем без форматирования
+                try:
+                    await message.reply_text(f"📄 Анализ документа:\n\n{media_analysis[:4000]}")
+                except:
+                    pass
     
     text = message.text or message.caption or ""
     
