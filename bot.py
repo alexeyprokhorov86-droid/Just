@@ -273,6 +273,68 @@ def set_user_role(user_id: int, chat_id: int, role: str, username: str = None, f
     finally:
         conn.close()
 
+# ============================================================
+# НАСТРОЙКИ РАССЫЛКИ ПОЛНОГО АНАЛИЗА В ЛИЧКУ
+# ============================================================
+
+def get_user_analysis_setting(user_id: int) -> bool:
+    """Проверяет, включена ли у пользователя рассылка полного анализа."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT send_full_analysis 
+                FROM tg_full_analysis_settings 
+                WHERE user_id = %s
+            """, (user_id,))
+            row = cur.fetchone()
+            return row[0] if row else False
+    except Exception as e:
+        logger.error(f"Ошибка получения настройки анализа: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def set_user_analysis_setting(user_id: int, username: str, first_name: str, enabled: bool):
+    """Устанавливает настройку рассылки полного анализа."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tg_full_analysis_settings 
+                    (user_id, username, first_name, send_full_analysis, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    send_full_analysis = EXCLUDED.send_full_analysis,
+                    username = COALESCE(EXCLUDED.username, tg_full_analysis_settings.username),
+                    first_name = COALESCE(EXCLUDED.first_name, tg_full_analysis_settings.first_name),
+                    updated_at = NOW()
+            """, (user_id, username, first_name, enabled))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка установки настройки анализа: {e}")
+    finally:
+        conn.close()
+
+
+def get_users_with_full_analysis_enabled() -> list:
+    """Возвращает список user_id с включённой рассылкой."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id, username, first_name
+                FROM tg_full_analysis_settings 
+                WHERE send_full_analysis = TRUE
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка получения списка пользователей: {e}")
+        return []
+    finally:
+        conn.close()
+
 
 def get_users_without_roles(chat_id: int, table_name: str) -> list:
     """Получает список пользователей без ролей в чате."""
@@ -1085,42 +1147,74 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Отправляем результат анализа в чат
         if media_analysis:
             try:
-                lines = media_analysis.split('\n')
+                # Формируем краткий анализ (2-3 строки)
+                lines = [l for l in media_analysis.split('\n') if l.strip()]
+                summary = '\n'.join(lines[:3])
+                if len(summary) > 350:
+                    summary = summary[:350] + "..."
                 
-                # Если анализ короткий — отправляем как есть
-                if len(lines) <= 5 or len(media_analysis) <= 500:
-                    await message.reply_text(f"📄 Анализ документа:\n\n{media_analysis}")
-                else:
-                    # Краткое резюме (первые 3 строки)
-                    summary = '\n'.join(lines[:3])
-                    if len(summary) > 300:
-                        summary = summary[:300] + "..."
+                # В чат — только краткий анализ
+                filename = ""
+                if message.document and message.document.file_name:
+                    filename = f" ({message.document.file_name})"
+                
+                await message.reply_text(f"📄 Анализ{filename}:\n\n{summary}")
+                
+                # Рассылка полного анализа в личку тем, кто включил
+                if len(media_analysis) > 400:  # Только если есть что добавить
+                    chat_title = message.chat.title or "Чат"
+                    sender_name = message.from_user.first_name if message.from_user else "Неизвестный"
                     
-                    # Отправляем краткий ответ
-                    short_msg = await message.reply_text(
-                        f"📄 Анализ документа:\n\n{summary}\n\n⬇️ Полный анализ в ответе ниже"
+                    full_message = (
+                        f"📄 *Полный анализ документа*\n\n"
+                        f"📍 Чат: {chat_title}\n"
+                        f"👤 Отправил: {sender_name}\n"
+                        f"📎 Файл: {filename.strip(' ()') or message_type}\n\n"
+                        f"{media_analysis}"
                     )
                     
-                    # Отправляем полный анализ как reply на краткий
-                    full_text = f"📄 Полный анализ:\n\n{media_analysis}"
+                    # Получаем список пользователей этого чата с включённой рассылкой
+                    conn = get_db_connection()
+                    try:
+                        with conn.cursor() as cur:
+                            # Пользователи чата с включённой рассылкой
+                            cur.execute(sql.SQL("""
+                                SELECT DISTINCT m.user_id 
+                                FROM {} m
+                                JOIN tg_full_analysis_settings s ON m.user_id = s.user_id
+                                WHERE s.send_full_analysis = TRUE
+                                AND m.timestamp > NOW() - INTERVAL '30 days'
+                            """).format(sql.Identifier(table_name)))
+                            users_to_notify = [row[0] for row in cur.fetchall()]
+                    finally:
+                        conn.close()
                     
-                    # Разбиваем если слишком длинный
-                    if len(full_text) > 4000:
-                        parts = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
-                        for i, part in enumerate(parts):
-                            if i == 0:
-                                await short_msg.reply_text(part)
+                    # Отправляем в личку
+                    for uid in users_to_notify:
+                        try:
+                            # Разбиваем если слишком длинный
+                            if len(full_message) > 4000:
+                                parts = [full_message[i:i+4000] for i in range(0, len(full_message), 4000)]
+                                for i, part in enumerate(parts):
+                                    await context.bot.send_message(
+                                        chat_id=uid,
+                                        text=part if i == 0 else f"...продолжение:\n\n{part}",
+                                        parse_mode="Markdown"
+                                    )
                             else:
-                                await message.reply_text(f"{part}\n\n[{i+1}/{len(parts)}]")
-                    else:
-                        await short_msg.reply_text(full_text)
+                                await context.bot.send_message(
+                                    chat_id=uid,
+                                    text=full_message,
+                                    parse_mode="Markdown"
+                                )
+                        except Exception as e:
+                            logger.warning(f"Не удалось отправить анализ пользователю {uid}: {e}")
+                            # Если бот заблокирован — отключаем рассылку
+                            if "bot was blocked" in str(e).lower() or "chat not found" in str(e).lower():
+                                set_user_analysis_setting(uid, "", "", False)
                     
             except Exception as e:
                 logger.error(f"Ошибка отправки анализа: {e}")
-                try:
-                    await message.reply_text(f"📄 Анализ документа:\n\n{media_analysis[:4000]}")
-                except:
-                    pass
     
     text = message.text or message.caption or ""
     
@@ -1237,7 +1331,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Команды:\n"
             "/roles - показать пользователей без ролей\n"
             "/stats - статистика чата\n"
-            "/search <запрос> - поиск по сообщениям\n\n"
+            "/search <запрос> - поиск по сообщениям\n"
+            "/analysis - настройка рассылки полного анализа документов\n\n"
             "Добавь меня в групповой чат!"
         )
     else:
@@ -1489,6 +1584,79 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
 
+async def analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /analysis — управление рассылкой полного анализа документов в личку."""
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or ""
+    first_name = user.first_name or ""
+    
+    args = context.args
+    
+    if not args:
+        current = get_user_analysis_setting(user_id)
+        status = "✅ включена" if current else "❌ выключена"
+        await update.message.reply_text(
+            f"📄 *Рассылка полного анализа документов:* {status}\n\n"
+            f"Когда кто-то отправляет документ в чат, бот анализирует его.\n"
+            f"В чат приходит краткий анализ (2-3 строки).\n"
+            f"Если включено — полный анализ приходит вам в личку.\n\n"
+            f"Команды:\n"
+            f"`/analysis on` — включить\n"
+            f"`/analysis off` — выключить",
+            parse_mode="Markdown"
+        )
+        return
+    
+    action = args[0].lower()
+    
+    if action == 'on':
+        set_user_analysis_setting(user_id, username, first_name, True)
+        await update.message.reply_text(
+            "✅ Готово! Теперь полный анализ документов будет приходить вам в личные сообщения.\n\n"
+            "⚠️ Убедитесь, что вы начали диалог с ботом (напишите /start в личку боту)."
+        )
+        logger.info(f"Пользователь {first_name} ({user_id}) включил рассылку анализа")
+    
+    elif action == 'off':
+        set_user_analysis_setting(user_id, username, first_name, False)
+        await update.message.reply_text("❌ Рассылка полного анализа отключена.")
+        logger.info(f"Пользователь {first_name} ({user_id}) отключил рассылку анализа")
+    
+    else:
+        await update.message.reply_text(
+            "Используйте:\n"
+            "`/analysis on` — включить\n"
+            "`/analysis off` — выключить",
+            parse_mode="Markdown"
+        )
+
+
+async def analysis_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /analysis_list — показать кто включил рассылку (только для админа)."""
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Эта команда доступна только администратору.")
+        return
+    
+    users = get_users_with_full_analysis_enabled()
+    
+    if not users:
+        await update.message.reply_text("📭 Никто не включил рассылку полного анализа.")
+        return
+    
+    response = "📄 *Пользователи с включённой рассылкой анализа:*\n\n"
+    for uid, username, first_name in users:
+        name = first_name or username or str(uid)
+        username_str = f" (@{username})" if username else ""
+        response += f"• {name}{username_str}\n"
+    
+    response += f"\n*Всего:* {len(users)}"
+    
+    await update.message.reply_text(response, parse_mode="Markdown")
+    
+
 async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список всех логируемых чатов."""
     if update.message.chat.type != "private":
@@ -1610,6 +1778,8 @@ def main():
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("chats", chats_command))
+    application.add_handler(CommandHandler("analysis", analysis_command))
+    application.add_handler(CommandHandler("analysis_list", analysis_list_command))
 
     # RAG агент — обработка упоминаний бота (ПЕРЕД log_message!)
     application.add_handler(MessageHandler(
@@ -1636,11 +1806,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
