@@ -1341,7 +1341,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📝 Логирование сообщений\n"
             "🖼 Анализ документов с контекстом\n"
             "👥 Учёт ролей участников\n\n"
-            "Команды: /roles, /stats, /search"
+            "Команды: /roles, /stats, /search, /analysis"
         )
 
 
