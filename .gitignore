@@ -1,0 +1,36 @@
+# Переменные окружения (конфиденциально!)
+.env
+.env.local
+.env.*.local
+
+# Логи
+*.log
+watchdog.log
+watchdog_state.txt
+
+# Бэкапы
+backups/
+*.sql
+*.sql.gz
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
