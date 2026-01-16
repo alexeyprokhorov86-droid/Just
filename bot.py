@@ -1091,21 +1091,32 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if len(lines) <= 5 or len(media_analysis) <= 500:
                     await message.reply_text(f"📄 Анализ документа:\n\n{media_analysis}")
                 else:
-                    # Краткое резюме (первые 3 строки) + остальное в спойлере
+                    # Краткое резюме (первые 3 строки)
                     summary = '\n'.join(lines[:3])
-                    details = '\n'.join(lines[3:])
+                    if len(summary) > 300:
+                        summary = summary[:300] + "..."
                     
-                    # Ограничиваем длину
-                    if len(details) > 3500:
-                        details = details[:3500] + "..."
+                    # Отправляем краткий ответ
+                    short_msg = await message.reply_text(
+                        f"📄 Анализ документа:\n\n{summary}\n\n⬇️ Полный анализ в ответе ниже"
+                    )
                     
-                    formatted = f"📄 Анализ документа:\n\n{summary}\n\n▼ Подробнее (нажмите):\n<tg-spoiler>{details}</tg-spoiler>"
+                    # Отправляем полный анализ как reply на краткий
+                    full_text = f"📄 Полный анализ:\n\n{media_analysis}"
                     
-                    await message.reply_text(formatted, parse_mode="HTML")
+                    # Разбиваем если слишком длинный
+                    if len(full_text) > 4000:
+                        parts = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
+                        for i, part in enumerate(parts):
+                            if i == 0:
+                                await short_msg.reply_text(part)
+                            else:
+                                await message.reply_text(f"{part}\n\n[{i+1}/{len(parts)}]")
+                    else:
+                        await short_msg.reply_text(full_text)
                     
             except Exception as e:
                 logger.error(f"Ошибка отправки анализа: {e}")
-                # Fallback — отправляем без форматирования
                 try:
                     await message.reply_text(f"📄 Анализ документа:\n\n{media_analysis[:4000]}")
                 except:
