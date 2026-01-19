@@ -1177,18 +1177,16 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"{media_analysis}"
                     )
                     
-                    # Получаем список пользователей этого чата с включённой рассылкой
+                    # Получаем список всех пользователей с включённой рассылкой
                     conn = get_db_connection()
                     try:
                         with conn.cursor() as cur:
-                            # Пользователи чата с включённой рассылкой
-                            cur.execute(sql.SQL("""
-                                SELECT DISTINCT m.user_id 
-                                FROM {} m
-                                JOIN tg_full_analysis_settings s ON m.user_id = s.user_id
-                                WHERE s.send_full_analysis = TRUE
-                                AND m.timestamp > NOW() - INTERVAL '30 days'
-                            """).format(sql.Identifier(table_name)))
+                            # Все пользователи с включённой рассылкой (независимо от чата)
+                            cur.execute("""
+                                SELECT user_id
+                                FROM tg_full_analysis_settings
+                                WHERE send_full_analysis = TRUE
+                            """)
                             users_to_notify = [row[0] for row in cur.fetchall()]
                     finally:
                         conn.close()
@@ -1246,7 +1244,7 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Сохранено сообщение {message.message_id} ({message_type}) в {table_name}")
     
     # Проверяем, есть ли у пользователя роль
-    if message.from_user and ADMIN_USER_ID and message.from_user.id not in [1087968824, 136817688]:
+    if message.from_user and ADMIN_USER_ID and message.from_user.id != ADMIN_USER_ID:
         user_role = get_user_role(message.from_user.id, chat_id)
         if not user_role:
             # Запрашиваем роль у администратора (только для новых пользователей)
