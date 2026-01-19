@@ -128,6 +128,7 @@ def ensure_table_exists(chat_id: int, chat_title: str) -> str:
                     forward_from_user_id BIGINT,
                     media_file_id TEXT,
                     media_analysis TEXT,
+                    content_text TEXT,
                     timestamp TIMESTAMPTZ NOT NULL,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE(message_id)
@@ -149,7 +150,7 @@ def ensure_table_exists(chat_id: int, chat_title: str) -> str:
             ))
             
             cur.execute(sql.SQL("""
-                CREATE INDEX IF NOT EXISTS {} ON {} USING gin(to_tsvector('russian', COALESCE(message_text, '') || ' ' || COALESCE(media_analysis, '')))
+                CREATE INDEX IF NOT EXISTS {} ON {} USING gin(to_tsvector('russian', COALESCE(message_text, '') || ' ' || COALESCE(media_analysis, '') || ' ' || COALESCE(content_text, '')))
             """).format(
                 sql.Identifier(f"idx_{table_name}_fts"),
                 sql.Identifier(table_name)
@@ -218,15 +219,16 @@ def save_message(table_name: str, message_data: dict):
                 INSERT INTO {} (
                     message_id, user_id, username, first_name, last_name,
                     message_text, message_type, reply_to_message_id,
-                    forward_from_user_id, media_file_id, media_analysis, timestamp
+                    forward_from_user_id, media_file_id, media_analysis, content_text, timestamp
                 ) VALUES (
                     %(message_id)s, %(user_id)s, %(username)s, %(first_name)s, %(last_name)s,
                     %(message_text)s, %(message_type)s, %(reply_to_message_id)s,
-                    %(forward_from_user_id)s, %(media_file_id)s, %(media_analysis)s, %(timestamp)s
+                    %(forward_from_user_id)s, %(media_file_id)s, %(media_analysis)s, %(content_text)s, %(timestamp)s
                 )
                 ON CONFLICT (message_id) DO UPDATE SET
                     message_text = EXCLUDED.message_text,
-                    media_analysis = EXCLUDED.media_analysis
+                    media_analysis = EXCLUDED.media_analysis,
+                    content_text = EXCLUDED.content_text
             """).format(sql.Identifier(table_name)), message_data)
             conn.commit()
     finally:
@@ -562,6 +564,267 @@ def build_analysis_prompt(doc_type: str, doc_content: str, context: str, filenam
 Проанализируй документ:"""
     
     return prompt
+
+
+# ============================================================
+# ИЗВЛЕЧЕНИЕ ТЕКСТОВОГО СОДЕРЖИМОГО
+# ============================================================
+
+async def extract_text_from_image(image_data: bytes, media_type: str) -> str:
+    """Извлекает текст из изображения с помощью OCR через Claude Vision."""
+    if not claude_client:
+        return ""
+
+    try:
+        base64_image = base64.standard_b64encode(image_data).decode("utf-8")
+
+        # Используем Claude Vision для OCR
+        response = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": base64_image,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "Извлеки весь текст, который видишь на этом изображении. Верни только текст, без дополнительных комментариев. Если текста нет, верни пустую строку."
+                        }
+                    ],
+                }
+            ],
+        )
+
+        extracted_text = response.content[0].text.strip()
+        logger.info(f"Текст извлечен из изображения: {len(extracted_text)} символов")
+        return extracted_text
+
+    except Exception as e:
+        logger.error(f"Ошибка извлечения текста из изображения: {e}")
+        return ""
+
+
+async def extract_text_from_pdf(pdf_data: bytes) -> str:
+    """Извлекает текст из PDF файла."""
+    try:
+        # Пробуем извлечь текст напрямую
+        try:
+            import PyPDF2
+            import io
+
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_data))
+            text_parts = []
+
+            for page_num, page in enumerate(pdf_reader.pages[:50], 1):  # Максимум 50 страниц
+                page_text = page.extract_text()
+                if page_text.strip():
+                    text_parts.append(f"=== Страница {page_num} ===\n{page_text}")
+
+            if text_parts:
+                return "\n\n".join(text_parts)
+        except Exception as e:
+            logger.warning(f"PyPDF2 не смог извлечь текст: {e}")
+
+        # Если PyPDF2 не сработал, используем Claude Vision через pdf2image
+        try:
+            from pdf2image import convert_from_bytes
+            images = convert_from_bytes(pdf_data, first_page=1, last_page=20)
+
+            all_text = []
+            for i, image in enumerate(images, 1):
+                import io
+                img_byte_arr = io.BytesIO()
+                image.save(img_byte_arr, format='PNG')
+                img_bytes = img_byte_arr.getvalue()
+
+                page_text = await extract_text_from_image(img_bytes, "image/png")
+                if page_text:
+                    all_text.append(f"=== Страница {i} ===\n{page_text}")
+
+            return "\n\n".join(all_text)
+        except Exception as e:
+            logger.error(f"Не удалось извлечь текст через OCR: {e}")
+            return ""
+
+    except Exception as e:
+        logger.error(f"Ошибка извлечения текста из PDF: {e}")
+        return ""
+
+
+async def extract_text_from_word(file_data: bytes) -> str:
+    """Извлекает текст из Word документа."""
+    try:
+        import io
+        from docx import Document
+
+        doc = Document(io.BytesIO(file_data))
+
+        text_parts = []
+
+        # Извлекаем параграфы
+        for para in doc.paragraphs:
+            if para.text.strip():
+                text_parts.append(para.text)
+
+        # Извлекаем таблицы
+        for table in doc.tables:
+            table_text = []
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells)
+                if row_text.strip():
+                    table_text.append(row_text)
+            if table_text:
+                text_parts.append("\n" + "\n".join(table_text))
+
+        return "\n".join(text_parts)
+
+    except Exception as e:
+        logger.error(f"Ошибка извлечения текста из Word: {e}")
+        return ""
+
+
+async def extract_csv_from_excel(file_data: bytes, filename: str = "") -> str:
+    """Извлекает данные из Excel в формате CSV."""
+    try:
+        import io
+        is_xls = filename.lower().endswith('.xls') and not filename.lower().endswith('.xlsx')
+
+        csv_parts = []
+
+        if is_xls:
+            # Старый формат .xls
+            try:
+                import xlrd
+                wb = xlrd.open_workbook(file_contents=file_data)
+
+                for sheet_name in wb.sheet_names():
+                    sheet = wb.sheet_by_name(sheet_name)
+                    csv_parts.append(f"=== {sheet_name} ===")
+
+                    for row_idx in range(sheet.nrows):
+                        row_values = []
+                        for col_idx in range(sheet.ncols):
+                            cell_value = sheet.cell_value(row_idx, col_idx)
+                            # Экранируем значения для CSV
+                            if isinstance(cell_value, str) and (',' in cell_value or '"' in cell_value or '\n' in cell_value):
+                                cell_value = f'"{cell_value.replace(chr(34), chr(34)+chr(34))}"'
+                            row_values.append(str(cell_value) if cell_value else "")
+                        csv_parts.append(",".join(row_values))
+                    csv_parts.append("")  # Пустая строка между листами
+
+            except Exception as e:
+                logger.error(f"Ошибка чтения .xls: {e}")
+                return ""
+        else:
+            # Новый формат .xlsx
+            try:
+                from openpyxl import load_workbook
+                wb = load_workbook(io.BytesIO(file_data), read_only=True, data_only=True)
+
+                for sheet_name in wb.sheetnames:
+                    sheet = wb[sheet_name]
+                    csv_parts.append(f"=== {sheet_name} ===")
+
+                    for row in sheet.iter_rows(values_only=True):
+                        row_values = []
+                        for cell in row:
+                            # Экранируем значения для CSV
+                            cell_str = str(cell) if cell is not None else ""
+                            if ',' in cell_str or '"' in cell_str or '\n' in cell_str:
+                                cell_str = f'"{cell_str.replace(chr(34), chr(34)+chr(34))}"'
+                            row_values.append(cell_str)
+                        csv_parts.append(",".join(row_values))
+                    csv_parts.append("")  # Пустая строка между листами
+
+                wb.close()
+            except Exception as e:
+                logger.warning(f"openpyxl не смог открыть, пробуем xlrd: {e}")
+                try:
+                    import xlrd
+                    wb = xlrd.open_workbook(file_contents=file_data)
+
+                    for sheet_name in wb.sheet_names():
+                        sheet = wb.sheet_by_name(sheet_name)
+                        csv_parts.append(f"=== {sheet_name} ===")
+
+                        for row_idx in range(sheet.nrows):
+                            row_values = []
+                            for col_idx in range(sheet.ncols):
+                                cell_value = sheet.cell_value(row_idx, col_idx)
+                                if isinstance(cell_value, str) and (',' in cell_value or '"' in cell_value or '\n' in cell_value):
+                                    cell_value = f'"{cell_value.replace(chr(34), chr(34)+chr(34))}"'
+                                row_values.append(str(cell_value) if cell_value else "")
+                            csv_parts.append(",".join(row_values))
+                        csv_parts.append("")
+                except Exception as e2:
+                    logger.error(f"Ошибка чтения Excel обоими методами: {e2}")
+                    return ""
+
+        return "\n".join(csv_parts)
+
+    except Exception as e:
+        logger.error(f"Ошибка извлечения CSV из Excel: {e}")
+        return ""
+
+
+async def extract_text_from_pptx(file_data: bytes) -> str:
+    """Извлекает текст из PowerPoint презентации."""
+    try:
+        import io
+        from pptx import Presentation
+
+        prs = Presentation(io.BytesIO(file_data))
+
+        text_parts = []
+
+        for slide_num, slide in enumerate(prs.slides, 1):
+            slide_text = [f"=== Слайд {slide_num} ==="]
+
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_text.append(shape.text)
+
+                # Извлекаем текст из таблиц
+                if hasattr(shape, "table"):
+                    table = shape.table
+                    for row in table.rows:
+                        row_text = " | ".join(cell.text.strip() for cell in row.cells)
+                        if row_text:
+                            slide_text.append(row_text)
+
+            if len(slide_text) > 1:  # Если есть текст помимо заголовка
+                text_parts.append("\n".join(slide_text))
+
+        return "\n\n".join(text_parts)
+
+    except Exception as e:
+        logger.error(f"Ошибка извлечения текста из PowerPoint: {e}")
+        return ""
+
+
+async def extract_transcript_from_audio(audio_path: str) -> str:
+    """Извлекает транскрипт из аудио файла с помощью Whisper."""
+    try:
+        import whisper
+
+        model = whisper.load_model("base")
+        result = model.transcribe(audio_path, language="ru", fp16=False)
+
+        transcript = result.get("text", "").strip()
+        logger.info(f"Аудио транскрибировано: {len(transcript)} символов")
+        return transcript
+
+    except Exception as e:
+        logger.error(f"Ошибка транскрибирования аудио: {e}")
+        return ""
 
 
 # ============================================================
@@ -986,21 +1249,35 @@ async def analyze_video_with_whisper(file_data: bytes, filename: str = "", conte
 # ОБРАБОТКА МЕДИАФАЙЛОВ
 # ============================================================
 
-async def download_and_analyze_media(bot, message, table_name: str = None) -> tuple[str, str]:
-    """Скачивает и анализирует медиафайл с учётом контекста чата."""
+async def download_and_analyze_media(bot, message, table_name: str = None) -> tuple[str, str, str]:
+    """Скачивает и анализирует медиафайл с учётом контекста чата.
+
+    Возвращает: (media_type_str, media_analysis, content_text)
+    """
     media_analysis = ""
+    content_text = ""
     media_type_str = "media"
-    
+
     try:
         file = None
         media_type = None
         filename = ""
-        
+
         if message.photo:
             file = await bot.get_file(message.photo[-1].file_id)
             media_type = "image/jpeg"
             media_type_str = "photo"
             filename = "photo.jpg"
+        elif message.voice:
+            file = await bot.get_file(message.voice.file_id)
+            media_type = "voice"
+            media_type_str = "voice"
+            filename = "voice.ogg"
+        elif message.audio:
+            file = await bot.get_file(message.audio.file_id)
+            media_type = "audio"
+            media_type_str = "audio"
+            filename = message.audio.file_name or "audio.mp3"
         elif message.video:
             if message.video.file_size and message.video.file_size < 40 * 1024 * 1024:
                 file = await bot.get_file(message.video.file_id)
@@ -1009,12 +1286,12 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
                 filename = "video.mp4"
             else:
                 logger.warning("Видео слишком большое для анализа")
-                return "video", ""
+                return "video", "", ""
         elif message.document:
             doc = message.document
             filename = doc.file_name or ""
             filename_lower = filename.lower()
-            
+
             if doc.mime_type and doc.mime_type.startswith("image/"):
                 file = await bot.get_file(doc.file_id)
                 media_type = doc.mime_type
@@ -1042,54 +1319,102 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
                     media_type_str = "video"
                 else:
                     logger.warning("Видео слишком большое для анализа")
-                    return "video", ""
+                    return "video", "", ""
             else:
                 media_type_str = "document"
-                return media_type_str, ""
+                return media_type_str, "", ""
         else:
-            return media_type_str, ""
-        
+            return media_type_str, "", ""
+
         if not file:
-            return media_type_str, ""
-        
+            return media_type_str, "", ""
+
         # Скачиваем файл
         file_data = await file.download_as_bytearray()
-        
+
         # Получаем полный контекст чата (8 дней = 192 часа)
         context = ""
         if table_name and message.chat:
             chat_context = get_full_chat_context(
-                table_name, 
-                message.chat.id, 
-                message.chat.title or "Чат", 
+                table_name,
+                message.chat.id,
+                message.chat.title or "Чат",
                 192  # 8 дней
             )
             if chat_context:
                 context = chat_context
-        
+
         # Добавляем подпись если есть
         caption = message.caption or ""
         if caption:
             context += f"\n\n=== ПОДПИСЬ К ТЕКУЩЕМУ ФАЙЛУ ===\n{caption}"
-        
-        # Анализируем в зависимости от типа
-        if media_type == "application/pdf":
+
+        # Анализируем И извлекаем содержимое в зависимости от типа
+        if media_type == "voice" or media_type == "audio":
+            # Для голосовых сообщений и аудио - транскрибируем
+            import tempfile
+            suffix = '.ogg' if media_type == "voice" else '.mp3'
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(bytes(file_data))
+                audio_path = tmp.name
+            try:
+                content_text = await extract_transcript_from_audio(audio_path)
+
+                # Создаем анализ на основе транскрипта
+                if content_text:
+                    prompt = build_analysis_prompt(
+                        "Голосовое сообщение" if media_type == "voice" else "Аудио файл",
+                        f"Транскрипция:\n{content_text}",
+                        context,
+                        filename
+                    )
+
+                    if claude_client:
+                        response = claude_client.messages.create(
+                            model="claude-sonnet-4-20250514",
+                            max_tokens=2500,
+                            messages=[{"role": "user", "content": prompt}],
+                        )
+                        media_analysis = response.content[0].text
+                    else:
+                        media_analysis = f"Транскрипция: {content_text}"
+                else:
+                    media_analysis = "Не удалось распознать речь в аудио."
+            finally:
+                if os.path.exists(audio_path):
+                    os.unlink(audio_path)
+        elif media_type == "application/pdf":
             media_analysis = await analyze_pdf_with_claude(bytes(file_data), filename, context)
+            content_text = await extract_text_from_pdf(bytes(file_data))
         elif media_type and media_type.startswith("image/"):
             media_analysis = await analyze_image_with_claude(bytes(file_data), media_type, context, filename)
+            content_text = await extract_text_from_image(bytes(file_data), media_type)
         elif media_type == "excel":
             media_analysis = await analyze_excel_with_claude(bytes(file_data), filename, context)
+            content_text = await extract_csv_from_excel(bytes(file_data), filename)
         elif media_type == "word":
             media_analysis = await analyze_word_with_claude(bytes(file_data), filename, context)
+            content_text = await extract_text_from_word(bytes(file_data))
         elif media_type == "powerpoint":
             media_analysis = await analyze_pptx_with_claude(bytes(file_data), filename, context)
+            content_text = await extract_text_from_pptx(bytes(file_data))
         elif media_type == "video":
             media_analysis = await analyze_video_with_gemini(bytes(file_data), filename, context)
-        
+            # Для видео извлекаем транскрипт аудио
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+                tmp.write(bytes(file_data))
+                video_path = tmp.name
+            try:
+                content_text = await extract_transcript_from_audio(video_path)
+            finally:
+                if os.path.exists(video_path):
+                    os.unlink(video_path)
+
     except Exception as e:
         logger.error(f"Ошибка обработки медиа: {e}")
-    
-    return media_type_str, media_analysis
+
+    return media_type_str, media_analysis, content_text
 
 
 def determine_message_type(message) -> tuple[str, str | None]:
@@ -1143,8 +1468,9 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Анализируем медиа если есть
     media_analysis = ""
-    if message.photo or message.video or (message.document and (message.document.mime_type or message.document.file_name)):
-        analyzed_type, media_analysis = await download_and_analyze_media(context.bot, message, table_name)
+    content_text = ""
+    if message.photo or message.video or message.voice or message.audio or (message.document and (message.document.mime_type or message.document.file_name)):
+        analyzed_type, media_analysis, content_text = await download_and_analyze_media(context.bot, message, table_name)
         if analyzed_type != "media":
             message_type = analyzed_type
         
@@ -1232,13 +1558,14 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "forward_from_user_id": None,
         "media_file_id": media_file_id,
         "media_analysis": media_analysis,
+        "content_text": content_text,
         "timestamp": message.date
     }
-    
+
     save_message(table_name, message_data)
-    
-    # Индексируем для векторного поиска
-    content_for_index = (message_data.get("message_text") or "") + " " + (message_data.get("media_analysis") or "")
+
+    # Индексируем для векторного поиска (включая извлеченное содержимое)
+    content_for_index = (message_data.get("message_text") or "") + " " + (message_data.get("media_analysis") or "") + " " + (message_data.get("content_text") or "")
     if content_for_index.strip():
         await index_new_message(table_name, message_data["message_id"], content_for_index.strip())
     logger.info(f"Сохранено сообщение {message.message_id} ({message_type}) в {table_name}")

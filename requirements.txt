@@ -1,0 +1,20 @@
+# Telegram Bot
+python-telegram-bot>=20.0
+
+# Database
+psycopg2-binary
+
+# AI/ML
+anthropic
+openai-whisper
+PyPDF2
+
+# Document processing
+python-docx
+openpyxl
+xlrd
+python-pptx
+pdf2image
+
+# Utilities
+python-dotenv
