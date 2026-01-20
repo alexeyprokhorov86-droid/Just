@@ -468,6 +468,7 @@ def sync_mailbox(mailbox_id: int, email_addr: str, password: str, last_uid_inbox
                 except Exception as e:
                     logger.error(f"Error processing inbox {parsed.uid}: {e}")
                     stats['errors'] += 1
+                    conn_db.rollback()
             
             # Синхронизируем Sent
             sent_folder = find_sent_folder(conn_imap)
