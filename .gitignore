@@ -12,6 +12,10 @@ watchdog_state.txt
 backups/
 *.sql
 *.sql.gz
+*.1
+*.bak
+*.backup
+*.old
 
 # Python
 __pycache__/
