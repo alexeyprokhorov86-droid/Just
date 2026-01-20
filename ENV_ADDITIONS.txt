@@ -1,0 +1,105 @@
+# ============================================================
+# ДОПОЛНЕНИЯ К .env ДЛЯ EMAIL LOGGER
+# Добавить в твой существующий .env файл
+# ============================================================
+
+# ----- IMAP Settings (NIC.ru) -----
+IMAP_SERVER=imap.nicmail.ru
+IMAP_PORT=993
+
+# ----- Email Sync Settings -----
+SYNC_INTERVAL_MINUTES=5
+SYNC_BATCH_SIZE=50
+INITIAL_LOAD_DAYS=30
+
+# ----- Attachments Storage -----
+ATTACHMENTS_PATH=/var/email_logger/attachments
+
+# ----- Email Credentials -----
+# Формат: EMAIL_N=address,password
+# Заполни завтра когда соберёшь пароли
+
+# totsamiy.com (70 ящиков)
+EMAIL_1=1c-its@totsamiy.com,ПАРОЛЬ
+EMAIL_2=accountant_1@totsamiy.com,ПАРОЛЬ
+EMAIL_3=aho@totsamiy.com,ПАРОЛЬ
+EMAIL_4=assistant@totsamiy.com,ПАРОЛЬ
+EMAIL_5=brigadir1@totsamiy.com,ПАРОЛЬ
+EMAIL_6=brigadir2@totsamiy.com,ПАРОЛЬ
+EMAIL_7=business@totsamiy.com,ПАРОЛЬ
+EMAIL_8=cadri@totsamiy.com,ПАРОЛЬ
+EMAIL_9=chef@totsamiy.com,ПАРОЛЬ
+EMAIL_10=chop@totsamiy.com,ПАРОЛЬ
+EMAIL_11=control@totsamiy.com,ПАРОЛЬ
+EMAIL_12=controlling@totsamiy.com,ПАРОЛЬ
+EMAIL_13=directorprod@totsamiy.com,ПАРОЛЬ
+EMAIL_14=document1@totsamiy.com,ПАРОЛЬ
+EMAIL_15=document2@totsamiy.com,ПАРОЛЬ
+EMAIL_16=education@totsamiy.com,ПАРОЛЬ
+EMAIL_17=executive@totsamiy.com,ПАРОЛЬ
+EMAIL_18=factoring@totsamiy.com,ПАРОЛЬ
+EMAIL_19=fasovka@totsamiy.com,ПАРОЛЬ
+EMAIL_20=gaskov@totsamiy.com,ПАРОЛЬ
+EMAIL_21=glavbuh@totsamiy.com,ПАРОЛЬ
+EMAIL_22=glavtehnolog@totsamiy.com,ПАРОЛЬ
+EMAIL_23=grechkina@totsamiy.com,ПАРОЛЬ
+EMAIL_24=headzakupki@totsamiy.com,ПАРОЛЬ
+EMAIL_25=hr@totsamiy.com,ПАРОЛЬ
+EMAIL_26=ip@totsamiy.com,ПАРОЛЬ
+EMAIL_27=it@totsamiy.com,ПАРОЛЬ
+EMAIL_28=kachestvo@totsamiy.com,ПАРОЛЬ
+EMAIL_29=kivanov@totsamiy.com,ПАРОЛЬ
+EMAIL_30=konditer@totsamiy.com,ПАРОЛЬ
+EMAIL_31=kro@totsamiy.com,ПАРОЛЬ
+EMAIL_32=manager3@totsamiy.com,ПАРОЛЬ
+EMAIL_33=mm@totsamiy.com,ПАРОЛЬ
+EMAIL_34=nebula-zyxel@totsamiy.com,ПАРОЛЬ
+EMAIL_35=noreply@totsamiy.com,ПАРОЛЬ
+EMAIL_36=od@totsamiy.com,ПАРОЛЬ
+EMAIL_37=office@totsamiy.com,ПАРОЛЬ
+EMAIL_38=oper@totsamiy.com,ПАРОЛЬ
+EMAIL_39=operating@totsamiy.com,ПАРОЛЬ
+EMAIL_40=operator@totsamiy.com,ПАРОЛЬ
+EMAIL_41=podbor@totsamiy.com,ПАРОЛЬ
+EMAIL_42=postmaster@totsamiy.com,ПАРОЛЬ
+EMAIL_43=prescription@totsamiy.com,ПАРОЛЬ
+EMAIL_44=proizvodstvo@totsamiy.com,ПАРОЛЬ
+EMAIL_45=rukprod@totsamiy.com,ПАРОЛЬ
+EMAIL_46=sale@totsamiy.com,ПАРОЛЬ
+EMAIL_47=sale1@totsamiy.com,ПАРОЛЬ
+EMAIL_48=sale2@totsamiy.com,ПАРОЛЬ
+EMAIL_49=sb@totsamiy.com,ПАРОЛЬ
+EMAIL_50=scan@totsamiy.com,ПАРОЛЬ
+EMAIL_51=security@totsamiy.com,ПАРОЛЬ
+EMAIL_52=shiftsupervisor@totsamiy.com,ПАРОЛЬ
+EMAIL_53=shiftsupervisor1@totsamiy.com,ПАРОЛЬ
+EMAIL_54=sklad@totsamiy.com,ПАРОЛЬ
+EMAIL_55=sklad1@totsamiy.com,ПАРОЛЬ
+EMAIL_56=sverka@totsamiy.com,ПАРОЛЬ
+EMAIL_57=tehnolog@totsamiy.com,ПАРОЛЬ
+EMAIL_58=tehnolog1@totsamiy.com,ПАРОЛЬ
+EMAIL_59=tehnolog2@totsamiy.com,ПАРОЛЬ
+EMAIL_60=tehnolog3@totsamiy.com,ПАРОЛЬ
+EMAIL_61=tehnolog4@totsamiy.com,ПАРОЛЬ
+EMAIL_62=tehnolog5@totsamiy.com,ПАРОЛЬ
+EMAIL_63=tehnologg2@totsamiy.com,ПАРОЛЬ
+EMAIL_64=tikhonova@totsamiy.com,ПАРОЛЬ
+EMAIL_65=v.ryabov@totsamiy.com,ПАРОЛЬ
+EMAIL_66=zakaz1@totsamiy.com,ПАРОЛЬ
+EMAIL_67=zakupki1@totsamiy.com,ПАРОЛЬ
+EMAIL_68=zakupki2@totsamiy.com,ПАРОЛЬ
+EMAIL_69=zambuh@totsamiy.com,ПАРОЛЬ
+EMAIL_70=zavsklad@totsamiy.com,ПАРОЛЬ
+
+# lacannelle.ru (11 ящиков)
+EMAIL_71=aho@lacannelle.ru,ПАРОЛЬ
+EMAIL_72=alexey@lacannelle.ru,ПАРОЛЬ
+EMAIL_73=bot@lacannelle.ru,ПАРОЛЬ
+EMAIL_74=document@lacannelle.ru,ПАРОЛЬ
+EMAIL_75=irina@lacannelle.ru,ПАРОЛЬ
+EMAIL_76=postmaster@lacannelle.ru,ПАРОЛЬ
+EMAIL_77=sale@lacannelle.ru,ПАРОЛЬ
+EMAIL_78=tehnolog@lacannelle.ru,ПАРОЛЬ
+EMAIL_79=zakaz@lacannelle.ru,ПАРОЛЬ
+EMAIL_80=zakupki@lacannelle.ru,ПАРОЛЬ
+EMAIL_81=zakupki1@lacannelle.ru,ПАРОЛЬ

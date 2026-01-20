@@ -1,13 +1,19 @@
 #!/bin/bash
 
-# Настройки
-BACKUP_DIR="/home/admin/backups"
-DB_CONTAINER="knowledge_db"
-DB_NAME="knowledge_base"
-DB_USER="knowledge"
-BOT_TOKEN="8402954094:AAHV5LHFHO7w5ObkZqre9A0H3sMSBLuvXcQ"
-ADMIN_ID="805598873"
-DAYS_TO_KEEP=7
+# Загружаем переменные окружения из .env файла
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    export $(grep -v '^#' "$SCRIPT_DIR/.env" | xargs)
+fi
+
+# Настройки (берутся из .env или устанавливаются значения по умолчанию)
+BACKUP_DIR="${BACKUP_DIR:-$SCRIPT_DIR/backups}"
+DB_CONTAINER="${DB_CONTAINER:-knowledge_db}"
+DB_NAME="${DB_NAME:-knowledge_base}"
+DB_USER="${DB_USER:-knowledge}"
+BOT_TOKEN="${BOT_TOKEN}"
+ADMIN_USER_ID="${ADMIN_USER_ID}"
+DAYS_TO_KEEP="${BACKUP_DAYS_TO_KEEP:-7}"
 
 # Создаём папку если нет
 mkdir -p $BACKUP_DIR
@@ -35,14 +41,14 @@ if [ -f "$BACKUP_FILE" ] && [ -s "$BACKUP_FILE" ]; then
     
     # Отправляем уведомление об успехе (опционально, можно закомментировать)
     # curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-    #     -d "chat_id=$ADMIN_ID" \
+    #     -d "chat_id=$ADMIN_USER_ID" \
     #     -d "text=✅ Бэкап БД создан: $SIZE, всего бэкапов: $COUNT"
 else
     echo "[$(date)] ОШИБКА: Бэкап не создан!"
     
     # Отправляем алерт
     curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-        -d "chat_id=$ADMIN_ID" \
+        -d "chat_id=$ADMIN_USER_ID" \
         -d "text=🚨 ОШИБКА: Бэкап базы данных не создан!"
 fi
 

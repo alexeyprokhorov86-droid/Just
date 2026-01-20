@@ -7,11 +7,14 @@ import os
 import subprocess
 import requests
 import psycopg2
+import pathlib
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения
-load_dotenv('/home/admin/telegram_logger_bot/.env')
+# Ищем .env в директории скрипта или в текущей директории
+env_path = pathlib.Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path if env_path.exists() else None)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
@@ -21,9 +24,10 @@ DB_NAME = os.getenv("DB_NAME", "knowledge_base")
 DB_USER = os.getenv("DB_USER", "knowledge")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-# Файл для хранения состояния
-STATE_FILE = "/home/admin/telegram_logger_bot/watchdog_state.txt"
-LOG_FILE = "/home/admin/telegram_logger_bot/watchdog.log"
+# Файлы для хранения состояния (настраиваемые через env или в директории скрипта)
+SCRIPT_DIR = pathlib.Path(__file__).parent
+STATE_FILE = os.getenv("WATCHDOG_STATE_FILE", str(SCRIPT_DIR / "watchdog_state.txt"))
+LOG_FILE = os.getenv("WATCHDOG_LOG_FILE", str(SCRIPT_DIR / "watchdog.log"))
 
 def log(message: str):
     """Записывает в лог."""
