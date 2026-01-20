@@ -408,12 +408,24 @@ def find_or_create_thread(cur, parsed: ParsedEmail) -> int:
         if row:
             return row[0]
     
-    # 4. Создаём новую ветку
+    # 4. Сначала проверяем, есть ли уже ветка с таким thread_id
+    if parsed.message_id:
+        cur.execute("""
+            SELECT id FROM email_threads WHERE thread_id = %s
+        """, (parsed.message_id,))
+        row = cur.fetchone()
+        if row:
+            return row[0]
+    
+    # 5. Создаём новую ветку
     cur.execute("""
         INSERT INTO email_threads (
             thread_id, subject_normalized, started_at, last_message_at, message_count
         )
         VALUES (%s, %s, %s, %s, 1)
+        ON CONFLICT (thread_id) DO UPDATE SET
+            last_message_at = GREATEST(email_threads.last_message_at, EXCLUDED.last_message_at),
+            message_count = email_threads.message_count + 1
         RETURNING id
     """, (parsed.message_id, parsed.subject_normalized, parsed.received_at, parsed.received_at))
     
@@ -463,11 +475,13 @@ def sync_mailbox(mailbox_id: int, email_addr: str, password: str, last_uid_inbox
             for parsed in fetch_messages(conn_imap, "INBOX", uids):
                 try:
                     process_email(cur, parsed, mailbox_id, "INBOX", "inbound")
+                    conn_db.commit()
                     new_uid_inbox = max(new_uid_inbox, parsed.uid)
                     stats['inbox'] += 1
                 except Exception as e:
                     logger.error(f"Error processing inbox {parsed.uid}: {e}")
                     stats['errors'] += 1
+                    conn_db.rollback()
             
             # Синхронизируем Sent
             sent_folder = find_sent_folder(conn_imap)
@@ -480,11 +494,13 @@ def sync_mailbox(mailbox_id: int, email_addr: str, password: str, last_uid_inbox
                 for parsed in fetch_messages(conn_imap, sent_folder, uids):
                     try:
                         process_email(cur, parsed, mailbox_id, "Sent", "outbound")
+                        conn_db.commit()
                         new_uid_sent = max(new_uid_sent, parsed.uid)
                         stats['sent'] += 1
                     except Exception as e:
                         logger.error(f"Error processing sent {parsed.uid}: {e}")
                         stats['errors'] += 1
+                        conn_db.rollback()
             
             # Обновляем статус ящика
             cur.execute("""
@@ -644,3 +660,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
