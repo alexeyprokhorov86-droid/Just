@@ -1,0 +1,694 @@
+"""
+Telegram Bot для логирования сообщений из групповых чатов.
+Каждый чат сохраняется в отдельную таблицу.
++ Автоматический анализ изображений и PDF через Claude Vision
+
+Интеграция с существующей БД knowledge_base на VPS.
+"""
+
+import os
+import re
+import logging
+import base64
+import tempfile
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+import psycopg2
+from psycopg2 import sql
+from dotenv import load_dotenv
+import anthropic
+
+# Загружаем переменные окружения
+load_dotenv()
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# КОНФИГУРАЦИЯ
+# ============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+# Подключение к существующей БД knowledge_base
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "knowledge_base")
+DB_USER = os.getenv("DB_USER", "knowledge")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+# Инициализация Claude клиента
+claude_client = None
+if ANTHROPIC_API_KEY:
+    import httpx
+    proxy_url = os.getenv("PROXY_URL")
+    if proxy_url:
+        http_client = httpx.Client(proxy=proxy_url)
+        claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, http_client=http_client)
+        logger.info(f"Claude Vision активирован через прокси")
+    else:
+        claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        logger.info("Claude Vision активирован")
+    logger.info("Claude Vision активирован")
+else:
+    logger.warning("ANTHROPIC_API_KEY не установлен - анализ изображений отключён")
+
+
+# ============================================================
+# РАБОТА С БД
+# ============================================================
+
+def get_db_connection():
+    """Создаёт подключение к PostgreSQL."""
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+
+
+def sanitize_table_name(chat_id: int, chat_title: str) -> str:
+    """Создаёт безопасное имя таблицы из ID и названия чата."""
+    translit_map = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
+        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'
+    }
+    
+    title_lower = chat_title.lower()
+    transliterated = ''.join(translit_map.get(c, c) for c in title_lower)
+    safe_title = re.sub(r'[^a-z0-9]+', '_', transliterated)
+    safe_title = re.sub(r'_+', '_', safe_title).strip('_')
+    safe_title = safe_title[:30] if safe_title else "unnamed"
+    
+    return f"tg_chat_{abs(chat_id)}_{safe_title}"
+
+
+def ensure_table_exists(chat_id: int, chat_title: str) -> str:
+    """Создаёт таблицу для чата, если она не существует."""
+    table_name = sanitize_table_name(chat_id, chat_title)
+    
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("""
+                CREATE TABLE IF NOT EXISTS {} (
+                    id SERIAL PRIMARY KEY,
+                    message_id BIGINT NOT NULL,
+                    user_id BIGINT,
+                    username VARCHAR(255),
+                    first_name VARCHAR(255),
+                    last_name VARCHAR(255),
+                    message_text TEXT,
+                    message_type VARCHAR(50) DEFAULT 'text',
+                    reply_to_message_id BIGINT,
+                    forward_from_user_id BIGINT,
+                    media_file_id TEXT,
+                    media_analysis TEXT,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(message_id)
+                )
+            """).format(sql.Identifier(table_name)))
+            
+            cur.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {} ON {} (timestamp)
+            """).format(
+                sql.Identifier(f"idx_{table_name}_timestamp"),
+                sql.Identifier(table_name)
+            ))
+            
+            cur.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {} ON {} (user_id)
+            """).format(
+                sql.Identifier(f"idx_{table_name}_user_id"),
+                sql.Identifier(table_name)
+            ))
+            
+            # Полнотекстовый поиск
+            cur.execute(sql.SQL("""
+                CREATE INDEX IF NOT EXISTS {} ON {} USING gin(to_tsvector('russian', COALESCE(message_text, '') || ' ' || COALESCE(media_analysis, '')))
+            """).format(
+                sql.Identifier(f"idx_{table_name}_fts"),
+                sql.Identifier(table_name)
+            ))
+            
+            # Таблица метаданных
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tg_chats_metadata (
+                    chat_id BIGINT PRIMARY KEY,
+                    chat_title VARCHAR(255),
+                    table_name VARCHAR(100),
+                    chat_type VARCHAR(50),
+                    added_at TIMESTAMPTZ DEFAULT NOW(),
+                    last_message_at TIMESTAMPTZ,
+                    total_messages INTEGER DEFAULT 0
+                )
+            """)
+            
+            cur.execute("""
+                INSERT INTO tg_chats_metadata (chat_id, chat_title, table_name, chat_type, last_message_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    chat_title = EXCLUDED.chat_title,
+                    last_message_at = NOW()
+            """, (chat_id, chat_title, table_name, "group"))
+            
+            conn.commit()
+            logger.info(f"Таблица {table_name} готова для чата '{chat_title}'")
+            
+    finally:
+        conn.close()
+    
+    return table_name
+
+
+def save_message(table_name: str, message_data: dict):
+    """Сохраняет сообщение в таблицу чата."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("""
+                INSERT INTO {} (
+                    message_id, user_id, username, first_name, last_name,
+                    message_text, message_type, reply_to_message_id,
+                    forward_from_user_id, media_file_id, media_analysis, timestamp
+                ) VALUES (
+                    %(message_id)s, %(user_id)s, %(username)s, %(first_name)s, %(last_name)s,
+                    %(message_text)s, %(message_type)s, %(reply_to_message_id)s,
+                    %(forward_from_user_id)s, %(media_file_id)s, %(media_analysis)s, %(timestamp)s
+                )
+                ON CONFLICT (message_id) DO UPDATE SET
+                    message_text = EXCLUDED.message_text,
+                    media_analysis = EXCLUDED.media_analysis
+            """).format(sql.Identifier(table_name)), message_data)
+            conn.commit()
+    finally:
+        conn.close()
+
+
+# ============================================================
+# АНАЛИЗ ИЗОБРАЖЕНИЙ И PDF
+# ============================================================
+
+async def analyze_image_with_claude(image_data: bytes, media_type: str, caption: str = "") -> str:
+    """Анализирует изображение через Claude Vision."""
+    if not claude_client:
+        return ""
+    
+    try:
+        base64_image = base64.standard_b64encode(image_data).decode("utf-8")
+        
+        prompt = """Проанализируй это изображение и опиши его содержимое на русском языке.
+
+Если это документ (накладная, счёт, акт и т.д.):
+- Укажи тип документа
+- Извлеки ключевые данные: номер, дата, контрагент, суммы, товары/услуги
+- Кратко опиши суть документа
+
+Если это фото (товар, оборудование, люди, рабочий процесс):
+- Опиши что изображено
+- Укажи важные детали (количество, состояние, особенности)
+
+Если это скриншот:
+- Опиши содержимое экрана
+- Извлеки важную информацию
+
+Ответ должен быть кратким, информативным и полезным для поиска."""
+
+        if caption:
+            prompt += f"\n\nПодпись к изображению: {caption}"
+        
+        response = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": base64_image,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ],
+                }
+            ],
+        )
+        
+        analysis = response.content[0].text
+        logger.info(f"Изображение проанализировано: {len(analysis)} символов")
+        return analysis
+        
+    except Exception as e:
+        logger.error(f"Ошибка анализа изображения: {e}")
+        return ""
+
+
+async def analyze_pdf_with_claude(pdf_data: bytes, filename: str = "") -> str:
+    """Анализирует PDF через Claude."""
+    if not claude_client:
+        return ""
+    
+    try:
+        # Пробуем конвертировать PDF в изображения
+        try:
+            from pdf2image import convert_from_bytes
+            images = convert_from_bytes(pdf_data, first_page=1, last_page=5)  # Максимум 5 страниц
+        except Exception as e:
+            logger.warning(f"Не удалось конвертировать PDF в изображения: {e}")
+            # Отправляем PDF как документ
+            base64_pdf = base64.standard_b64encode(pdf_data).decode("utf-8")
+            
+            response = claude_client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1500,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": base64_pdf,
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": f"""Проанализируй этот PDF документ ({filename}) и опиши его содержимое на русском языке.
+
+Укажи:
+- Тип документа
+- Ключевые данные (номера, даты, суммы, контрагенты)
+- Краткое содержание
+
+Ответ должен быть информативным для поиска."""
+                            }
+                        ],
+                    }
+                ],
+            )
+            return response.content[0].text
+        
+        # Анализируем каждую страницу
+        all_analysis = []
+        for i, image in enumerate(images):
+            # Конвертируем в bytes
+            import io
+            img_byte_arr = io.BytesIO()
+            image.save(img_byte_arr, format='PNG')
+            img_bytes = img_byte_arr.getvalue()
+            
+            analysis = await analyze_image_with_claude(
+                img_bytes, 
+                "image/png", 
+                f"Страница {i+1} документа {filename}"
+            )
+            if analysis:
+                all_analysis.append(f"[Страница {i+1}]\n{analysis}")
+        
+        return "\n\n".join(all_analysis)
+        
+    except Exception as e:
+        logger.error(f"Ошибка анализа PDF: {e}")
+        return ""
+
+
+async def download_and_analyze_media(bot, message) -> tuple[str, str]:
+    """Скачивает и анализирует медиафайл."""
+    media_analysis = ""
+    media_type_str = "media"
+    
+    try:
+        file = None
+        media_type = None
+        filename = ""
+        
+        if message.photo:
+            file = await bot.get_file(message.photo[-1].file_id)
+            media_type = "image/jpeg"
+            media_type_str = "photo"
+        elif message.document:
+            doc = message.document
+            filename = doc.file_name or ""
+            
+            # Проверяем тип документа
+            if doc.mime_type and doc.mime_type.startswith("image/"):
+                file = await bot.get_file(doc.file_id)
+                media_type = doc.mime_type
+                media_type_str = "image"
+            elif doc.mime_type == "application/pdf" or filename.lower().endswith(".pdf"):
+                file = await bot.get_file(doc.file_id)
+                media_type = "application/pdf"
+                media_type_str = "pdf"
+            else:
+                # Другие документы пока не анализируем
+                media_type_str = "document"
+                return media_type_str, ""
+        else:
+            return media_type_str, ""
+        
+        if not file:
+            return media_type_str, ""
+        
+        # Скачиваем файл
+        file_data = await file.download_as_bytearray()
+        
+        # Анализируем
+        if media_type == "application/pdf":
+            media_analysis = await analyze_pdf_with_claude(bytes(file_data), filename)
+        elif media_type and media_type.startswith("image/"):
+            caption = message.caption or ""
+            media_analysis = await analyze_image_with_claude(bytes(file_data), media_type, caption)
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки медиа: {e}")
+    
+    return media_type_str, media_analysis
+
+
+# ============================================================
+# ОПРЕДЕЛЕНИЕ ТИПА СООБЩЕНИЯ
+# ============================================================
+
+def determine_message_type(message) -> tuple[str, str | None]:
+    """Определяет тип сообщения и file_id если есть медиа."""
+    if message.photo:
+        return "photo", message.photo[-1].file_id
+    elif message.video:
+        return "video", message.video.file_id
+    elif message.audio:
+        return "audio", message.audio.file_id
+    elif message.voice:
+        return "voice", message.voice.file_id
+    elif message.video_note:
+        return "video_note", message.video_note.file_id
+    elif message.document:
+        return "document", message.document.file_id
+    elif message.sticker:
+        return "sticker", message.sticker.file_id
+    elif message.animation:
+        return "animation", message.animation.file_id
+    elif message.location:
+        return "location", None
+    elif message.contact:
+        return "contact", None
+    elif message.poll:
+        return "poll", None
+    else:
+        return "text", None
+
+
+# ============================================================
+# ОБРАБОТЧИКИ СООБЩЕНИЙ
+# ============================================================
+
+async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для логирования всех сообщений."""
+    message = update.message or update.edited_message
+    
+    if not message or not message.chat:
+        return
+    
+    # Работаем только с групповыми чатами
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+    
+    chat_id = message.chat.id
+    chat_title = message.chat.title or f"Chat_{abs(chat_id)}"
+    
+    # Создаём таблицу если нужно
+    table_name = ensure_table_exists(chat_id, chat_title)
+    
+    # Определяем тип сообщения
+    message_type, media_file_id = determine_message_type(message)
+    
+    # Анализируем медиа если есть
+    media_analysis = ""
+    if message.photo or (message.document and message.document.mime_type):
+        analyzed_type, media_analysis = await download_and_analyze_media(context.bot, message)
+        if analyzed_type != "media":
+            message_type = analyzed_type
+        
+        # Отправляем результат анализа в чат
+        if media_analysis:
+            try:
+                analysis_preview = media_analysis[:500] + "..." if len(media_analysis) > 500 else media_analysis
+                await message.reply_text(
+                    f"📄 **Анализ документа:**\n\n{analysis_preview}",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка отправки анализа: {e}")
+    
+    # Собираем текст (включая подписи к медиа)
+    text = message.text or message.caption or ""
+    
+    # Данные для сохранения
+    message_data = {
+        "message_id": message.message_id,
+        "user_id": message.from_user.id if message.from_user else None,
+        "username": message.from_user.username if message.from_user else None,
+        "first_name": message.from_user.first_name if message.from_user else None,
+        "last_name": message.from_user.last_name if message.from_user else None,
+        "message_text": text,
+        "message_type": message_type,
+        "reply_to_message_id": message.reply_to_message.message_id if message.reply_to_message else None,
+        "forward_from_user_id": None,
+        "media_file_id": media_file_id,
+        "media_analysis": media_analysis,
+        "timestamp": message.date
+    }
+    
+    # Сохраняем
+    save_message(table_name, message_data)
+    logger.info(f"Сохранено сообщение {message.message_id} ({message_type}) в {table_name}")
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start."""
+    if update.message.chat.type == "private":
+        await update.message.reply_text(
+            "👋 Привет! Я бот для логирования сообщений.\n\n"
+            "📝 Сохраняю все сообщения в базу данных\n"
+            "🖼 Анализирую изображения и PDF через AI\n"
+            "🔍 Поддерживаю поиск по истории\n\n"
+            "Добавь меня в групповой чат!"
+        )
+    else:
+        await update.message.reply_text(
+            "✅ Бот активирован в этом чате.\n"
+            "📝 Логирование текста\n"
+            "🖼 Анализ изображений и PDF\n"
+            "🔍 Поиск: /search <запрос>"
+        )
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статистику по текущему чату."""
+    message = update.message
+    
+    if message.chat.type not in ["group", "supergroup"]:
+        await message.reply_text("Эта команда работает только в групповых чатах.")
+        return
+    
+    chat_id = message.chat.id
+    chat_title = message.chat.title or f"Chat_{abs(chat_id)}"
+    table_name = sanitize_table_name(chat_id, chat_title)
+    
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = %s
+                )
+            """, (table_name,))
+            
+            if not cur.fetchone()[0]:
+                await message.reply_text("📊 Пока нет данных для этого чата.")
+                return
+            
+            # Статистика
+            cur.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table_name)))
+            total_messages = cur.fetchone()[0]
+            
+            cur.execute(sql.SQL("SELECT COUNT(DISTINCT user_id) FROM {}").format(sql.Identifier(table_name)))
+            unique_users = cur.fetchone()[0]
+            
+            cur.execute(sql.SQL("""
+                SELECT COUNT(*) FROM {} WHERE message_type IN ('photo', 'pdf', 'image')
+            """).format(sql.Identifier(table_name)))
+            media_count = cur.fetchone()[0]
+            
+            cur.execute(sql.SQL("""
+                SELECT COUNT(*) FROM {} WHERE media_analysis IS NOT NULL AND media_analysis != ''
+            """).format(sql.Identifier(table_name)))
+            analyzed_count = cur.fetchone()[0]
+            
+            cur.execute(sql.SQL("""
+                SELECT COUNT(*) FROM {} WHERE timestamp::date = CURRENT_DATE
+            """).format(sql.Identifier(table_name)))
+            today_messages = cur.fetchone()[0]
+            
+            stats_text = (
+                f"📊 *Статистика чата*\n\n"
+                f"📝 Всего сообщений: {total_messages:,}\n"
+                f"👥 Участников: {unique_users}\n"
+                f"📅 Сегодня: {today_messages}\n"
+                f"🖼 Медиафайлов: {media_count}\n"
+                f"🤖 Проанализировано AI: {analyzed_count}"
+            )
+            
+            await message.reply_text(stats_text, parse_mode="Markdown")
+            
+    finally:
+        conn.close()
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Поиск по сообщениям в текущем чате."""
+    message = update.message
+    
+    if message.chat.type not in ["group", "supergroup"]:
+        await message.reply_text("Эта команда работает только в групповых чатах.")
+        return
+    
+    query = ' '.join(context.args) if context.args else None
+    
+    if not query:
+        await message.reply_text(
+            "🔍 Использование: /search <запрос>\n\n"
+            "Пример: /search накладная сахар"
+        )
+        return
+    
+    chat_id = message.chat.id
+    chat_title = message.chat.title or f"Chat_{abs(chat_id)}"
+    table_name = sanitize_table_name(chat_id, chat_title)
+    
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Поиск по тексту и анализу медиа
+            cur.execute(sql.SQL("""
+                SELECT 
+                    timestamp,
+                    COALESCE(first_name, username, 'Неизвестный') as author,
+                    message_type,
+                    LEFT(COALESCE(message_text, '') || ' ' || COALESCE(media_analysis, ''), 300) as content
+                FROM {}
+                WHERE to_tsvector('russian', COALESCE(message_text, '') || ' ' || COALESCE(media_analysis, '')) 
+                      @@ plainto_tsquery('russian', %s)
+                ORDER BY timestamp DESC
+                LIMIT 10
+            """).format(sql.Identifier(table_name)), (query,))
+            
+            results = cur.fetchall()
+            
+            if not results:
+                await message.reply_text(f"🔍 По запросу «{query}» ничего не найдено.")
+                return
+            
+            response = f"🔍 *Результаты поиска:* «{query}»\n\n"
+            for ts, author, msg_type, content in results:
+                date_str = ts.strftime("%d.%m.%Y %H:%M")
+                type_emoji = {"photo": "🖼", "pdf": "📄", "document": "📎"}.get(msg_type, "💬")
+                content_preview = content[:150] + "..." if len(content) > 150 else content
+                response += f"{type_emoji} {date_str} | *{author}*\n{content_preview}\n\n"
+            
+            await message.reply_text(response, parse_mode="Markdown")
+            
+    finally:
+        conn.close()
+
+
+async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список всех логируемых чатов."""
+    if update.message.chat.type != "private":
+        await update.message.reply_text("Эта команда доступна только в личных сообщениях.")
+        return
+    
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT chat_title, total_messages, last_message_at
+                FROM tg_chats_metadata
+                ORDER BY last_message_at DESC NULLS LAST
+                LIMIT 20
+            """)
+            chats = cur.fetchall()
+            
+            if not chats:
+                await update.message.reply_text("📭 Пока нет подключенных чатов.")
+                return
+            
+            response = "📋 *Логируемые чаты:*\n\n"
+            for title, total, last_msg in chats:
+                last_str = last_msg.strftime("%d.%m.%Y %H:%M") if last_msg else "—"
+                total = total or 0
+                response += f"• *{title}*\n  Сообщений: {total:,} | {last_str}\n\n"
+            
+            await update.message.reply_text(response, parse_mode="Markdown")
+            
+    finally:
+        conn.close()
+
+
+# ============================================================
+# ЗАПУСК
+# ============================================================
+
+def main():
+    """Запуск бота."""
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN не установлен в .env!")
+        return
+    
+    if not DB_PASSWORD:
+        logger.error("DB_PASSWORD не установлен в .env!")
+        return
+    
+    # Создаём приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Добавляем обработчики команд
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("chats", chats_command))
+    
+    # Обработчик для всех сообщений
+    application.add_handler(MessageHandler(
+        filters.ALL & ~filters.COMMAND,
+        log_message
+    ))
+    
+    # Запускаем
+    logger.info("🚀 Бот запущен. Логирование + анализ медиа активны.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
