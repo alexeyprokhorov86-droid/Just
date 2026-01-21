@@ -13,7 +13,7 @@ import os
 import re
 import logging
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import psycopg2
@@ -23,6 +23,8 @@ import anthropic
 from telegram.ext import CallbackQueryHandler
 from rag_agent import process_rag_query, index_new_message
 from telegram.helpers import escape_markdown
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # Загружаем переменные окружения
 # Ищем .env в директории скрипта или в текущей директории
@@ -53,6 +55,9 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 # ID администратора для запросов ролей (твой Telegram ID)
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+
+# Название группы для отложенного анализа документов
+DELAYED_ANALYSIS_CHAT = "Торты Отгрузки"
 
 # Инициализация Claude клиента
 claude_client = None
@@ -1445,6 +1450,107 @@ def determine_message_type(message) -> tuple[str, str | None]:
         return "text", None
 
 
+async def analyze_daily_documents(bot, chat_id: int, chat_title: str):
+    """Анализирует все документы за день для указанного чата.
+
+    Вызывается планировщиком в конце дня (23:55).
+    """
+    logger.info(f"Запуск анализа документов за день для чата {chat_title} ({chat_id})")
+
+    table_name = ensure_table_exists(chat_id, chat_title)
+
+    # Получаем все документы за сегодня без анализа
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Ищем документы за сегодня, которые не имеют анализа
+            cur.execute(f"""
+                SELECT message_id, media_file_id, message_text, message_type, timestamp
+                FROM {table_name}
+                WHERE DATE(timestamp) = CURRENT_DATE
+                AND message_type IN ('pdf', 'excel', 'word', 'powerpoint', 'document', 'photo')
+                AND (media_analysis IS NULL OR media_analysis = '')
+                ORDER BY timestamp
+            """)
+            documents = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not documents:
+        logger.info(f"Нет документов для анализа в чате {chat_title}")
+        return
+
+    logger.info(f"Найдено {len(documents)} документов для анализа в чате {chat_title}")
+
+    # Формируем сводный анализ всех документов за день
+    all_docs_info = []
+    for idx, (msg_id, file_id, caption, msg_type, timestamp) in enumerate(documents, 1):
+        time_str = timestamp.strftime("%H:%M")
+        doc_info = f"{idx}. Документ {msg_type} в {time_str}"
+        if caption:
+            doc_info += f": {caption[:100]}"
+        all_docs_info.append(doc_info)
+
+    # Получаем контекст чата за день
+    context = get_full_chat_context(table_name, chat_id, chat_title, 24)  # 24 часа
+
+    # Создаем сводный анализ
+    summary_prompt = f"""Проанализируй все документы, отправленные в чат "{chat_title}" за сегодня.
+
+=== СПИСОК ДОКУМЕНТОВ ЗА ДЕНЬ ===
+{chr(10).join(all_docs_info)}
+
+=== КОНТЕКСТ ЧАТА ЗА ДЕНЬ ===
+{context}
+
+Создай краткий сводный анализ всех документов:
+1. Общая тематика документов
+2. Ключевые данные и цифры
+3. Важные моменты и выводы
+4. Связь между документами (если есть)
+
+Анализ должен быть структурированным и информативным."""
+
+    try:
+        if claude_client:
+            response = claude_client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=3000,
+                messages=[{"role": "user", "content": summary_prompt}],
+            )
+            summary_analysis = response.content[0].text
+
+            # Сохраняем сводный анализ в БД для последнего документа дня
+            # (или можно создать отдельную таблицу для дневных отчетов)
+            conn = get_db_connection()
+            try:
+                with conn.cursor() as cur:
+                    # Обновляем последний документ дня со сводным анализом
+                    last_msg_id = documents[-1][0]
+                    cur.execute(f"""
+                        UPDATE {table_name}
+                        SET media_analysis = %s
+                        WHERE message_id = %s
+                    """, (f"📊 СВОДНЫЙ АНАЛИЗ ДОКУМЕНТОВ ЗА ДЕНЬ\n\n{summary_analysis}", last_msg_id))
+                    conn.commit()
+            finally:
+                conn.close()
+
+            # Отправляем сводный анализ в чат
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"📊 *Сводный анализ документов за {datetime.now().strftime('%d.%m.%Y')}*\n\n"
+                     f"Проанализировано документов: {len(documents)}\n\n"
+                     f"{summary_analysis}",
+                parse_mode="Markdown"
+            )
+
+            logger.info(f"Сводный анализ отправлен в чат {chat_title}")
+
+    except Exception as e:
+        logger.error(f"Ошибка при создании сводного анализа: {e}")
+
+
 # ============================================================
 # ОБРАБОТЧИКИ СООБЩЕНИЙ
 # ============================================================
@@ -1465,16 +1571,37 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     table_name = ensure_table_exists(chat_id, chat_title)
     
     message_type, media_file_id = determine_message_type(message)
-    
-    # Анализируем медиа если есть
+
+    # Проверяем, нужно ли отложить анализ для этой группы
+    is_delayed_chat = chat_title == DELAYED_ANALYSIS_CHAT
+
+    # Анализируем медиа если есть (кроме группы с отложенным анализом)
     media_analysis = ""
     content_text = ""
     if message.photo or message.video or message.voice or message.audio or (message.document and (message.document.mime_type or message.document.file_name)):
-        analyzed_type, media_analysis, content_text = await download_and_analyze_media(context.bot, message, table_name)
-        if analyzed_type != "media":
-            message_type = analyzed_type
-        
-        # Отправляем результат анализа в чат
+        # Для группы "Торты Отгрузки" не анализируем сразу - анализ будет в конце дня
+        if not is_delayed_chat:
+            analyzed_type, media_analysis, content_text = await download_and_analyze_media(context.bot, message, table_name)
+            if analyzed_type != "media":
+                message_type = analyzed_type
+        else:
+            # Для отложенного анализа просто определяем тип документа
+            if message.document:
+                doc = message.document
+                filename = doc.file_name or ""
+                filename_lower = filename.lower()
+                if doc.mime_type == "application/pdf" or filename_lower.endswith(".pdf"):
+                    message_type = "pdf"
+                elif filename_lower.endswith(('.xlsx', '.xls')):
+                    message_type = "excel"
+                elif filename_lower.endswith(('.docx', '.doc')):
+                    message_type = "word"
+                elif filename_lower.endswith(('.pptx', '.ppt')):
+                    message_type = "powerpoint"
+
+            logger.info(f"Документ {message_type} отложен для анализа в конце дня (чат: {chat_title})")
+
+        # Отправляем результат анализа в чат (только если анализ был выполнен)
         if media_analysis:
             try:
                 # Формируем краткий анализ (2-3 строки)
@@ -2662,17 +2789,83 @@ async def list_employees_command(update: Update, context: ContextTypes.DEFAULT_T
     
     await update.message.reply_text(text[:4000], parse_mode="Markdown")
 
+def get_chat_id_by_title(chat_title: str) -> int | None:
+    """Получает chat_id по названию чата из БД."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Получаем список всех таблиц чатов
+            cur.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                AND table_name LIKE 'chat_%'
+            """)
+            tables = [row[0] for row in cur.fetchall()]
+
+            # Ищем таблицу по названию чата
+            for table in tables:
+                try:
+                    # Проверяем название чата
+                    cur.execute(f"SELECT chat_id FROM {table} LIMIT 1")
+                    result = cur.fetchone()
+                    if result:
+                        chat_id = result[0]
+                        # Проверяем, соответствует ли название
+                        cur.execute("""
+                            SELECT EXISTS(
+                                SELECT 1 FROM chat_info
+                                WHERE chat_id = %s AND chat_title = %s
+                            )
+                        """, (chat_id, chat_title))
+                        if cur.fetchone()[0]:
+                            return chat_id
+                except Exception as e:
+                    logger.debug(f"Ошибка при проверке таблицы {table}: {e}")
+                    continue
+    finally:
+        conn.close()
+
+    return None
+
+
+async def scheduled_daily_analysis(application):
+    """Запланированный анализ документов в конце дня."""
+    chat_id = get_chat_id_by_title(DELAYED_ANALYSIS_CHAT)
+
+    if chat_id:
+        await analyze_daily_documents(application.bot, chat_id, DELAYED_ANALYSIS_CHAT)
+    else:
+        logger.warning(f"Чат '{DELAYED_ANALYSIS_CHAT}' не найден для анализа документов")
+
+
 def main():
     """Запуск бота."""
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не установлен в .env!")
         return
-    
+
     if not DB_PASSWORD:
         logger.error("DB_PASSWORD не установлен в .env!")
         return
-    
+
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # Инициализация планировщика для отложенного анализа документов
+    scheduler = AsyncIOScheduler()
+
+    # Добавляем задачу на 23:55 каждый день
+    scheduler.add_job(
+        scheduled_daily_analysis,
+        CronTrigger(hour=23, minute=55),
+        args=[application],
+        id='daily_document_analysis',
+        name='Ежедневный анализ документов для группы "Торты Отгрузки"',
+        replace_existing=True
+    )
+
+    scheduler.start()
+    logger.info(f"🕐 Планировщик запущен. Анализ документов для '{DELAYED_ANALYSIS_CHAT}' будет проводиться в 23:55")
     
     # Команды
     application.add_handler(CommandHandler("start", start_command))
