@@ -2852,9 +2852,11 @@ def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Инициализация планировщика для отложенного анализа документов
+    
     scheduler = AsyncIOScheduler()
-
+    
     # Добавляем задачу на 23:55 каждый день
+    
     scheduler.add_job(
         scheduled_daily_analysis,
         CronTrigger(hour=23, minute=55),
@@ -2863,9 +2865,13 @@ def main():
         name='Ежедневный анализ документов для группы "Торты Отгрузки"',
         replace_existing=True
     )
-
-    scheduler.start()
-    logger.info(f"🕐 Планировщик запущен. Анализ документов для '{DELAYED_ANALYSIS_CHAT}' будет проводиться в 23:55")
+    
+    # Запуск планировщика после инициализации event loop
+    async def post_init(app):
+        scheduler.start()
+        logger.info(f"🕐 Планировщик запущен. Анализ документов для '{DELAYED_ANALYSIS_CHAT}' будет проводиться в 23:55")
+    
+    application.post_init = post_init
     
     # Команды
     application.add_handler(CommandHandler("start", start_command))
