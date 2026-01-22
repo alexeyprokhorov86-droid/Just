@@ -1,13 +1,12 @@
 """
 RAG Agent для поиска по базе знаний и интернету.
-Включает SQL-поиск и векторный (семантический) поиск.
+Включает SQL-поиск и векторный (семантический) поиск с учётом свежести.
 """
 
 import os
 import pathlib
 from dotenv import load_dotenv
 
-# Ищем .env в директории скрипта или в текущей директории
 env_path = pathlib.Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path if env_path.exists() else None)
 
@@ -44,7 +43,6 @@ def get_db_connection():
 
 def clean_keywords(query: str) -> list:
     """Очищает ключевые слова от пунктуации."""
-    # Убираем запятые, точки и другую пунктуацию
     clean_query = re.sub(r'[,.:;!?()"\']', ' ', query)
     keywords = [w.strip() for w in clean_query.split() if len(w.strip()) > 2]
     return keywords if keywords else [query]
@@ -79,30 +77,43 @@ def search_telegram_chats_sql(query: str, limit: int = 10) -> list:
 
 
 def search_telegram_chats_vector(query: str, limit: int = 10) -> list:
-    """Векторный (семантический) поиск по чатам."""
+    """Векторный поиск по чатам с учётом свежести."""
     if not VECTOR_SEARCH_ENABLED:
         return []
     
     try:
-        vector_results = vector_search(query, limit=limit, source_type='telegram')
+        # Используем взвешенный поиск с учётом свежести
+        vector_results = vector_search_weighted(query, limit=limit, source_type='telegram')
         results = []
         for r in vector_results:
             chat_name = r['source_table'].replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
+            
+            date_str = ""
+            if r.get('timestamp'):
+                date_str = r['timestamp'].strftime("%d.%m.%Y %H:%M")
+            
             results.append({
                 "source": f"Чат: {chat_name}",
+                "date": date_str,
                 "content": r['content'][:1000],
                 "type": "text",
                 "similarity": r['similarity'],
+                "freshness": r.get('freshness', 0),
+                "final_score": r.get('final_score', r['similarity']),
                 "search_type": "vector"
             })
-        logger.info(f"Векторный поиск: {len(results)} результатов")
+        logger.info(f"Векторный поиск чатов: {len(results)} результатов")
         return results
     except Exception as e:
-        logger.error(f"Ошибка векторного поиска: {e}")
+        logger.error(f"Ошибка векторного поиска чатов: {e}")
         return []
+
 
 def search_emails_vector(query: str, limit: int = 10) -> list:
     """Семантический поиск по email с учётом свежести."""
+    if not VECTOR_SEARCH_ENABLED:
+        return []
+    
     results = []
     try:
         email_results = vector_search_weighted(query, limit=limit, source_type='email')
@@ -112,20 +123,31 @@ def search_emails_vector(query: str, limit: int = 10) -> list:
             if r.get("received_at"):
                 received_str = r["received_at"].strftime("%d.%m.%Y")
             
+            # Формируем читаемый контент
+            content_parts = []
+            if r.get("subject"):
+                content_parts.append(f"Тема: {r['subject']}")
+            if r.get("from_address"):
+                content_parts.append(f"От: {r['from_address']}")
+            content_parts.append(r["content"][:800])
+            
             results.append({
-                "content": r["content"],
+                "source": "Email",
+                "date": received_str,
+                "content": "\n".join(content_parts),
                 "subject": r.get("subject", ""),
                 "from_address": r.get("from_address", ""),
-                "received_at": received_str,
                 "similarity": r["similarity"],
                 "freshness": r.get("freshness", 0),
                 "final_score": r.get("final_score", r["similarity"]),
                 "search_type": "email_vector"
             })
+        logger.info(f"Векторный поиск email: {len(results)} результатов")
     except Exception as e:
         logger.error(f"Ошибка поиска email: {e}")
     
     return results
+
 
 def search_telegram_chats(query: str, limit: int = 10) -> list:
     """Комбинированный поиск по чатам."""
@@ -208,7 +230,6 @@ def search_1c_data(query: str, limit: int = 10) -> list:
     finally:
         conn.close()
     
-    # Собираем результаты: сначала цены, потом остальное
     results = prices[:limit]
     remaining = limit - len(results)
     if remaining > 0:
@@ -258,6 +279,7 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
         prices = [r for r in db_results if r.get('type') == 'price']
         other_1c = [r for r in db_results if r.get('source', '').startswith('1С') and r.get('type') != 'price']
         chats = [r for r in db_results if r.get('source', '').startswith('Чат')]
+        emails = [r for r in db_results if r.get('source', '').startswith('Email')]
         
         # Сначала закупочные цены (ПРИОРИТЕТ!)
         if prices:
@@ -275,8 +297,21 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
         if chats:
             context_parts.append("\n=== ИЗ ЧАТОВ ===")
             for i, res in enumerate(chats[:5], 1):
-                similarity_info = f" [релевантность: {res['similarity']:.0%}]" if 'similarity' in res else ""
-                context_parts.append(f"{i}.{similarity_info} {res['content'][:300]}")
+                score_info = ""
+                if 'final_score' in res:
+                    score_info = f" [релевантность: {res['final_score']:.0%}]"
+                elif 'similarity' in res:
+                    score_info = f" [релевантность: {res['similarity']:.0%}]"
+                date_info = f" ({res['date']})" if res.get('date') else ""
+                context_parts.append(f"{i}.{score_info}{date_info} {res['content'][:300]}")
+        
+        # Потом email
+        if emails:
+            context_parts.append("\n=== ИЗ EMAIL ===")
+            for i, res in enumerate(emails[:5], 1):
+                score_info = f" [релевантность: {res.get('final_score', res.get('similarity', 0)):.0%}]"
+                date_info = f" ({res['date']})" if res.get('date') else ""
+                context_parts.append(f"{i}.{score_info}{date_info} {res['content'][:400]}")
         
         # Интернет
         if web_results:
@@ -293,11 +328,12 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
 {context if context else "Ничего не найдено."}
 
 ВАЖНЫЕ ИНСТРУКЦИИ:
-1. ЗАКУПОЧНЫЕ ЦЕНЫ КОМПАНИИ — это РЕАЛЬНЫЕ цены по которым мы покупаем товар. Они в разделе "ЗАКУПОЧНЫЕ ЦЕНЫ КОМПАНИИ". ВСЕГДА указывай их в ответе!
+1. ЗАКУПОЧНЫЕ ЦЕНЫ КОМПАНИИ — это РЕАЛЬНЫЕ цены по которым мы покупаем товар. ВСЕГДА указывай их в ответе!
 2. Если спрашивают о цене "у нас" — это закупочные цены из 1С
 3. Если спрашивают о рыночных ценах — используй данные из интернета
-4. Указывай конкретные цифры: цену, дату, поставщика
-5. Не придумывай данные
+4. Данные из ЧАТОВ и EMAIL — это внутренняя переписка компании
+5. Указывай конкретные цифры: цену, дату, поставщика
+6. Не придумывай данные
 
 Ответ:"""
 
@@ -306,7 +342,6 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
         if "choices" in result:
             response_text = result["choices"][0]["message"]["content"]
             
-            # Добавляем ссылки в конец если есть
             if web_citations:
                 response_text += "\n\n📎 **Источники:**"
                 for i, url in enumerate(web_citations[:5], 1):
@@ -321,25 +356,24 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
 def classify_question(question: str) -> dict:
     """Классификация вопроса для выбора источников поиска."""
     if not ROUTERAI_API_KEY:
-        return {"search_1c": True, "search_chats": True, "search_web": False, "keywords": question, "priority": "1c"}
+        return {"search_1c": True, "search_chats": True, "search_email": True, "search_web": False, "keywords": question, "priority": "1c"}
     try:
         prompt = f"""Определи где искать информацию.
-Источники: 1С (цены, закупки, товары), Чаты (обсуждения), Интернет (внешнее).
+Источники: 1С (цены, закупки, товары), Чаты (обсуждения в Telegram), Email (переписка по почте), Интернет (внешняя информация).
 Извлеки 1-3 КЛЮЧЕВЫХ СЛОВА (существительные без запятых: сахар мука торт)
 
 Вопрос: {question}
 
-JSON: {{"search_1c": true/false, "search_chats": true/false, "search_web": true/false, "keywords": "слово1 слово2", "priority": "1c/chats/web"}}"""
+JSON: {{"search_1c": true/false, "search_chats": true/false, "search_email": true/false, "search_web": true/false, "keywords": "слово1 слово2", "priority": "1c/chats/email/web"}}"""
         response = requests.post(f"{ROUTERAI_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"}, json={"model": "google/gemini-3-flash-preview", "messages": [{"role": "user", "content": prompt}], "max_tokens": 200}, timeout=30)
         result = response.json()
         if "choices" in result:
-            import re
             match = re.search(r'\{[^}]+\}', result["choices"][0]["message"]["content"])
             if match:
                 return json.loads(match.group())
-        return {"search_1c": True, "search_chats": True, "search_web": False, "keywords": question, "priority": "1c"}
+        return {"search_1c": True, "search_chats": True, "search_email": True, "search_web": False, "keywords": question, "priority": "1c"}
     except:
-        return {"search_1c": True, "search_chats": True, "search_web": False, "keywords": question, "priority": "1c"}
+        return {"search_1c": True, "search_chats": True, "search_email": True, "search_web": False, "keywords": question, "priority": "1c"}
 
 
 async def process_rag_query(question: str, chat_context: str = "") -> str:
@@ -356,11 +390,17 @@ async def process_rag_query(question: str, chat_context: str = "") -> str:
         db_results.extend(c1_results)
         logger.info(f"Найдено в 1С: {len(c1_results)}")
     
-    # Поиск в чатах (векторный + SQL)
+    # Поиск в чатах (векторный с учётом свежести + SQL)
     if classification.get("search_chats", True):
         chat_results = search_telegram_chats(keywords, limit=10)
         db_results.extend(chat_results)
         logger.info(f"Найдено в чатах: {len(chat_results)}")
+    
+    # Поиск в email (векторный с учётом свежести)
+    if classification.get("search_email", True):
+        email_results = search_emails_vector(keywords, limit=10)
+        db_results.extend(email_results)
+        logger.info(f"Найдено в email: {len(email_results)}")
     
     logger.info(f"Всего в БД: {len(db_results)}")
     
@@ -373,7 +413,6 @@ async def process_rag_query(question: str, chat_context: str = "") -> str:
     return generate_response(question, db_results, web_results, web_citations, chat_context)
 
 
-# Функция для индексации новых сообщений (вызывается из bot.py)
 async def index_new_message(table_name: str, message_id: int, content: str):
     """Индексирует новое сообщение для векторного поиска."""
     if not VECTOR_SEARCH_ENABLED:
