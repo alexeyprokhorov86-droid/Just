@@ -236,6 +236,71 @@ def get_index_stats() -> Dict:
     finally:
         conn.close()
 
+def vector_search_weighted(query: str, limit: int = 10, source_type: Optional[str] = None, 
+                           freshness_weight: float = 0.25, decay_days: int = 90) -> List[Dict]:
+    """
+    Семантический поиск с учётом свежести (для email).
+    
+    Args:
+        query: Поисковый запрос
+        limit: Максимум результатов
+        source_type: Фильтр по типу источника
+        freshness_weight: Вес свежести (0.0-1.0), остальное - similarity
+        decay_days: За сколько дней freshness падает до ~0.37
+    
+    Returns:
+        Список результатов с полями: source_type, source_table, source_id, content, 
+        similarity, freshness, final_score, received_at
+    """
+    query_embedding = create_query_embedding(query)
+    similarity_weight = 1.0 - freshness_weight
+    
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            if source_type == 'email':
+                # Для email — взвешенный скоринг с учётом даты
+                cur.execute("""
+                    SELECT 
+                        e.source_type, 
+                        e.source_table, 
+                        e.source_id, 
+                        e.content,
+                        1 - (e.embedding <=> %s::vector) as similarity,
+                        EXP(-EXTRACT(EPOCH FROM (NOW() - em.received_at)) / (%s * 86400)) as freshness,
+                        (1 - (e.embedding <=> %s::vector)) * %s + 
+                        EXP(-EXTRACT(EPOCH FROM (NOW() - em.received_at)) / (%s * 86400)) * %s as final_score,
+                        em.received_at,
+                        em.subject,
+                        em.from_address
+                    FROM embeddings e
+                    JOIN email_messages em ON e.source_id = em.id
+                    WHERE e.source_type = 'email'
+                    ORDER BY final_score DESC
+                    LIMIT %s
+                """, (query_embedding, decay_days, query_embedding, similarity_weight, 
+                      decay_days, freshness_weight, limit))
+                
+                results = []
+                for row in cur.fetchall():
+                    results.append({
+                        "source_type": row[0],
+                        "source_table": row[1],
+                        "source_id": row[2],
+                        "content": row[3],
+                        "similarity": float(row[4]),
+                        "freshness": float(row[5]) if row[5] else 0,
+                        "final_score": float(row[6]) if row[6] else 0,
+                        "received_at": row[7],
+                        "subject": row[8],
+                        "from_address": row[9]
+                    })
+                return results
+            else:
+                # Для остальных — обычный поиск
+                return vector_search(query, limit, source_type)
+    finally:
+        conn.close()
 
 # CLI для запуска индексации
 if __name__ == "__main__":
