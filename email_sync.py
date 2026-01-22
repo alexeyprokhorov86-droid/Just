@@ -27,6 +27,7 @@ import pathlib
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import sql
+from email_embeddings import index_email_message
 
 # Загружаем переменные окружения
 env_path = pathlib.Path(__file__).parent / '.env'
@@ -548,6 +549,7 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         )
         ON CONFLICT (mailbox_id, folder, message_uid) DO NOTHING
+        RETURNING id
     """, (
         parsed.uid, parsed.message_id, parsed.in_reply_to, parsed.references,
         thread_id, mailbox_id, folder, direction,
@@ -555,6 +557,20 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
         parsed.subject, parsed.subject_normalized, parsed.body_text, parsed.body_html,
         parsed.has_attachments, parsed.received_at
     ))
+    
+    # Получаем ID нового сообщения
+    row = cur.fetchone()
+    if row:
+        email_id = row[0]
+        
+        # Индексируем для векторного поиска
+        combined_text = f"{parsed.subject or ''} {parsed.body_text or ''}"
+        if len(combined_text.strip()) >= 10:
+            try:
+                index_email_message(email_id, combined_text)
+                logger.debug(f"Indexed email {email_id}")
+            except Exception as e:
+                logger.warning(f"Email indexing failed for {email_id}: {e}")
     
     # Обновляем статистику ветки
     update_thread_stats(cur, thread_id, parsed)
