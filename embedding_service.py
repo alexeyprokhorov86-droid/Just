@@ -55,8 +55,6 @@ def create_embedding(text: str) -> List[float]:
     Для e5 моделей нужен префикс 'query: ' или 'passage: '
     """
     model = get_model()
-    # Для индексации документов используем 'passage: '
-    # Для поисковых запросов используем 'query: '
     embedding = model.encode(f"passage: {text}", normalize_embeddings=True)
     return embedding.tolist()
 
@@ -71,7 +69,7 @@ def create_query_embedding(text: str) -> List[float]:
 def index_telegram_message(source_table: str, source_id: int, content: str) -> bool:
     """Индексирует одно сообщение из Telegram."""
     if not content or len(content.strip()) < 10:
-        return False  # Слишком короткий текст
+        return False
     
     conn = get_db_connection()
     try:
@@ -105,7 +103,6 @@ def index_all_telegram_chats(batch_size: int = 100) -> Dict[str, int]:
     
     try:
         with conn.cursor() as cur:
-            # Получаем список всех таблиц чатов
             cur.execute("""
                 SELECT table_name FROM information_schema.tables 
                 WHERE table_schema = 'public' 
@@ -123,7 +120,6 @@ def index_all_telegram_chats(batch_size: int = 100) -> Dict[str, int]:
             
             try:
                 with conn.cursor() as cur:
-                    # Получаем сообщения, которые ещё не проиндексированы
                     cur.execute(sql.SQL("""
                         SELECT t.id, 
                                COALESCE(t.message_text, '') || ' ' || COALESCE(t.media_analysis, '') as content
@@ -150,7 +146,6 @@ def index_all_telegram_chats(batch_size: int = 100) -> Dict[str, int]:
                         else:
                             stats["skipped"] += 1
                         
-                        # Прогресс каждые 100 записей
                         if stats["indexed"] % 100 == 0:
                             logger.info(f"Проиндексировано: {stats['indexed']}")
                             
@@ -169,15 +164,7 @@ def index_all_telegram_chats(batch_size: int = 100) -> Dict[str, int]:
 
 def vector_search(query: str, limit: int = 10, source_type: Optional[str] = None) -> List[Dict]:
     """
-    Семантический поиск по эмбеддингам.
-    
-    Args:
-        query: Поисковый запрос
-        limit: Максимум результатов
-        source_type: Фильтр по типу источника ('telegram', 'email', '1c_nomenclature')
-    
-    Returns:
-        Список результатов с полями: source_type, source_table, source_id, content, similarity
+    Семантический поиск по эмбеддингам (без учёта свежести).
     """
     query_embedding = create_query_embedding(query)
     
@@ -217,40 +204,21 @@ def vector_search(query: str, limit: int = 10, source_type: Optional[str] = None
         conn.close()
 
 
-def get_index_stats() -> Dict:
-    """Возвращает статистику индекса."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT source_type, COUNT(*) as count
-                FROM embeddings
-                GROUP BY source_type
-            """)
-            by_type = {row[0]: row[1] for row in cur.fetchall()}
-            
-            cur.execute("SELECT COUNT(*) FROM embeddings")
-            total = cur.fetchone()[0]
-            
-            return {"total": total, "by_type": by_type}
-    finally:
-        conn.close()
-
 def vector_search_weighted(query: str, limit: int = 10, source_type: Optional[str] = None, 
                            freshness_weight: float = 0.25, decay_days: int = 90) -> List[Dict]:
     """
-    Семантический поиск с учётом свежести (для email).
+    Семантический поиск с учётом свежести.
     
     Args:
         query: Поисковый запрос
         limit: Максимум результатов
-        source_type: Фильтр по типу источника
+        source_type: Фильтр по типу источника ('telegram' или 'email')
         freshness_weight: Вес свежести (0.0-1.0), остальное - similarity
         decay_days: За сколько дней freshness падает до ~0.37
     
     Returns:
         Список результатов с полями: source_type, source_table, source_id, content, 
-        similarity, freshness, final_score, received_at
+        similarity, freshness, final_score, и дополнительные поля в зависимости от типа
     """
     query_embedding = create_query_embedding(query)
     similarity_weight = 1.0 - freshness_weight
@@ -259,7 +227,7 @@ def vector_search_weighted(query: str, limit: int = 10, source_type: Optional[st
     try:
         with conn.cursor() as cur:
             if source_type == 'email':
-                # Для email — взвешенный скоринг с учётом даты
+                # Для email — JOIN с email_messages
                 cur.execute("""
                     SELECT 
                         e.source_type, 
@@ -296,11 +264,97 @@ def vector_search_weighted(query: str, limit: int = 10, source_type: Optional[st
                         "from_address": row[9]
                     })
                 return results
+            
+            elif source_type == 'telegram':
+                # Для telegram — JOIN с таблицами чатов через source_table
+                # Сначала получаем кандидатов по similarity
+                cur.execute("""
+                    SELECT 
+                        e.source_type, 
+                        e.source_table, 
+                        e.source_id, 
+                        e.content,
+                        1 - (e.embedding <=> %s::vector) as similarity,
+                        e.created_at
+                    FROM embeddings e
+                    WHERE e.source_type = 'telegram'
+                    ORDER BY e.embedding <=> %s::vector
+                    LIMIT %s
+                """, (query_embedding, query_embedding, limit * 3))
+                
+                candidates = cur.fetchall()
+                results = []
+                
+                for row in candidates:
+                    source_table = row[1]
+                    source_id = row[2]
+                    similarity = float(row[4])
+                    
+                    # Получаем timestamp из таблицы чата
+                    try:
+                        cur.execute(sql.SQL("""
+                            SELECT timestamp FROM {} WHERE id = %s
+                        """).format(sql.Identifier(source_table)), (source_id,))
+                        timestamp_row = cur.fetchone()
+                        
+                        if timestamp_row and timestamp_row[0]:
+                            # Вычисляем freshness
+                            cur.execute("""
+                                SELECT EXP(-EXTRACT(EPOCH FROM (NOW() - %s)) / (%s * 86400))
+                            """, (timestamp_row[0], decay_days))
+                            freshness = float(cur.fetchone()[0])
+                            final_score = similarity * similarity_weight + freshness * freshness_weight
+                            timestamp = timestamp_row[0]
+                        else:
+                            freshness = 0.5
+                            final_score = similarity * similarity_weight + freshness * freshness_weight
+                            timestamp = None
+                    except:
+                        freshness = 0.5
+                        final_score = similarity * similarity_weight + freshness * freshness_weight
+                        timestamp = None
+                    
+                    results.append({
+                        "source_type": row[0],
+                        "source_table": source_table,
+                        "source_id": source_id,
+                        "content": row[3],
+                        "similarity": similarity,
+                        "freshness": freshness,
+                        "final_score": final_score,
+                        "timestamp": timestamp
+                    })
+                
+                # Сортируем по final_score и берём top-N
+                results.sort(key=lambda x: x['final_score'], reverse=True)
+                return results[:limit]
+            
             else:
-                # Для остальных — обычный поиск
+                # Для остальных — обычный поиск без взвешивания
                 return vector_search(query, limit, source_type)
     finally:
         conn.close()
+
+
+def get_index_stats() -> Dict:
+    """Возвращает статистику индекса."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT source_type, COUNT(*) as count
+                FROM embeddings
+                GROUP BY source_type
+            """)
+            by_type = {row[0]: row[1] for row in cur.fetchall()}
+            
+            cur.execute("SELECT COUNT(*) FROM embeddings")
+            total = cur.fetchone()[0]
+            
+            return {"total": total, "by_type": by_type}
+    finally:
+        conn.close()
+
 
 # CLI для запуска индексации
 if __name__ == "__main__":
