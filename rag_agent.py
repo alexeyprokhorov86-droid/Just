@@ -30,7 +30,7 @@ ROUTERAI_BASE_URL = os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1")
 
 # Импорт векторного поиска
 try:
-    from embedding_service import vector_search, index_telegram_message
+    from embedding_service import vector_search, vector_search_weighted, index_telegram_message
     VECTOR_SEARCH_ENABLED = True
     logger.info("Векторный поиск включен")
 except ImportError:
@@ -101,6 +101,31 @@ def search_telegram_chats_vector(query: str, limit: int = 10) -> list:
         logger.error(f"Ошибка векторного поиска: {e}")
         return []
 
+def search_emails_vector(query: str, limit: int = 10) -> list:
+    """Семантический поиск по email с учётом свежести."""
+    results = []
+    try:
+        email_results = vector_search_weighted(query, limit=limit, source_type='email')
+        
+        for r in email_results:
+            received_str = ""
+            if r.get("received_at"):
+                received_str = r["received_at"].strftime("%d.%m.%Y")
+            
+            results.append({
+                "content": r["content"],
+                "subject": r.get("subject", ""),
+                "from_address": r.get("from_address", ""),
+                "received_at": received_str,
+                "similarity": r["similarity"],
+                "freshness": r.get("freshness", 0),
+                "final_score": r.get("final_score", r["similarity"]),
+                "search_type": "email_vector"
+            })
+    except Exception as e:
+        logger.error(f"Ошибка поиска email: {e}")
+    
+    return results
 
 def search_telegram_chats(query: str, limit: int = 10) -> list:
     """Комбинированный поиск по чатам."""
