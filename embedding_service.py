@@ -92,6 +92,31 @@ def index_telegram_message(source_table: str, source_id: int, content: str) -> b
     finally:
         conn.close()
 
+def index_email_message(email_id: int, content: str) -> bool:
+    """Индексирует одно email сообщение."""
+    if not content or len(content.strip()) < 10:
+        return False
+    
+    conn = get_db_connection()
+    try:
+        embedding = create_embedding(content)
+        
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO embeddings (source_type, source_table, source_id, content, embedding)
+                VALUES ('email', 'email_messages', %s, %s, %s)
+                ON CONFLICT (source_table, source_id) 
+                DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding
+            """, (email_id, content[:5000], embedding))
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка индексации email: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
 
 def index_all_telegram_chats(batch_size: int = 100) -> Dict[str, int]:
     """
