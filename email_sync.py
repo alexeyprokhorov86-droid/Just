@@ -27,7 +27,7 @@ import pathlib
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import sql
-from email_embeddings import index_email_message
+from embedding_service import index_email_message
 
 # Загружаем переменные окружения
 env_path = pathlib.Path(__file__).parent / '.env'
