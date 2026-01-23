@@ -2794,38 +2794,19 @@ def get_chat_id_by_title(chat_title: str) -> int | None:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # Получаем список всех таблиц чатов
             cur.execute("""
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema = 'public'
-                AND table_name LIKE 'chat_%'
-            """)
-            tables = [row[0] for row in cur.fetchall()]
-
-            # Ищем таблицу по названию чата
-            for table in tables:
-                try:
-                    # Проверяем название чата
-                    cur.execute(f"SELECT chat_id FROM {table} LIMIT 1")
-                    result = cur.fetchone()
-                    if result:
-                        chat_id = result[0]
-                        # Проверяем, соответствует ли название
-                        cur.execute("""
-                            SELECT EXISTS(
-                                SELECT 1 FROM chat_info
-                                WHERE chat_id = %s AND chat_title = %s
-                            )
-                        """, (chat_id, chat_title))
-                        if cur.fetchone()[0]:
-                            return chat_id
-                except Exception as e:
-                    logger.debug(f"Ошибка при проверке таблицы {table}: {e}")
-                    continue
+                SELECT chat_id FROM tg_chats_metadata
+                WHERE chat_title = %s
+                ORDER BY last_message_at DESC
+                LIMIT 1
+            """, (chat_title,))
+            result = cur.fetchone()
+            if result:
+                return result[0]
+    except Exception as e:
+        logger.error(f"Ошибка получения chat_id для '{chat_title}': {e}")
     finally:
         conn.close()
-
     return None
 
 
