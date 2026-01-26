@@ -16,6 +16,7 @@ import requests
 import psycopg2
 from psycopg2 import sql
 import re
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,110 @@ def clean_keywords(query: str) -> list:
     keywords = [w.strip() for w in clean_query.split() if len(w.strip()) > 2]
     return keywords if keywords else [query]
 
+def extract_time_context(question: str) -> dict:
+    """
+    Извлекает временной контекст из запроса.
+    
+    Если в запросе указан период (за последний месяц, вчера, в январе) —
+    настраивает параметры поиска под этот период.
+    
+    Если период не указан — использует decay_days=90 по умолчанию.
+    """
+    question_lower = question.lower()
+    now = datetime.now()
+    
+    result = {
+        "has_time_filter": False,
+        "date_from": None,
+        "date_to": None,
+        "decay_days": 90,  # По умолчанию 90 дней
+        "freshness_weight": 0.25  # По умолчанию
+    }
+    
+    # Паттерны для "за последний/последние N дней/недель/месяцев"
+    patterns = [
+        # "за последний месяц", "за последние 2 месяца"
+        (r'за последн(?:ий|ие|юю|ее)?\s*(\d+)?\s*месяц', lambda m: int(m.group(1) or 1) * 30),
+        (r'за (\d+)\s*месяц', lambda m: int(m.group(1)) * 30),
+        
+        # "за последнюю неделю", "за последние 2 недели"  
+        (r'за последн(?:ий|ие|юю|ее)?\s*(\d+)?\s*недел', lambda m: int(m.group(1) or 1) * 7),
+        (r'за (\d+)\s*недел', lambda m: int(m.group(1)) * 7),
+        
+        # "за последний день", "за последние 3 дня"
+        (r'за последн(?:ий|ие|юю|ее)?\s*(\d+)?\s*(?:день|дня|дней)', lambda m: int(m.group(1) or 1)),
+        (r'за (\d+)\s*(?:день|дня|дней)', lambda m: int(m.group(1))),
+        
+        # "за последний год"
+        (r'за последн(?:ий|ие|юю|ее)?\s*год', lambda m: 365),
+        (r'за год', lambda m: 365),
+        
+        # "за последний квартал"
+        (r'за последн(?:ий|ие|юю|ее)?\s*квартал', lambda m: 90),
+        (r'за квартал', lambda m: 90),
+        
+        # "вчера"
+        (r'\bвчера\b', lambda m: 2),
+        
+        # "сегодня"
+        (r'\bсегодня\b', lambda m: 1),
+        
+        # "на этой неделе"
+        (r'на этой неделе', lambda m: 7),
+        (r'на прошлой неделе', lambda m: 14),
+        
+        # "в этом месяце"
+        (r'в этом месяце', lambda m: now.day),
+        (r'в прошлом месяце', lambda m: 60),
+        
+        # "недавно" - используем 14 дней
+        (r'\bнедавно\b', lambda m: 14),
+        
+        # "в последнее время" - 30 дней
+        (r'в последнее время', lambda m: 30),
+    ]
+    
+    for pattern, days_func in patterns:
+        match = re.search(pattern, question_lower)
+        if match:
+            result["has_time_filter"] = True
+            result["decay_days"] = days_func(match)
+            result["date_from"] = now - timedelta(days=result["decay_days"])
+            result["date_to"] = now
+            # Если указан конкретный период — увеличиваем вес свежести
+            result["freshness_weight"] = 0.4
+            break
+    
+    # Паттерны для конкретных месяцев: "в январе", "в январе 2025"
+    months = {
+        'январ': 1, 'феврал': 2, 'март': 3, 'апрел': 4,
+        'мае': 5, 'мая': 5, 'май': 5, 'июн': 6, 'июл': 7, 'август': 8,
+        'сентябр': 9, 'октябр': 10, 'ноябр': 11, 'декабр': 12
+    }
+    
+    if not result["has_time_filter"]:
+        for month_pattern, month_num in months.items():
+            match = re.search(rf'в\s+{month_pattern}\w*\s*(\d{{4}})?', question_lower)
+            if match:
+                year = int(match.group(1)) if match.group(1) else now.year
+                # Если месяц в будущем этого года — берём прошлый год
+                if month_num > now.month and year == now.year:
+                    year -= 1
+                
+                # Первый день месяца
+                result["date_from"] = datetime(year, month_num, 1)
+                # Последний день месяца
+                if month_num == 12:
+                    result["date_to"] = datetime(year + 1, 1, 1) - timedelta(days=1)
+                else:
+                    result["date_to"] = datetime(year, month_num + 1, 1) - timedelta(days=1)
+                
+                result["has_time_filter"] = True
+                result["decay_days"] = (now - result["date_from"]).days or 30
+                result["freshness_weight"] = 0.5  # Точный период — высокий вес
+                break
+    
+    return result
 
 def search_telegram_chats_sql(query: str, limit: int = 10) -> list:
     """SQL-поиск по чатам (точное совпадение слов)."""
@@ -76,99 +181,130 @@ def search_telegram_chats_sql(query: str, limit: int = 10) -> list:
     return results[:limit]
 
 
-def search_telegram_chats_vector(query: str, limit: int = 10) -> list:
-    """Векторный поиск по чатам с учётом свежести."""
+def search_telegram_chats_vector(query: str, limit: int = 10, time_context: dict = None) -> list:
+    """Векторный (семантический) поиск по чатам с учётом свежести."""
     if not VECTOR_SEARCH_ENABLED:
         return []
     
+    # Получаем параметры времени
+    if time_context is None:
+        time_context = extract_time_context(query)
+    
+    decay_days = time_context.get("decay_days", 90)
+    freshness_weight = time_context.get("freshness_weight", 0.25)
+    
     try:
         # Используем взвешенный поиск с учётом свежести
-        vector_results = vector_search_weighted(query, limit=limit, source_type='telegram')
+        vector_results = vector_search_weighted(
+            query, 
+            limit=limit, 
+            source_type='telegram',
+            freshness_weight=freshness_weight,
+            decay_days=decay_days
+        )
+        
         results = []
         for r in vector_results:
             chat_name = r['source_table'].replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
             
-            date_str = ""
-            if r.get('timestamp'):
-                date_str = r['timestamp'].strftime("%d.%m.%Y %H:%M")
-            
-            results.append({
+            result = {
                 "source": f"Чат: {chat_name}",
-                "date": date_str,
                 "content": r['content'][:1000],
                 "type": "text",
-                "similarity": r['similarity'],
+                "similarity": r.get('similarity', 0),
                 "freshness": r.get('freshness', 0),
-                "final_score": r.get('final_score', r['similarity']),
+                "final_score": r.get('final_score', r.get('similarity', 0)),
                 "search_type": "vector"
-            })
-        logger.info(f"Векторный поиск чатов: {len(results)} результатов")
+            }
+            
+            # Добавляем дату если есть
+            if r.get('timestamp'):
+                result["date"] = r['timestamp'].strftime("%d.%m.%Y %H:%M")
+            
+            results.append(result)
+        
+        logger.info(f"Векторный поиск (decay={decay_days}d, fw={freshness_weight}): {len(results)} результатов")
         return results
+        
     except Exception as e:
-        logger.error(f"Ошибка векторного поиска чатов: {e}")
+        logger.error(f"Ошибка векторного поиска: {e}")
         return []
 
-
-def search_emails_vector(query: str, limit: int = 10) -> list:
+def search_emails_vector(query: str, limit: int = 10, time_context: dict = None) -> list:
     """Семантический поиск по email с учётом свежести."""
     if not VECTOR_SEARCH_ENABLED:
         return []
     
+    # Получаем параметры времени
+    if time_context is None:
+        time_context = extract_time_context(query)
+    
+    decay_days = time_context.get("decay_days", 90)
+    freshness_weight = time_context.get("freshness_weight", 0.25)
+    
     results = []
     try:
-        email_results = vector_search_weighted(query, limit=limit, source_type='email')
+        email_results = vector_search_weighted(
+            query, 
+            limit=limit, 
+            source_type='email',
+            freshness_weight=freshness_weight,
+            decay_days=decay_days
+        )
         
         for r in email_results:
             received_str = ""
             if r.get("received_at"):
                 received_str = r["received_at"].strftime("%d.%m.%Y")
             
-            # Формируем читаемый контент
-            content_parts = []
-            if r.get("subject"):
-                content_parts.append(f"Тема: {r['subject']}")
-            if r.get("from_address"):
-                content_parts.append(f"От: {r['from_address']}")
-            content_parts.append(r["content"][:800])
-            
             results.append({
                 "source": "Email",
-                "date": received_str,
-                "content": "\n".join(content_parts),
+                "content": r["content"],
                 "subject": r.get("subject", ""),
                 "from_address": r.get("from_address", ""),
-                "similarity": r["similarity"],
+                "date": received_str,
+                "similarity": r.get("similarity", 0),
                 "freshness": r.get("freshness", 0),
-                "final_score": r.get("final_score", r["similarity"]),
+                "final_score": r.get("final_score", r.get("similarity", 0)),
                 "search_type": "email_vector"
             })
-        logger.info(f"Векторный поиск email: {len(results)} результатов")
+            
+        logger.info(f"Email поиск (decay={decay_days}d): {len(results)} результатов")
+        
     except Exception as e:
         logger.error(f"Ошибка поиска email: {e}")
     
     return results
 
 
-def search_telegram_chats(query: str, limit: int = 10) -> list:
-    """Комбинированный поиск по чатам."""
+def search_telegram_chats(query: str, limit: int = 10, time_context: dict = None) -> list:
+    """
+    Комбинированный поиск по чатам:
+    1. Векторный поиск (семантический) — находит по смыслу с учётом свежести
+    2. SQL поиск — находит точные совпадения
+    3. Объединяем и дедуплицируем
+    """
     results = []
-    seen_contents = set()
+    seen_content = set()
     
-    vector_results = search_telegram_chats_vector(query, limit=limit)
+    # Сначала векторный поиск (с учётом временного контекста)
+    vector_results = search_telegram_chats_vector(query, limit=limit, time_context=time_context)
     for r in vector_results:
-        content_key = r['content'][:100]
-        if content_key not in seen_contents:
-            seen_contents.add(content_key)
+        content_hash = hash(r['content'][:200])
+        if content_hash not in seen_content:
+            seen_content.add(content_hash)
             results.append(r)
     
-    if len(results) < limit:
-        sql_results = search_telegram_chats_sql(query, limit=limit - len(results))
-        for r in sql_results:
-            content_key = r['content'][:100]
-            if content_key not in seen_contents:
-                seen_contents.add(content_key)
-                r['search_type'] = 'sql'
-                results.append(r)
+    # Затем SQL поиск для точных совпадений
+    sql_results = search_telegram_chats_sql(query, limit=limit)
+    for r in sql_results:
+        content_hash = hash(r['content'][:200])
+        if content_hash not in seen_content:
+            seen_content.add(content_hash)
+            results.append(r)
+    
+    # Сортируем по final_score (если есть) или similarity
+    results.sort(key=lambda x: x.get('final_score', x.get('similarity', 0)), reverse=True)
     
     logger.info(f"Поиск в чатах: {len(results)} результатов (vector + sql)")
     return results[:limit]
@@ -377,10 +513,18 @@ JSON: {{"search_1c": true/false, "search_chats": true/false, "search_email": tru
 
 
 async def process_rag_query(question: str, chat_context: str = "") -> str:
-    """Основная функция обработки RAG-запроса."""
+    """Основная функция обработки RAG-запроса с учётом временного контекста."""
     logger.info(f"RAG запрос: {question}")
+    
+    # Извлекаем временной контекст из вопроса
+    time_context = extract_time_context(question)
+    if time_context["has_time_filter"]:
+        logger.info(f"Временной контекст: decay_days={time_context['decay_days']}, fw={time_context['freshness_weight']}")
+    
+    # Классифицируем вопрос
     classification = classify_question(question)
     logger.info(f"Классификация: {classification}")
+    
     keywords = classification.get("keywords", question)
     db_results = []
     
@@ -392,13 +536,13 @@ async def process_rag_query(question: str, chat_context: str = "") -> str:
     
     # Поиск в чатах (векторный с учётом свежести + SQL)
     if classification.get("search_chats", True):
-        chat_results = search_telegram_chats(keywords, limit=10)
+        chat_results = search_telegram_chats(keywords, limit=10, time_context=time_context)
         db_results.extend(chat_results)
         logger.info(f"Найдено в чатах: {len(chat_results)}")
     
     # Поиск в email (векторный с учётом свежести)
     if classification.get("search_email", True):
-        email_results = search_emails_vector(keywords, limit=10)
+        email_results = search_emails_vector(keywords, limit=10, time_context=time_context)
         db_results.extend(email_results)
         logger.info(f"Найдено в email: {len(email_results)}")
     
