@@ -29,7 +29,8 @@ import pathlib
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import sql
-from embedding_service import index_email_message
+from embedding_service import index_email_chunk
+from email_text_processing import build_email_chunks
 
 # Загружаем переменные окружения
 env_path = pathlib.Path(__file__).parent / '.env'
@@ -571,10 +572,17 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
         email_id = row[0]
         
         # Индексируем для векторного поиска
-        combined_text = f"{parsed.subject or ''} {parsed.body_text or ''}"
-        if len(combined_text.strip()) >= 10:
+        chunks = build_email_chunks(
+            subject=parsed.subject,
+            body_text=parsed.body_text,
+            body_html=parsed.body_html
+        )
+
+        for idx, chunk in enumerate(chunks):
             try:
-                index_email_message(email_id, combined_text)
+                index_email_chunk(email_id=email_id, chunk_index=idx, content=chunk)
+            except Exception as e:
+                logger.warning(f"Email chunk indexing failed for email_id={email_id}, chunk={idx}: {e}")
                 logger.debug(f"Indexed email {email_id}")
             except Exception as e:
                 logger.warning(f"Email indexing failed for {email_id}: {e}")
