@@ -70,19 +70,19 @@ def index_telegram_message(source_table: str, source_id: int, content: str) -> b
     """Индексирует одно сообщение из Telegram."""
     if not content or len(content.strip()) < 10:
         return False
-    
+
     conn = get_db_connection()
     try:
         embedding = create_embedding(content)
-        
+
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO embeddings (source_type, source_table, source_id, content, embedding)
-                VALUES ('telegram', %s, %s, %s, %s)
-                ON CONFLICT (source_table, source_id) 
+                INSERT INTO embeddings (source_type, source_table, source_id, chunk_index, content, embedding)
+                VALUES ('telegram', %s, %s, 0, %s, %s)
+                ON CONFLICT (source_table, source_id, chunk_index)
                 DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding
             """, (source_table, source_id, content[:5000], embedding))
-        
+
         conn.commit()
         return True
     except Exception as e:
@@ -93,26 +93,31 @@ def index_telegram_message(source_table: str, source_id: int, content: str) -> b
         conn.close()
 
 def index_email_message(email_id: int, content: str) -> bool:
-    """Индексирует одно email сообщение."""
+    """Индексирует одно email сообщение (совместимость: chunk_index=0)."""
+    return index_email_chunk(email_id=email_id, chunk_index=0, content=content)
+
+
+def index_email_chunk(email_id: int, chunk_index: int, content: str) -> bool:
+    """Индексирует один chunk письма."""
     if not content or len(content.strip()) < 10:
         return False
-    
+
     conn = get_db_connection()
     try:
         embedding = create_embedding(content)
-        
+
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO embeddings (source_type, source_table, source_id, content, embedding)
-                VALUES ('email', 'email_messages', %s, %s, %s)
-                ON CONFLICT (source_table, source_id) 
+                INSERT INTO embeddings (source_type, source_table, source_id, chunk_index, content, embedding)
+                VALUES ('email', 'email_messages', %s, %s, %s, %s)
+                ON CONFLICT (source_table, source_id, chunk_index)
                 DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding
-            """, (email_id, content[:5000], embedding))
-        
+            """, (email_id, chunk_index, content[:5000], embedding))
+
         conn.commit()
         return True
     except Exception as e:
-        logger.error(f"Ошибка индексации email: {e}")
+        logger.error(f"Ошибка индексации email chunk: {e}")
         conn.rollback()
         return False
     finally:
