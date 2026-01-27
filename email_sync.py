@@ -17,6 +17,8 @@ import imaplib
 import email
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
+from email import policy
+from email.parser import BytesParser
 import logging
 import argparse
 from datetime import datetime, timedelta
@@ -162,54 +164,59 @@ def normalize_subject(subject: str) -> str:
         normalized = new
     return normalized.strip()[:500]
 
-
 def extract_body(msg) -> tuple:
-    """Извлекает текст и HTML из письма."""
+    """Извлекает текст и HTML из письма (стараемся корректно декодировать)."""
     body_text = ""
     body_html = ""
-    
+
     if msg.is_multipart():
         for part in msg.walk():
-            content_type = part.get_content_type()
-            content_disposition = str(part.get("Content-Disposition", ""))
-            
-            if "attachment" in content_disposition:
+            ctype = part.get_content_type()
+            disp = str(part.get("Content-Disposition", "")).lower()
+            if "attachment" in disp:
                 continue
-            
+
             try:
-                payload = part.get_payload(decode=True)
-                if not payload:
-                    continue
-                charset = part.get_content_charset() or 'utf-8'
-                text = payload.decode(charset, errors='replace')
-                
-                if content_type == "text/plain" and not body_text:
-                    body_text = text
-                elif content_type == "text/html" and not body_html:
-                    body_html = text
-            except:
-                pass
+                if ctype == "text/plain" and not body_text:
+                    body_text = part.get_content()
+                elif ctype == "text/html" and not body_html:
+                    body_html = part.get_content()
+            except Exception:
+                # fallback на старый decode (на всякий случай)
+                try:
+                    payload = part.get_payload(decode=True)
+                    if not payload:
+                        continue
+                    charset = part.get_content_charset() or 'utf-8'
+                    decoded = payload.decode(charset, errors='replace')
+                    if ctype == "text/plain" and not body_text:
+                        body_text = decoded
+                    elif ctype == "text/html" and not body_html:
+                        body_html = decoded
+                except Exception:
+                    pass
     else:
+        ctype = msg.get_content_type()
         try:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                charset = msg.get_content_charset() or 'utf-8'
-                text = payload.decode(charset, errors='replace')
-                if msg.get_content_type() == "text/html":
-                    body_html = text
-                else:
-                    body_text = text
-        except:
-            pass
-    
-    # Конвертируем HTML в текст если нет текстовой версии
-    if not body_text and body_html:
-        body_text = re.sub(r'<br\s*/?>', '\n', body_html, flags=re.IGNORECASE)
-        body_text = re.sub(r'<[^>]+>', '', body_text)
-        import html
-        body_text = html.unescape(body_text)
-    
-    return body_text, body_html
+            if ctype == "text/html":
+                body_html = msg.get_content()
+            else:
+                body_text = msg.get_content()
+        except Exception:
+            try:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    charset = msg.get_content_charset() or 'utf-8'
+                    decoded = payload.decode(charset, errors='replace')
+                    if ctype == "text/html":
+                        body_html = decoded
+                    else:
+                        body_text = decoded
+            except Exception:
+                pass
+
+    return str(body_text or ""), str(body_html or "")
+
 
 
 def has_attachments(msg) -> bool:
@@ -227,7 +234,7 @@ def has_attachments(msg) -> bool:
 def parse_email_message(uid: int, raw_data: bytes) -> Optional[ParsedEmail]:
     """Парсит сырые данные письма."""
     try:
-        msg = email.message_from_bytes(raw_data)
+        msg = BytesParser(policy=policy.default).parsebytes(raw_data)
         
         message_id = decode_email_header(msg.get('Message-ID', ''))
         in_reply_to = decode_email_header(msg.get('In-Reply-To', ''))
