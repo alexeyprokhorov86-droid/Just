@@ -38,6 +38,37 @@ def _normalize_whitespace(text: str) -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
+# --- Quality checks (decoding issues) ---
+
+REPLACEMENT_CHAR = "�"  # U+FFFD
+
+def replacement_ratio(text: str) -> float:
+    """
+    Доля replacement-символов (�) в тексте.
+    Если декодирование прошло с errors='replace', вместо битых байтов появляется �.
+    """
+    if not text:
+        return 0.0
+    return text.count(REPLACEMENT_CHAR) / max(len(text), 1)
+
+def is_text_decoding_bad(text: str, max_ratio: float = 0.002, min_count: int = 3) -> bool:
+    """
+    Определяет, что текст подозрительно "битый".
+
+    Порог по умолчанию:
+    - max_ratio=0.002 -> 0.2% символов заменены на �
+    - min_count=3     -> чтобы не реагировать на 1 случайный символ
+
+    Для коротких email это адекватно:
+    3+ replacement-символа почти всегда означает проблему кодировки.
+    """
+    if not text:
+        return False
+    cnt = text.count(REPLACEMENT_CHAR)
+    if cnt < min_count:
+        return False
+    return (cnt / max(len(text), 1)) > max_ratio
+
 
 # --- Очистка email ---
 
@@ -137,26 +168,53 @@ def chunk_text(text: str, max_chars: int = 2200, overlap: int = 200) -> List[str
 
 def build_email_chunks(subject: str, body_text: str, body_html: str) -> List[str]:
     """
-    Берём body_text (если пусто — делаем text из html),
-    чистим, затем чанкаем.
-    Subject добавляем в каждый chunk как короткий якорь.
+    1) берём body_text (если пусто — text из html)
+    2) чистим quoted replies/подписи/дисклеймеры
+    3) чанкаем
+    4) добавляем Subject как якорь ТОЛЬКО если subject не битый
+    5) фильтруем чанки с сильными признаками битого декодирования (�)
+    6) fallback: если всё плохое — индексируем только Subject, если он нормальный
     """
     subj = (subject or "").strip()
     body = (body_text or "").strip()
 
+    # если нет plain-текста — берём из HTML
     if not body and body_html:
         body = html_to_text(body_html)
 
+    # чистим тело письма
     body = clean_email_text(body)
 
+    # если письмо фактически пустое — пробуем хотя бы subject
     if not body and subj:
-        # иногда письмо = только тема
         body = subj
 
+    # чанки тела (без subject)
     chunks = chunk_text(body, max_chars=2200, overlap=200)
 
-    # добавляем тему как контекстный якорь
-    if subj:
-        chunks = [f"Subject: {subj}\n\n{ch}" for ch in chunks]
+    # решаем, можно ли использовать subject как якорь
+    subject_ok = bool(subj) and (not is_text_decoding_bad(subj))
 
-    return [c for c in chunks if len(c.strip()) >= 10]
+    if subject_ok:
+        chunks = [f"Subject: {subj}\n\n{ch}" for ch in chunks]
+    else:
+        # если subject битый — лучше не добавлять его в чанки
+        # иначе он будет портить embedding даже у хорошего body
+        pass
+
+    # выкидываем слишком короткие чанки
+    chunks = [c for c in chunks if len(c.strip()) >= 10]
+
+    # фильтрация чанков с явной порчей декодирования
+    good = [c for c in chunks if not is_text_decoding_bad(c)]
+
+    if good:
+        return good
+
+    # fallback: если все чанки плохие, но subject нормальный — индексируем только subject
+    if subject_ok:
+        return [f"Subject: {subj}"]
+
+    # иначе лучше не индексировать вообще
+    return []
+
