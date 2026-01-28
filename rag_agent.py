@@ -153,6 +153,52 @@ def extract_time_context(question: str) -> dict:
     
     return result
 
+def diversify_by_source_id(
+    items: list,
+    total_limit: int,
+    max_per_source: int = 2,
+    score_key: str = "final_score",
+    source_id_key: str = "source_id",
+) -> list:
+    """
+    Ограничивает число результатов от одного источника (source_id).
+    Нужна для email, где один email = несколько чанков => много попаданий из одного письма.
+
+    Логика:
+    - ожидаем, что items уже отсортированы по score desc (или мы сортируем сами)
+    - берём по max_per_source на один source_id
+    - останавливаемся на total_limit
+    """
+    if not items:
+        return []
+
+    # На всякий случай сортируем (чтобы не зависеть от поведения БД/индекса)
+    items = sorted(items, key=lambda x: x.get(score_key, 0), reverse=True)
+
+    per_source_count = {}
+    out = []
+
+    for it in items:
+        sid = it.get(source_id_key)
+        if sid is None:
+            # если source_id отсутствует — считаем как уникальный
+            out.append(it)
+            if len(out) >= total_limit:
+                break
+            continue
+
+        cnt = per_source_count.get(sid, 0)
+        if cnt >= max_per_source:
+            continue
+
+        per_source_count[sid] = cnt + 1
+        out.append(it)
+
+        if len(out) >= total_limit:
+            break
+
+    return out
+
 def search_telegram_chats_sql(query: str, limit: int = 10) -> list:
     """SQL-поиск по чатам (точное совпадение слов)."""
     results = []
@@ -230,50 +276,70 @@ def search_telegram_chats_vector(query: str, limit: int = 10, time_context: dict
         logger.error(f"Ошибка векторного поиска: {e}")
         return []
 
+
 def search_emails_vector(query: str, limit: int = 10, time_context: dict = None) -> list:
-    """Семантический поиск по email с учётом свежести."""
+    """Семантический поиск по email с учётом свежести + diversity по source_id (чанки одного письма)."""
     if not VECTOR_SEARCH_ENABLED:
         return []
-    
-    # Получаем параметры времени
+
     if time_context is None:
         time_context = extract_time_context(query)
-    
+
     decay_days = time_context.get("decay_days", 90)
     freshness_weight = time_context.get("freshness_weight", 0.25)
-    
+
+    # Сколько кандидатов взять до группировки:
+    #  - если max_per_email=2 и нужно limit=10, то кандидатов лучше 50-80,
+    #    чтобы после отбрасывания дублей не остаться без результатов.
+    pre_limit = max(limit * 6, 50)
+    max_chunks_per_email = 2
+
     results = []
     try:
-        email_results = vector_search_weighted(
-            query, 
-            limit=limit, 
+        email_candidates = vector_search_weighted(
+            query,
+            limit=pre_limit,
             source_type='email',
             freshness_weight=freshness_weight,
             decay_days=decay_days
         )
-        
-        for r in email_results:
+
+        # Ключевой шаг пункта 1: ограничиваем чанки одного письма
+        diversified = diversify_by_source_id(
+            email_candidates,
+            total_limit=limit,
+            max_per_source=max_chunks_per_email,
+            score_key="final_score",
+            source_id_key="source_id",
+        )
+
+        for r in diversified:
             received_str = ""
             if r.get("received_at"):
                 received_str = r["received_at"].strftime("%d.%m.%Y")
-            
+
             results.append({
                 "source": "Email",
-                "content": r["content"],
+                "content": r.get("content", ""),
                 "subject": r.get("subject", ""),
                 "from_address": r.get("from_address", ""),
                 "date": received_str,
                 "similarity": r.get("similarity", 0),
                 "freshness": r.get("freshness", 0),
                 "final_score": r.get("final_score", r.get("similarity", 0)),
-                "search_type": "email_vector"
+                "search_type": "email_vector",
+                # полезно для дальнейших шагов и отладки
+                "source_id": r.get("source_id"),
             })
-            
-        logger.info(f"Email поиск (decay={decay_days}d): {len(results)} результатов")
-        
+
+        logger.info(
+            f"Email vector search: pre_limit={pre_limit}, diversified={len(results)} "
+            f"(max_per_email={max_chunks_per_email}, decay={decay_days}d, fw={freshness_weight})"
+        )
+
     except Exception as e:
         logger.error(f"Ошибка поиска email: {e}")
-    
+
     return results
 
 
@@ -447,7 +513,16 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
             for i, res in enumerate(emails[:5], 1):
                 score_info = f" [релевантность: {res.get('final_score', res.get('similarity', 0)):.0%}]"
                 date_info = f" ({res['date']})" if res.get('date') else ""
-                context_parts.append(f"{i}.{score_info}{date_info} {res['content'][:400]}")
+                subj = (res.get("subject") or "").strip()
+                frm = (res.get("from_address") or "").strip()
+                header = ""
+                if subj or frm:
+                    header = f"{subj} | {frm}".strip(" |")
+
+                context_parts.append(
+                    f"{i}.{score_info}{date_info} {header}\n{res['content'][:400]}"
+                )
+
         
         # Интернет
         if web_results:
