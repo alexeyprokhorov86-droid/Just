@@ -592,7 +592,7 @@ async def extract_text_from_image(image_data: bytes, media_type: str) -> str:
                             "image_url": {
                                 "url": f"data:{media_type};base64,{base64_image}"
                             }
-                        }
+                        },
                         {
                             "type": "text",
                             "text": "Извлеки весь текст, который видишь на этом изображении. Верни только текст, без дополнительных комментариев. Если текста нет, верни пустую строку."
@@ -852,7 +852,7 @@ async def analyze_image_with_gpt(image_data: bytes, media_type: str, context: st
                             "image_url": {
                                 "url": f"data:{media_type};base64,{base64_image}"
                             }
-                        }
+                        },
                         {
                             "type": "text",
                             "text": prompt
