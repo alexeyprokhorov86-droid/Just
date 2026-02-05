@@ -19,7 +19,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 import psycopg2
 from psycopg2 import sql
 from dotenv import load_dotenv
-import anthropic
+from openai import OpenAI
 from telegram.ext import CallbackQueryHandler
 from rag_agent import process_rag_query, index_new_message
 from telegram.helpers import escape_markdown
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
 
 # Подключение к БД
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -59,20 +59,16 @@ ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 # Название группы для отложенного анализа документов
 DELAYED_ANALYSIS_CHAT = "Торты Отгрузки"
 
-# Инициализация Claude клиента
-claude_client = None
-if ANTHROPIC_API_KEY:
-    import httpx
-    proxy_url = os.getenv("PROXY_URL")
-    if proxy_url:
-        http_client = httpx.Client(proxy=proxy_url)
-        claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, http_client=http_client)
-        logger.info(f"Claude Vision активирован через прокси {proxy_url}")
-    else:
-        claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        logger.info("Claude Vision активирован")
+# Инициализация GPT клиента через RouterAI
+ROUTERAI_API_KEY = os.getenv("ROUTERAI_API_KEY")
+ROUTERAI_BASE_URL = os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1")
+
+gpt_client = None
+if ROUTERAI_API_KEY:
+    gpt_client = OpenAI(api_key=ROUTERAI_API_KEY, base_url=ROUTERAI_BASE_URL)
+    logger.info("GPT-4.1 через RouterAI активирован")
 else:
-    logger.warning("ANTHROPIC_API_KEY не установлен - анализ изображений отключён")
+    logger.warning("ROUTERAI_API_KEY не установлен - анализ документов отключён")
 
 # Хранение состояния для назначения ролей
 pending_role_assignments = {}
@@ -577,28 +573,26 @@ def build_analysis_prompt(doc_type: str, doc_content: str, context: str, filenam
 
 async def extract_text_from_image(image_data: bytes, media_type: str) -> str:
     """Извлекает текст из изображения с помощью OCR через Claude Vision."""
-    if not claude_client:
+    if not gpt_client:
         return ""
 
     try:
         base64_image = base64.standard_b64encode(image_data).decode("utf-8")
 
         # Используем Claude Vision для OCR
-        response = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
+        response = gpt_client.chat.completions.create(
+            model="openai/gpt-4.1",
             max_tokens=4096,
             messages=[
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": base64_image,
-                            },
-                        },
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{base64_image}"
+                            }
+                        }
                         {
                             "type": "text",
                             "text": "Извлеки весь текст, который видишь на этом изображении. Верни только текст, без дополнительных комментариев. Если текста нет, верни пустую строку."
@@ -608,7 +602,7 @@ async def extract_text_from_image(image_data: bytes, media_type: str) -> str:
             ],
         )
 
-        extracted_text = response.content[0].text.strip()
+        extracted_text = response.choices[0].message.content.strip()
         logger.info(f"Текст извлечен из изображения: {len(extracted_text)} символов")
         return extracted_text
 
@@ -836,9 +830,9 @@ async def extract_transcript_from_audio(audio_path: str) -> str:
 # АНАЛИЗ ДОКУМЕНТОВ
 # ============================================================
 
-async def analyze_image_with_claude(image_data: bytes, media_type: str, context: str = "", filename: str = "") -> str:
+async def analyze_image_with_gpt(image_data: bytes, media_type: str, context: str = "", filename: str = "") -> str:
     """Анализирует изображение через Claude Vision."""
-    if not claude_client:
+    if not gpt_client:
         return ""
     
     try:
@@ -846,21 +840,19 @@ async def analyze_image_with_claude(image_data: bytes, media_type: str, context:
         
         prompt = build_analysis_prompt("Изображение", "[Изображение прикреплено]", context, filename)
         
-        response = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
+        response = gpt_client.chat.completions.create(
+            model="openai/gpt-4.1",
             max_tokens=2500,
             messages=[
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": base64_image,
-                            },
-                        },
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{base64_image}"
+                            }
+                        }
                         {
                             "type": "text",
                             "text": prompt
@@ -870,7 +862,7 @@ async def analyze_image_with_claude(image_data: bytes, media_type: str, context:
             ],
         )
         
-        analysis = response.content[0].text
+        analysis = response.choices[0].message.content
         logger.info(f"Изображение проанализировано: {len(analysis)} символов")
         return analysis
         
@@ -879,9 +871,9 @@ async def analyze_image_with_claude(image_data: bytes, media_type: str, context:
         return ""
 
 
-async def analyze_pdf_with_claude(pdf_data: bytes, filename: str = "", context: str = "") -> str:
+async def analyze_pdf_with_gpt(pdf_data: bytes, filename: str = "", context: str = "") -> str:
     """Анализирует PDF через Claude."""
-    if not claude_client:
+    if not gpt_client:
         return ""
     
     try:
@@ -894,9 +886,9 @@ async def analyze_pdf_with_claude(pdf_data: bytes, filename: str = "", context: 
             
             prompt = build_analysis_prompt("PDF документ", "[PDF документ прикреплён]", context, filename)
             
-            response = claude_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=2500,
+            response = gpt_client.chat.completions.create(
+                model="openai/gpt-4.1",
+                max_tokens=4500,
                 messages=[
                     {
                         "role": "user",
@@ -917,7 +909,7 @@ async def analyze_pdf_with_claude(pdf_data: bytes, filename: str = "", context: 
                     }
                 ],
             )
-            return response.content[0].text
+            return response.choices[0].message.content
         
         # Анализируем каждую страницу
         all_analysis = []
@@ -931,7 +923,7 @@ async def analyze_pdf_with_claude(pdf_data: bytes, filename: str = "", context: 
             if context:
                 page_context = context + f"\n\nТекущая страница: {i+1} из {len(images)}"
             
-            analysis = await analyze_image_with_claude(img_bytes, "image/png", page_context, filename)
+            analysis = await analyze_image_with_gpt(img_bytes, "image/png", page_context, filename)
             if analysis:
                 all_analysis.append(f"[Страница {i+1}]\n{analysis}")
         
@@ -942,9 +934,9 @@ async def analyze_pdf_with_claude(pdf_data: bytes, filename: str = "", context: 
         return ""
 
 
-async def analyze_excel_with_claude(file_data: bytes, filename: str = "", context: str = "") -> str:
+async def analyze_excel_with_gpt(file_data: bytes, filename: str = "", context: str = "") -> str:
     """Анализирует Excel файл через Claude. Поддерживает .xlsx и .xls форматы."""
-    if not claude_client:
+    if not gpt_client:
         return ""
     
     try:
@@ -1027,22 +1019,22 @@ async def analyze_excel_with_claude(file_data: bytes, filename: str = "", contex
         
         prompt = build_analysis_prompt("Excel таблица", f"Содержимое файла:\n{excel_content}", context, filename)
         
-        response = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2500,
+        response = gpt_client.chat.completions.create(
+            model="openai/gpt-4.1",
+            max_tokens=4500,
             messages=[{"role": "user", "content": prompt}],
         )
         
-        return response.content[0].text
+        return response.choices[0].message.content
         
     except Exception as e:
         logger.error(f"Ошибка анализа Excel: {e}")
         return ""
 
 
-async def analyze_word_with_claude(file_data: bytes, filename: str = "", context: str = "") -> str:
+async def analyze_word_with_gpt(file_data: bytes, filename: str = "", context: str = "") -> str:
     """Анализирует Word файл через Claude."""
-    if not claude_client:
+    if not gpt_client:
         return ""
     
     try:
@@ -1069,22 +1061,22 @@ async def analyze_word_with_claude(file_data: bytes, filename: str = "", context
         
         prompt = build_analysis_prompt("Word документ", f"Содержимое документа:\n{word_content}", context, filename)
         
-        response = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2500,
+        response = gpt_client.chat.completions.create(
+            model="openai/gpt-4.1",
+            max_tokens=4500,
             messages=[{"role": "user", "content": prompt}],
         )
         
-        return response.content[0].text
+        return response.choices[0].message.content
         
     except Exception as e:
         logger.error(f"Ошибка анализа Word: {e}")
         return ""
 
 
-async def analyze_pptx_with_claude(file_data: bytes, filename: str = "", context: str = "") -> str:
+async def analyze_pptx_with_gpt(file_data: bytes, filename: str = "", context: str = "") -> str:
     """Анализирует PowerPoint файл через Claude."""
-    if not claude_client:
+    if not gpt_client:
         return ""
     
     try:
@@ -1111,13 +1103,13 @@ async def analyze_pptx_with_claude(file_data: bytes, filename: str = "", context
         
         prompt = build_analysis_prompt("PowerPoint презентация", f"Содержимое презентации:\n{pptx_content}", context, filename)
         
-        response = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2500,
+        response = gpt_client.chat.completions.create(
+            model="openai/gpt-4.1",
+            max_tokens=4500,
             messages=[{"role": "user", "content": prompt}],
         )
         
-        return response.content[0].text
+        return response.choices[0].message.content
         
     except Exception as e:
         logger.error(f"Ошибка анализа PowerPoint: {e}")
@@ -1180,7 +1172,7 @@ async def analyze_video_with_gemini(file_data: bytes, filename: str = "", contex
                     ]
                 }
             ],
-            "max_tokens": 2000
+            "max_tokens": 4000
         }
         
         response = requests.post(url, headers=headers, json=data, timeout=120)
@@ -1201,7 +1193,7 @@ async def analyze_video_with_gemini(file_data: bytes, filename: str = "", contex
 
 async def analyze_video_with_whisper(file_data: bytes, filename: str = "", context: str = "") -> str:
     """Fallback: анализирует видео через Whisper (только аудио) + Claude."""
-    if not claude_client:
+    if not gpt_client:
         return ""
     
     try:
@@ -1237,13 +1229,13 @@ async def analyze_video_with_whisper(file_data: bytes, filename: str = "", conte
         
         prompt = build_analysis_prompt("Видео (транскрипция аудио)", f"Транскрипция:\n{transcript}", context, filename)
         
-        response = claude_client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2500,
+        response = gpt_client.chat.completions.create(
+            model="openai/gpt-4.1",
+            max_tokens=4500,
             messages=[{"role": "user", "content": prompt}],
         )
         
-        return response.content[0].text
+        return response.choices[0].message.content
         
     except Exception as e:
         logger.error(f"Ошибка анализа видео через Whisper: {e}")
@@ -1374,13 +1366,13 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
                         filename
                     )
 
-                    if claude_client:
-                        response = claude_client.messages.create(
-                            model="claude-sonnet-4-20250514",
-                            max_tokens=2500,
+                    if gpt_client:
+                        response = gpt_client.chat.completions.create(
+                            model="openai/gpt-4.1",
+                            max_tokens=4500,
                             messages=[{"role": "user", "content": prompt}],
                         )
-                        media_analysis = response.content[0].text
+                        media_analysis = response.choices[0].message.content
                     else:
                         media_analysis = f"Транскрипция: {content_text}"
                 else:
@@ -1389,19 +1381,19 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
                 if os.path.exists(audio_path):
                     os.unlink(audio_path)
         elif media_type == "application/pdf":
-            media_analysis = await analyze_pdf_with_claude(bytes(file_data), filename, context)
+            media_analysis = await analyze_pdf_with_gpt(bytes(file_data), filename, context)
             content_text = await extract_text_from_pdf(bytes(file_data))
         elif media_type and media_type.startswith("image/"):
-            media_analysis = await analyze_image_with_claude(bytes(file_data), media_type, context, filename)
+            media_analysis = await analyze_image_with_gpt(bytes(file_data), media_type, context, filename)
             content_text = await extract_text_from_image(bytes(file_data), media_type)
         elif media_type == "excel":
-            media_analysis = await analyze_excel_with_claude(bytes(file_data), filename, context)
+            media_analysis = await analyze_excel_with_gpt(bytes(file_data), filename, context)
             content_text = await extract_csv_from_excel(bytes(file_data), filename)
         elif media_type == "word":
-            media_analysis = await analyze_word_with_claude(bytes(file_data), filename, context)
+            media_analysis = await analyze_word_with_gpt(bytes(file_data), filename, context)
             content_text = await extract_text_from_word(bytes(file_data))
         elif media_type == "powerpoint":
-            media_analysis = await analyze_pptx_with_claude(bytes(file_data), filename, context)
+            media_analysis = await analyze_pptx_with_gpt(bytes(file_data), filename, context)
             content_text = await extract_text_from_pptx(bytes(file_data))
         elif media_type == "video":
             media_analysis = await analyze_video_with_gemini(bytes(file_data), filename, context)
@@ -1512,13 +1504,13 @@ async def analyze_daily_documents(bot, chat_id: int, chat_title: str):
 Анализ должен быть структурированным и информативным."""
 
     try:
-        if claude_client:
-            response = claude_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=3000,
+        if gpt_client:
+            response = gpt_client.chat.completions.create(
+                model="openai/gpt-4.1",
+                max_tokens=6000,
                 messages=[{"role": "user", "content": summary_prompt}],
             )
-            summary_analysis = response.content[0].text
+            summary_analysis = response.choices[0].message.content
 
             # Сохраняем сводный анализ в БД для последнего документа дня
             # (или можно создать отдельную таблицу для дневных отчетов)
