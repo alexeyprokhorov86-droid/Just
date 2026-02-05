@@ -13,7 +13,7 @@ DB_NAME="${DB_NAME:-knowledge_base}"
 DB_USER="${DB_USER:-knowledge}"
 BOT_TOKEN="${BOT_TOKEN}"
 ADMIN_USER_ID="${ADMIN_USER_ID}"
-DAYS_TO_KEEP="${BACKUP_DAYS_TO_KEEP:-7}"
+DAYS_TO_KEEP="${BACKUP_DAYS_TO_KEEP:-3}"
 
 # Создаём папку если нет
 mkdir -p $BACKUP_DIR
