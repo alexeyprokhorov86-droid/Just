@@ -1615,7 +1615,7 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     sender_name = message.from_user.first_name if message.from_user else "Неизвестный"
                     
                     full_message = (
-                        f"📄 *Полный анализ документа*\n\n"
+                        f"📄 *Полный анализ документа\n\n"
                         f"📍 Чат: {chat_title}\n"
                         f"👤 Отправил: {sender_name}\n"
                         f"📎 Файл: {filename.strip(' ()') or message_type}\n\n"
@@ -1646,13 +1646,13 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     await context.bot.send_message(
                                         chat_id=uid,
                                         text=part if i == 0 else f"...продолжение:\n\n{part}",
-                                        parse_mode="Markdown"
+                                        parse_mode=None
                                     )
                             else:
                                 await context.bot.send_message(
                                     chat_id=uid,
                                     text=full_message,
-                                    parse_mode="Markdown"
+                                    parse_mode=None
                                 )
                         except Exception as e:
                             logger.warning(f"Не удалось отправить анализ пользователю {uid}: {e}")
