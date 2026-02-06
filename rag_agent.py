@@ -276,6 +276,70 @@ def search_telegram_chats_vector(query: str, limit: int = 10, time_context: dict
         logger.error(f"Ошибка векторного поиска: {e}")
         return []
 
+def search_emails_sql(query: str, limit: int = 10) -> list:
+    """SQL/keyword поиск по email — для точных совпадений (артикулы, номера, ИНН)."""
+    results = []
+    conn = get_db_connection()
+    keywords = clean_keywords(query)
+    
+    try:
+        with conn.cursor() as cur:
+            # FTS поиск
+            fts_query = ' | '.join(keywords[:3])
+            cur.execute("""
+                SELECT id, subject, body_text, from_address, received_at
+                FROM email_messages
+                WHERE to_tsvector('russian', COALESCE(subject, '') || ' ' || COALESCE(body_text, ''))
+                      @@ to_tsquery('russian', %s)
+                ORDER BY received_at DESC
+                LIMIT %s
+            """, (fts_query, limit * 2))
+            
+            fts_results = cur.fetchall()
+            
+            # Если FTS не дал результатов — ILIKE fallback
+            if not fts_results:
+                for keyword in keywords[:2]:
+                    cur.execute("""
+                        SELECT id, subject, body_text, from_address, received_at
+                        FROM email_messages
+                        WHERE subject ILIKE %s OR body_text ILIKE %s
+                        ORDER BY received_at DESC
+                        LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", limit))
+                    fts_results.extend(cur.fetchall())
+            
+            seen_ids = set()
+            for row in fts_results:
+                if row[0] in seen_ids:
+                    continue
+                seen_ids.add(row[0])
+                
+                content = f"Тема: {row[1] or ''}\n{(row[2] or '')[:800]}"
+                received_str = row[4].strftime("%d.%m.%Y") if row[4] else ""
+                
+                results.append({
+                    "source": "Email",
+                    "content": content,
+                    "subject": row[1] or "",
+                    "from_address": row[3] or "",
+                    "date": received_str,
+                    "similarity": 0.5,
+                    "final_score": 0.5,
+                    "search_type": "email_sql",
+                    "source_id": row[0],
+                })
+                
+                if len(results) >= limit:
+                    break
+                    
+    except Exception as e:
+        logger.error(f"Ошибка SQL поиска email: {e}")
+    finally:
+        conn.close()
+    
+    logger.info(f"Email SQL поиск: {len(results)} результатов")
+    return results
 
 def search_emails_vector(query: str, limit: int = 10, time_context: dict = None) -> list:
     """Семантический поиск по email с учётом свежести + diversity по source_id (чанки одного письма)."""
@@ -342,6 +406,41 @@ def search_emails_vector(query: str, limit: int = 10, time_context: dict = None)
 
     return results
 
+def search_emails(query: str, limit: int = 10, time_context: dict = None) -> list:
+    """
+    Комбинированный поиск по email:
+    1. Векторный поиск (семантический) — находит по смыслу
+    2. SQL поиск — находит точные совпадения (артикулы, номера, ИНН)
+    3. Объединяем и дедуплицируем
+    """
+    results = []
+    seen_ids = set()
+    
+    # Сначала векторный поиск
+    vector_results = search_emails_vector(query, limit=limit, time_context=time_context)
+    for r in vector_results:
+        source_id = r.get('source_id')
+        if source_id and source_id in seen_ids:
+            continue
+        if source_id:
+            seen_ids.add(source_id)
+        results.append(r)
+    
+    # Затем SQL поиск для точных совпадений
+    sql_results = search_emails_sql(query, limit=limit)
+    for r in sql_results:
+        source_id = r.get('source_id')
+        if source_id and source_id in seen_ids:
+            continue
+        if source_id:
+            seen_ids.add(source_id)
+        results.append(r)
+    
+    # Сортируем по final_score
+    results.sort(key=lambda x: x.get('final_score', 0), reverse=True)
+    
+    logger.info(f"Поиск email: {len(results)} результатов (vector + sql)")
+    return results[:limit]
 
 def search_telegram_chats(query: str, limit: int = 10, time_context: dict = None) -> list:
     """
@@ -617,7 +716,7 @@ async def process_rag_query(question: str, chat_context: str = "") -> str:
     
     # Поиск в email (векторный с учётом свежести)
     if classification.get("search_email", True):
-        email_results = search_emails_vector(keywords, limit=10, time_context=time_context)
+        email_results = search_emails(keywords, limit=10, time_context=time_context)
         db_results.extend(email_results)
         logger.info(f"Найдено в email: {len(email_results)}")
     
