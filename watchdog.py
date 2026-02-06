@@ -55,16 +55,27 @@ def send_alert(message: str):
     except Exception as e:
         log(f"Ошибка отправки алерта: {e}")
 
-def check_service_running() -> bool:
-    """Проверяет что сервис telegram-logger запущен."""
+def check_service_running(service_name: str = "telegram-logger") -> bool:
+    """Проверяет что systemd сервис запущен."""
     try:
         result = subprocess.run(
-            ["systemctl", "is-active", "telegram-logger"],
+            ["systemctl", "is-active", service_name],
             capture_output=True, text=True, timeout=10
         )
         return result.stdout.strip() == "active"
     except Exception as e:
-        log(f"Ошибка проверки сервиса: {e}")
+        log(f"Ошибка проверки сервиса {service_name}: {e}")
+        return False
+
+
+def restart_service(service_name: str = "telegram-logger") -> bool:
+    """Перезапускает сервис."""
+    try:
+        subprocess.run(["sudo", "systemctl", "restart", service_name], timeout=30)
+        log(f"Сервис {service_name} перезапущен")
+        return True
+    except Exception as e:
+        log(f"Ошибка перезапуска {service_name}: {e}")
         return False
 
 def check_disk_space() -> tuple[bool, int]:
@@ -210,16 +221,30 @@ def main():
     log("=== Watchdog запущен ===")
     state = get_state()
     alerts = []
-    need_restart = False
     
-    # 1. Проверяем сервис
-    if not check_service_running():
+    # 1. Проверяем telegram-logger
+    if not check_service_running("telegram-logger"):
         alerts.append("❌ Сервис telegram-logger не запущен!")
-        need_restart = True
+        state["restart_count"] = state.get("restart_count", 0) + 1
+        skip_stuck_update()
+        if restart_service("telegram-logger"):
+            alerts.append(f"🔄 telegram-logger перезапущен (перезапусков: {state['restart_count']})")
+        else:
+            alerts.append("❌ Не удалось перезапустить telegram-logger!")
     else:
-        log("✅ Сервис запущен")
+        log("✅ telegram-logger запущен")
     
-    # 2. Проверяем диск
+    # 2. Проверяем email-sync
+    if not check_service_running("email-sync"):
+        alerts.append("❌ Сервис email-sync не запущен!")
+        if restart_service("email-sync"):
+            alerts.append("🔄 email-sync перезапущен")
+        else:
+            alerts.append("❌ Не удалось перезапустить email-sync!")
+    else:
+        log("✅ email-sync запущен")
+    
+    # 3. Проверяем диск
     disk_ok, disk_percent = check_disk_space()
     if not disk_ok:
         if should_alert("disk", state):
@@ -228,7 +253,7 @@ def main():
     else:
         log(f"✅ Диск: {disk_percent}% использовано")
     
-    # 3. Проверяем БД
+    # 4. Проверяем БД
     if not check_db_connection():
         if should_alert("db", state):
             alerts.append("🗄 База данных недоступна!")
@@ -236,31 +261,19 @@ def main():
     else:
         log("✅ База данных доступна")
     
-    # 4. Проверяем ошибки в логах
+    # 5. Проверяем ошибки в логах telegram-logger
     errors = check_service_errors()
     if errors:
         log(f"⚠️ Найдено {len(errors)} ошибок в логах")
         if "Error while parsing" in str(errors):
             log("Обнаружена ошибка парсинга — пробуем сбросить очередь")
             skip_stuck_update()
-            need_restart = True
+            restart_service("telegram-logger")
         if should_alert("errors", state, cooldown_minutes=60):
             alerts.append(f"⚠️ Ошибки в логах:\n{errors[0][:100]}...")
             mark_alerted("errors", state)
     else:
         log("✅ Критических ошибок нет")
-    
-    # 5. Перезапускаем если нужно
-    if need_restart:
-        log("Требуется перезапуск...")
-        state["restart_count"] = state.get("restart_count", 0) + 1
-        state["last_restart"] = datetime.now().isoformat()
-        
-        skip_stuck_update()
-        if restart_service():
-            alerts.append(f"🔄 Бот перезапущен (перезапусков сегодня: {state['restart_count']})")
-        else:
-            alerts.append("❌ Не удалось перезапустить бота!")
     
     # 6. Отправляем алерты
     if alerts:
