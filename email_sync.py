@@ -29,6 +29,8 @@ import pathlib
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import sql
+import requests
+import json
 from embedding_service import index_email_chunk
 from email_text_processing import build_email_chunks
 
@@ -62,6 +64,12 @@ INITIAL_LOAD_DAYS = int(os.getenv("INITIAL_LOAD_DAYS", "30"))
 
 ATTACHMENTS_PATH = os.getenv("ATTACHMENTS_PATH", "/var/email_logger/attachments")
 
+# RouterAI для анализа цепочек
+ROUTERAI_API_KEY = os.getenv("ROUTERAI_API_KEY")
+ROUTERAI_BASE_URL = os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1")
+
+# Telegram бот для уведомлений
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # ============================================================
 # РАБОТА С БД
@@ -446,6 +454,290 @@ def update_thread_stats(cur, thread_id: int, parsed: ParsedEmail):
         WHERE id = %s
     """, (parsed.received_at, parsed.from_address, parsed.from_address, parsed.from_address, thread_id))
 
+# ============================================================
+# АНАЛИЗ ЗАКРЫТИЯ ЦЕПОЧЕК
+# ============================================================
+
+CLOSURE_MARKERS = [
+    # Оплата
+    "оплачено", "оплатили", "оплата прошла", "оплата поступила", "деньги поступили",
+    "платёж получен", "платеж получен", "средства поступили", "оплата подтверждена",
+    # Отгрузка/доставка
+    "отгружено", "отгрузили", "товар отправлен", "заказ отправлен", "доставлено",
+    "получили товар", "товар получен", "груз доставлен", "отгрузка выполнена",
+    # Подтверждение/согласование
+    "подтверждаю", "подтверждено", "согласовано", "договорились", "принято",
+    "заказ подтверждён", "заказ подтвержден", "всё верно", "все верно",
+    # Завершение
+    "вопрос закрыт", "вопрос решён", "вопрос решен", "спасибо за сотрудничество",
+    "благодарим за заказ", "ждём следующий заказ", "ждем следующий заказ",
+    # Отказ/отмена
+    "отказ", "отменено", "заказ отменён", "заказ отменен", "не актуально"
+]
+
+
+def check_thread_closure(body_text: str, subject: str = "") -> tuple[bool, str]:
+    """
+    Проверяет, содержит ли письмо маркеры закрытия цепочки.
+    Возвращает (is_closed, marker_found).
+    """
+    if not body_text:
+        return False, ""
+    
+    text_lower = body_text.lower()
+    subject_lower = (subject or "").lower()
+    combined = f"{subject_lower} {text_lower}"
+    
+    for marker in CLOSURE_MARKERS:
+        if marker in combined:
+            return True, marker
+    
+    return False, ""
+
+
+def get_thread_messages(cur, thread_id: int, limit: int = 20) -> list:
+    """Получает последние сообщения цепочки для генерации сводки."""
+    cur.execute("""
+        SELECT from_address, to_addresses, subject, body_text, received_at
+        FROM email_messages
+        WHERE thread_id = %s
+        ORDER BY received_at DESC
+        LIMIT %s
+    """, (thread_id, limit))
+    
+    messages = []
+    for row in cur.fetchall():
+        messages.append({
+            "from": row[0],
+            "to": row[1],
+            "subject": row[2],
+            "body": (row[3] or "")[:1000],  # Ограничиваем длину
+            "date": row[4].strftime("%d.%m.%Y %H:%M") if row[4] else ""
+        })
+    
+    return list(reversed(messages))  # Хронологический порядок
+
+
+def generate_thread_summary(thread_id: int, messages: list, closure_marker: str) -> dict:
+    """Генерирует сводку цепочки через GPT-4.1-mini."""
+    if not ROUTERAI_API_KEY or not messages:
+        return {}
+    
+    # Формируем текст переписки
+    conversation = []
+    for msg in messages:
+        conversation.append(f"[{msg['date']}] От: {msg['from']}\nТема: {msg['subject']}\n{msg['body']}\n")
+    
+    conversation_text = "\n---\n".join(conversation)
+    
+    prompt = f"""Проанализируй эту email-переписку и создай краткую сводку.
+
+ПЕРЕПИСКА:
+{conversation_text}
+
+ОБНАРУЖЕННЫЙ МАРКЕР ЗАКРЫТИЯ: "{closure_marker}"
+
+Ответь в формате JSON:
+{{
+    "summary_short": "Краткий итог в 1-2 предложения (что заказали, чем закончилось)",
+    "summary_detailed": "Подробная сводка: участники, предмет обсуждения, ключевые даты и суммы, итог",
+    "key_decisions": ["решение 1", "решение 2"],
+    "action_items": ["задача 1 если есть", "задача 2"],
+    "status": "closed_success" или "closed_cancelled" или "closed_other",
+    "topic_tags": ["закупка", "оплата", "доставка"]
+}}
+
+Только JSON, без пояснений:"""
+
+    try:
+        response = requests.post(
+            f"{ROUTERAI_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {ROUTERAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "openai/gpt-4.1-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1000,
+                "temperature": 0.3
+            },
+            timeout=60
+        )
+        
+        result = response.json()
+        if "choices" not in result:
+            logger.error(f"Thread summary: нет choices в ответе")
+            return {}
+        
+        answer = result["choices"][0]["message"]["content"].strip()
+        
+        # Убираем markdown если есть
+        if answer.startswith("```"):
+            answer = answer.split("```")[1]
+            if answer.startswith("json"):
+                answer = answer[4:]
+        
+        summary_data = json.loads(answer)
+        logger.info(f"Thread {thread_id}: сводка сгенерирована")
+        return summary_data
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Thread summary: ошибка парсинга JSON: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"Thread summary: ошибка: {e}")
+        return {}
+
+
+def save_thread_summary(cur, thread_id: int, summary_data: dict, closure_marker: str):
+    """Сохраняет сводку в БД."""
+    if not summary_data:
+        return
+    
+    status_map = {
+        "closed_success": "closed",
+        "closed_cancelled": "cancelled",
+        "closed_other": "closed"
+    }
+    
+    new_status = status_map.get(summary_data.get("status", ""), "closed")
+    
+    cur.execute("""
+        UPDATE email_threads
+        SET 
+            status = %s,
+            resolution_detected_at = NOW(),
+            summary_short = %s,
+            summary_detailed = %s,
+            key_decisions = %s,
+            action_items = %s,
+            topic_tags = %s,
+            summary_generated_at = NOW(),
+            summary_model = 'gpt-4.1-mini',
+            updated_at = NOW()
+        WHERE id = %s
+    """, (
+        new_status,
+        summary_data.get("summary_short", ""),
+        summary_data.get("summary_detailed", ""),
+        summary_data.get("key_decisions", []),
+        json.dumps(summary_data.get("action_items", []), ensure_ascii=False),
+        summary_data.get("topic_tags", []),
+        thread_id
+    ))
+    
+    logger.info(f"Thread {thread_id}: сводка сохранена, статус={new_status}")
+
+
+def notify_thread_closed(thread_id: int, subject: str, summary_short: str, status: str):
+    """Отправляет уведомление в Telegram о закрытии цепочки."""
+    if not BOT_TOKEN:
+        return
+    
+    # Получаем список пользователей с включённой рассылкой
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+            user=DB_USER, password=DB_PASSWORD
+        )
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id FROM tg_full_analysis_settings
+                WHERE send_full_analysis = TRUE
+            """)
+            users = [row[0] for row in cur.fetchall()]
+        conn.close()
+    except Exception as e:
+        logger.error(f"Notify thread closed: ошибка получения пользователей: {e}")
+        return
+    
+    if not users:
+        return
+    
+    # Формируем сообщение
+    status_emoji = "✅" if status == "closed" else "❌" if status == "cancelled" else "📧"
+    message = (
+        f"{status_emoji} Цепочка писем закрыта\n\n"
+        f"📌 {subject[:100]}\n\n"
+        f"📝 {summary_short}"
+    )
+    
+    # Отправляем каждому пользователю
+    for user_id in users:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": user_id,
+                    "text": message
+                },
+                timeout=10
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+    
+    logger.info(f"Thread {thread_id}: уведомления отправлены {len(users)} пользователям")
+
+
+def process_thread_closure(cur, thread_id: int, body_text: str, subject: str):
+    """
+    Основная функция: проверяет закрытие, генерирует сводку, уведомляет.
+    Вызывается после каждого нового письма.
+    """
+    # Проверяем, не обработана ли уже эта цепочка
+    cur.execute("""
+        SELECT status, resolution_detected_at FROM email_threads WHERE id = %s
+    """, (thread_id,))
+    row = cur.fetchone()
+    
+    if not row:
+        return
+    
+    current_status, resolution_at = row
+    
+    # Если уже закрыта — пропускаем
+    if current_status in ('closed', 'cancelled') and resolution_at:
+        return
+    
+    # Проверяем маркеры закрытия
+    is_closed, marker = check_thread_closure(body_text, subject)
+    
+    if not is_closed:
+        return
+    
+    logger.info(f"Thread {thread_id}: обнаружен маркер закрытия '{marker}'")
+    
+    # Получаем сообщения цепочки
+    messages = get_thread_messages(cur, thread_id)
+    
+    if not messages:
+        return
+    
+    # Генерируем сводку
+    summary_data = generate_thread_summary(thread_id, messages, marker)
+    
+    if not summary_data:
+        # Если не удалось сгенерировать — просто помечаем как закрытую
+        cur.execute("""
+            UPDATE email_threads
+            SET status = 'closed', resolution_detected_at = NOW(), updated_at = NOW()
+            WHERE id = %s
+        """, (thread_id,))
+        return
+    
+    # Сохраняем сводку
+    save_thread_summary(cur, thread_id, summary_data, marker)
+    
+    # Отправляем уведомление
+    new_status = "closed" if summary_data.get("status") != "closed_cancelled" else "cancelled"
+    notify_thread_closed(
+        thread_id,
+        subject,
+        summary_data.get("summary_short", ""),
+        new_status
+    )
+
 
 # ============================================================
 # СИНХРОНИЗАЦИЯ
@@ -589,7 +881,9 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
     
     # Обновляем статистику ветки
     update_thread_stats(cur, thread_id, parsed)
-
+    
+    # Проверяем закрытие цепочки
+    process_thread_closure(cur, thread_id, parsed.body_text, parsed.subject)
 
 def sync_all_mailboxes():
     """Синхронизирует все активные почтовые ящики."""
