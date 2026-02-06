@@ -295,9 +295,19 @@ def generate_report() -> str:
     routerai = get_routerai_usage()
     if routerai:
         report_parts.append("🤖 <b>RouterAI:</b>")
-        report_parts.append(f"  • Использовано: {routerai.get('usage_monthly', 'N/A')}")
-        report_parts.append(f"  • Лимит: {routerai.get('limit', 'N/A')}")
-        report_parts.append(f"  • Осталось: {routerai.get('limit_remaining', 'N/A')}\n")
+        usage = routerai.get('usage_monthly', 0)
+        limit = routerai.get('limit', 0)
+        if isinstance(usage, (int, float)):
+            report_parts.append(f"  • Использовано за месяц: ${usage:.2f}")
+        else:
+            report_parts.append(f"  • Использовано за месяц: {usage}")
+        if limit and limit > 0:
+            remaining = routerai.get('limit_remaining', 0)
+            report_parts.append(f"  • Лимит: ${limit:.2f}")
+            report_parts.append(f"  • Осталось: ${remaining:.2f}")
+        else:
+            report_parts.append(f"  • Тариф: безлимитный")
+        report_parts.append("")
     
     # === Диск ===
     disk = get_disk_usage()
