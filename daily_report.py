@@ -79,7 +79,9 @@ def get_routerai_usage() -> dict:
             headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}"},
             timeout=10
         )
-        return response.json()
+        result = response.json()
+        # Данные в поле "data"
+        return result.get("data", result)
     except Exception as e:
         log(f"Ошибка получения статистики RouterAI: {e}")
         return {}
