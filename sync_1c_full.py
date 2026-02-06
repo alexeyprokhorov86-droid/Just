@@ -254,8 +254,8 @@ class Sync1C:
         """Загрузка документов начиная с указанной даты (инкрементально)."""
         from urllib.parse import quote
         
+        # Кодируем кириллицу в URL
         encoded_entity = quote(entity_name, safe='_')
-        url = f"{self.base_url}/{encoded_entity}"
         all_docs = []
         skip = 0
         
@@ -265,21 +265,29 @@ class Sync1C:
         print(f"    Инкрементально с {since_date.strftime('%d.%m.%Y %H:%M')}")
         
         while True:
-            params = {
-                "$format": "json",
-                "$top": str(batch_size),
-                "$skip": str(skip),
-                "$filter": f"Date gt datetime'{date_str}' and Posted eq true",
-                "$orderby": "Date asc"
-            }
+            # Формируем URL с параметрами напрямую (без кодирования $)
+            url = (
+                f"{self.base_url}/{encoded_entity}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20gt%20datetime'{date_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20asc"
+            )
             
             try:
-                r = self.session.get(url, params=params, timeout=120)
+                r = self.session.get(url, timeout=120)
                 if r.status_code != 200:
                     print(f"    Ошибка HTTP {r.status_code}")
                     break
                 
-                batch = r.json().get('value', [])
+                data = r.json()
+                if "odata.error" in data:
+                    error_msg = data['odata.error'].get('message', {}).get('value', 'Unknown')
+                    print(f"    Ошибка OData: {error_msg}")
+                    break
+                
+                batch = data.get('value', [])
                 if not batch:
                     break
                 
