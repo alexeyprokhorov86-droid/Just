@@ -2,11 +2,13 @@
 """
 Синхронизация данных из 1С:КА 2.5 в PostgreSQL
 - Закупки
-- Продажи (реализации + корректировки)
+- Продажи (реализация + корректировки)
 - Справочник номенклатуры
 - Справочник видов номенклатуры
 """
-
+import os
+import pathlib
+from dotenv import load_dotenv
 import requests
 from requests.auth import HTTPBasicAuth
 import psycopg2
@@ -14,26 +16,28 @@ from psycopg2.extras import execute_values
 from datetime import datetime, timedelta, date
 import time
 
+# Загружаем переменные окружения
+env_path = pathlib.Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path if env_path.exists() else None)
+
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-
 CONFIG_1C = {
-    "base_url": "http://185.126.95.33:81/NB_KA/odata/standard.odata",
-    "username": "odata.user",
-    "password": "gE9tibul",
+    "base_url": os.getenv("ODATA_BASE_URL", "http://185.126.95.33:81/NB_KA/odata/standard.odata"),
+    "username": os.getenv("ODATA_USERNAME", "odata.user"),
+    "password": os.getenv("ODATA_PASSWORD", ""),
 }
 
 CONFIG_PG = {
-    "host": "localhost",
-    "port": 5432,
-    "database": "knowledge_base",
-    "user": "knowledge",
-    "password": "Prokhorov2025Secure",
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", "5432")),
+    "database": os.getenv("DB_NAME", "knowledge_base"),
+    "user": os.getenv("DB_USER", "knowledge"),
+    "password": os.getenv("DB_PASSWORD", ""),
 }
 
 EMPTY_UUID = "00000000-0000-0000-0000-000000000000"
-
 
 # ============================================================
 # КЛАСС СИНХРОНИЗАЦИИ
