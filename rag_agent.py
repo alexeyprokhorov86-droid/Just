@@ -688,13 +688,13 @@ JSON: {{"search_1c": true/false, "search_chats": true/false, "search_email": tru
 def rerank_results(question: str, results: list, top_k: int = 10) -> list:
     """
     Переранжирование результатов через LLM.
-    Берёт до 30 кандидатов, просит GPT оценить релевантность, возвращает top_k лучших.
+    Берёт до 60 кандидатов, просит GPT оценить релевантность, возвращает top_k лучших.
     """
     if not results or not ROUTERAI_API_KEY:
         return results[:top_k]
     
-    # Берём максимум 30 кандидатов для reranking
-    candidates = results[:30]
+    # Берём максимум 60 кандидатов для reranking
+    candidates = results[:60]
     
     if len(candidates) <= top_k:
         return candidates
@@ -731,7 +731,7 @@ def rerank_results(question: str, results: list, top_k: int = 10) -> list:
             json={
                 "model": "openai/gpt-4.1-mini",
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 100,
+                "max_tokens": 2000,
                 "temperature": 0
             },
             timeout=30
@@ -794,19 +794,19 @@ async def process_rag_query(question: str, chat_context: str = "") -> str:
     
     # Поиск в 1С (SQL) — всегда первым
     if classification.get("search_1c", True):
-        c1_results = search_1c_data(keywords, limit=15)
+        c1_results = search_1c_data(keywords, limit=30)
         db_results.extend(c1_results)
         logger.info(f"Найдено в 1С: {len(c1_results)}")
     
     # Поиск в чатах (векторный с учётом свежести + SQL)
     if classification.get("search_chats", True):
-        chat_results = search_telegram_chats(keywords, limit=10, time_context=time_context)
+        chat_results = search_telegram_chats(keywords, limit=30, time_context=time_context)
         db_results.extend(chat_results)
         logger.info(f"Найдено в чатах: {len(chat_results)}")
     
     # Поиск в email (векторный с учётом свежести)
     if classification.get("search_email", True):
-        email_results = search_emails(keywords, limit=10, time_context=time_context)
+        email_results = search_emails(keywords, limit=30, time_context=time_context)
         db_results.extend(email_results)
         logger.info(f"Найдено в email: {len(email_results)}")
     
