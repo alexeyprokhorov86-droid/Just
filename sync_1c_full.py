@@ -70,6 +70,85 @@ def ensure_sync_status_table(conn):
     except Exception as e:
         print(f"Ошибка создания таблицы sync_status: {e}")
 
+def ensure_catalog_tables(conn):
+    """Создаёт таблицы для справочников если их нет."""
+    try:
+        with conn.cursor() as cur:
+            # Подразделения
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_departments (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    code VARCHAR(50),
+                    name VARCHAR(500),
+                    parent_key VARCHAR(50),
+                    owner_key VARCHAR(50),
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Должности
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_positions (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    code VARCHAR(50),
+                    name VARCHAR(500),
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Сотрудники
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_employees (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    code VARCHAR(50),
+                    name VARCHAR(500),
+                    organization_key VARCHAR(50),
+                    is_archived BOOLEAN DEFAULT FALSE,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Статьи ДДС
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_cash_flow_items (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    code VARCHAR(50),
+                    name VARCHAR(500),
+                    parent_key VARCHAR(50),
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Ресурсные спецификации
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_specifications (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    code VARCHAR(50),
+                    name VARCHAR(500),
+                    owner_key VARCHAR(50),
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            conn.commit()
+            print("✅ Таблицы справочников готовы")
+    except Exception as e:
+        print(f"Ошибка создания таблиц справочников: {e}")
 
 def get_last_sync_date(conn, entity_type: str) -> datetime:
     """Получает дату последней успешной синхронизации."""
@@ -305,7 +384,257 @@ class Sync1C:
         
         print(f"    Найдено: {len(all_docs)} новых документов")
         return all_docs
-    
+
+    def get_catalog_items(self, catalog_name: str):
+        """Загружает все элементы справочника."""
+        from urllib.parse import quote
+        
+        encoded_catalog = quote(catalog_name, safe='_')
+        all_items = []
+        skip = 0
+        batch_size = 500
+        
+        print(f"  Загрузка {catalog_name}...")
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded_catalog}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    print(f"    Ошибка HTTP {r.status_code}")
+                    break
+                
+                data = r.json()
+                if "odata.error" in data:
+                    print(f"    Ошибка OData: {data['odata.error'].get('message', {}).get('value', '')}")
+                    break
+                
+                batch = data.get('value', [])
+                if not batch:
+                    break
+                
+                all_items.extend(batch)
+                
+                if len(batch) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+                
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Загружено: {len(all_items)} записей")
+        return all_items
+
+    def sync_departments(self, conn):
+        """Синхронизация подразделений."""
+        print("\n[Подразделения]")
+        items = self.get_catalog_items("Catalog_ПодразделенияОрганизаций")
+        
+        if not items:
+            return 0
+        
+        count = 0
+        with conn.cursor() as cur:
+            for item in items:
+                try:
+                    cur.execute("""
+                        INSERT INTO c1_departments (ref_key, code, name, parent_key, owner_key, is_deleted, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (ref_key) DO UPDATE SET
+                            code = EXCLUDED.code,
+                            name = EXCLUDED.name,
+                            parent_key = EXCLUDED.parent_key,
+                            owner_key = EXCLUDED.owner_key,
+                            is_deleted = EXCLUDED.is_deleted,
+                            updated_at = NOW()
+                    """, (
+                        item.get('Ref_Key'),
+                        item.get('Code', ''),
+                        item.get('Description', ''),
+                        item.get('Parent_Key') if item.get('Parent_Key') != EMPTY_UUID else None,
+                        item.get('Owner_Key') if item.get('Owner_Key') != EMPTY_UUID else None,
+                        item.get('DeletionMark', False)
+                    ))
+                    count += 1
+                except Exception as e:
+                    print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {count} подразделений")
+        return count
+
+    def sync_positions(self, conn):
+        """Синхронизация должностей."""
+        print("\n[Должности]")
+        items = self.get_catalog_items("Catalog_Должности")
+        
+        if not items:
+            return 0
+        
+        count = 0
+        with conn.cursor() as cur:
+            for item in items:
+                try:
+                    cur.execute("""
+                        INSERT INTO c1_positions (ref_key, code, name, is_deleted, updated_at)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (ref_key) DO UPDATE SET
+                            code = EXCLUDED.code,
+                            name = EXCLUDED.name,
+                            is_deleted = EXCLUDED.is_deleted,
+                            updated_at = NOW()
+                    """, (
+                        item.get('Ref_Key'),
+                        item.get('Code', ''),
+                        item.get('Description', ''),
+                        item.get('DeletionMark', False)
+                    ))
+                    count += 1
+                except Exception as e:
+                    print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {count} должностей")
+        return count
+
+    def sync_employees(self, conn):
+        """Синхронизация сотрудников."""
+        print("\n[Сотрудники]")
+        items = self.get_catalog_items("Catalog_Сотрудники")
+        
+        if not items:
+            return 0
+        
+        count = 0
+        with conn.cursor() as cur:
+            for item in items:
+                try:
+                    cur.execute("""
+                        INSERT INTO c1_employees (ref_key, code, name, organization_key, is_archived, is_deleted, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (ref_key) DO UPDATE SET
+                            code = EXCLUDED.code,
+                            name = EXCLUDED.name,
+                            organization_key = EXCLUDED.organization_key,
+                            is_archived = EXCLUDED.is_archived,
+                            is_deleted = EXCLUDED.is_deleted,
+                            updated_at = NOW()
+                    """, (
+                        item.get('Ref_Key'),
+                        item.get('Code', ''),
+                        item.get('Description', ''),
+                        item.get('ГоловнаяОрганизация_Key') if item.get('ГоловнаяОрганизация_Key') != EMPTY_UUID else None,
+                        item.get('ВАрхиве', False),
+                        item.get('DeletionMark', False)
+                    ))
+                    count += 1
+                except Exception as e:
+                    print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {count} сотрудников")
+        return count
+
+    def sync_cash_flow_items(self, conn):
+        """Синхронизация статей ДДС."""
+        print("\n[Статьи ДДС]")
+        items = self.get_catalog_items("Catalog_СтатьиДвиженияДенежныхСредств")
+        
+        if not items:
+            return 0
+        
+        count = 0
+        with conn.cursor() as cur:
+            for item in items:
+                try:
+                    cur.execute("""
+                        INSERT INTO c1_cash_flow_items (ref_key, code, name, parent_key, is_deleted, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (ref_key) DO UPDATE SET
+                            code = EXCLUDED.code,
+                            name = EXCLUDED.name,
+                            parent_key = EXCLUDED.parent_key,
+                            is_deleted = EXCLUDED.is_deleted,
+                            updated_at = NOW()
+                    """, (
+                        item.get('Ref_Key'),
+                        item.get('Code', ''),
+                        item.get('Description', ''),
+                        item.get('Parent_Key') if item.get('Parent_Key') != EMPTY_UUID else None,
+                        item.get('DeletionMark', False)
+                    ))
+                    count += 1
+                except Exception as e:
+                    print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {count} статей ДДС")
+        return count
+
+    def sync_specifications(self, conn):
+        """Синхронизация ресурсных спецификаций."""
+        print("\n[Ресурсные спецификации]")
+        items = self.get_catalog_items("Catalog_РесурсныеСпецификации")
+        
+        if not items:
+            return 0
+        
+        count = 0
+        with conn.cursor() as cur:
+            for item in items:
+                try:
+                    cur.execute("""
+                        INSERT INTO c1_specifications (ref_key, code, name, owner_key, is_deleted, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (ref_key) DO UPDATE SET
+                            code = EXCLUDED.code,
+                            name = EXCLUDED.name,
+                            owner_key = EXCLUDED.owner_key,
+                            is_deleted = EXCLUDED.is_deleted,
+                            updated_at = NOW()
+                    """, (
+                        item.get('Ref_Key'),
+                        item.get('Code', ''),
+                        item.get('Description', ''),
+                        item.get('Owner_Key') if item.get('Owner_Key') != EMPTY_UUID else None,
+                        item.get('DeletionMark', False)
+                    ))
+                    count += 1
+                except Exception as e:
+                    print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {count} спецификаций")
+        return count
+
+    def sync_all_catalogs(self, conn):
+        """Синхронизация всех справочников."""
+        print("\n" + "=" * 60)
+        print("СПРАВОЧНИКИ (новые)")
+        print("=" * 60)
+        
+        ensure_catalog_tables(conn)
+        
+        self.sync_departments(conn)
+        self.sync_positions(conn)
+        self.sync_employees(conn)
+        self.sync_cash_flow_items(conn)
+        self.sync_specifications(conn)
+  
     def get_catalog(self, catalog_name, batch_size=1000):
         """Загрузка справочника"""
         from urllib.parse import quote
@@ -933,14 +1262,17 @@ def main_full(sync, conn):
     date_from = date_to - timedelta(days=365)
     print(f"\n[3] Период: {date_from} — {date_to}")
     
-    # Синхронизация справочников
+    # Синхронизация справочников (старые)
     print("\n" + "=" * 60)
-    print("СПРАВОЧНИКИ")
+    print("СПРАВОЧНИКИ (базовые)")
     print("=" * 60)
     
     sync.sync_nomenclature_types(conn)
     sync.sync_nomenclature(conn)
     sync.sync_clients(conn)
+    
+    # Синхронизация новых справочников
+    sync.sync_all_catalogs(conn)
     
     # Синхронизация документов
     print("\n" + "=" * 60)
