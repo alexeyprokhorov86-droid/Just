@@ -14,7 +14,7 @@ import re
 import logging
 import base64
 from datetime import datetime, timedelta
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import psycopg2
 from psycopg2 import sql
@@ -1607,7 +1607,12 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if message.document and message.document.file_name:
                     filename = f" ({message.document.file_name})"
                 
-                await message.reply_text(f"📄 Анализ{filename}:\n\n{summary}")
+                # Создаём кнопку для получения полного анализа
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Полный анализ", callback_data=f"full_{message.message_id}")]
+                ])
+                
+                await message.reply_text(f"📄 Анализ{filename}:\n\n{summary}", reply_markup=keyboard)
                 
                 # Рассылка полного анализа в личку тем, кто включил
                 if len(media_analysis) > 400:  # Только если есть что добавить
@@ -2869,6 +2874,79 @@ async def scheduled_daily_analysis(application):
     else:
         logger.warning(f"Чат '{DELAYED_ANALYSIS_CHAT}' не найден для анализа документов")
 
+async def handle_full_analysis_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки 'Полный анализ' — отправляет полный анализ в личку."""
+    query = update.callback_query
+    await query.answer()
+    
+    # Получаем message_id из callback_data
+    callback_data = query.data
+    if not callback_data.startswith("full_"):
+        return
+    
+    try:
+        original_message_id = int(callback_data.replace("full_", ""))
+    except ValueError:
+        await query.answer("Ошибка: неверный формат данных", show_alert=True)
+        return
+    
+    chat_id = query.message.chat.id
+    user_id = query.from_user.id
+    chat_title = query.message.chat.title or "Чат"
+    
+    # Находим таблицу чата
+    table_name = sanitize_table_name(chat_id, chat_title)
+    
+    # Получаем полный анализ из БД
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL("""
+                SELECT media_analysis, message_type, first_name
+                FROM {}
+                WHERE message_id = %s
+            """).format(sql.Identifier(table_name)), (original_message_id,))
+            
+            result = cur.fetchone()
+    finally:
+        conn.close()
+    
+    if not result or not result[0]:
+        await query.answer("Анализ не найден", show_alert=True)
+        return
+    
+    media_analysis, message_type, sender_name = result
+    
+    # Формируем полное сообщение
+    full_message = (
+        f"📄 Полный анализ документа\n\n"
+        f"📍 Чат: {chat_title}\n"
+        f"👤 Отправил: {sender_name or 'Неизвестный'}\n"
+        f"📎 Тип: {message_type}\n\n"
+        f"{media_analysis.replace('*', '✱').replace('_', '‗')}"
+    )
+    
+    # Отправляем в личку пользователю
+    try:
+        if len(full_message) > 4000:
+            parts = [full_message[i:i+4000] for i in range(0, len(full_message), 4000)]
+            for i, part in enumerate(parts):
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=part if i == 0 else f"...продолжение:\n\n{part}"
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=full_message
+            )
+        await query.answer("✅ Полный анализ отправлен в личные сообщения")
+    except Exception as e:
+        if "bot can't initiate" in str(e).lower() or "chat not found" in str(e).lower():
+            await query.answer("❌ Сначала напишите боту в личку /start", show_alert=True)
+        else:
+            logger.error(f"Ошибка отправки полного анализа: {e}")
+            await query.answer("❌ Ошибка отправки", show_alert=True)
 
 def main():
     """Запуск бота."""
@@ -2954,6 +3032,9 @@ def main():
         filters.ALL & ~filters.COMMAND,
         log_message
     ))
+
+    # Обработчик кнопки "Полный анализ"
+    application.add_handler(CallbackQueryHandler(handle_full_analysis_button))
     
     logger.info("🚀 Бот запущен. Логирование + анализ медиа + роли активны.")
     application.add_error_handler(error_handler)
