@@ -685,6 +685,96 @@ JSON: {{"search_1c": true/false, "search_chats": true/false, "search_email": tru
     except:
         return {"search_1c": True, "search_chats": True, "search_email": True, "search_web": False, "keywords": question, "priority": "1c"}
 
+def rerank_results(question: str, results: list, top_k: int = 10) -> list:
+    """
+    Переранжирование результатов через LLM.
+    Берёт до 30 кандидатов, просит GPT оценить релевантность, возвращает top_k лучших.
+    """
+    if not results or not ROUTERAI_API_KEY:
+        return results[:top_k]
+    
+    # Берём максимум 30 кандидатов для reranking
+    candidates = results[:30]
+    
+    if len(candidates) <= top_k:
+        return candidates
+    
+    # Формируем список для оценки
+    docs_text = []
+    for i, r in enumerate(candidates):
+        source = r.get('source', 'Unknown')
+        content = r.get('content', '')[:300]
+        date = r.get('date', '')
+        docs_text.append(f"[{i}] ({source}, {date}) {content}")
+    
+    docs_joined = "\n".join(docs_text)
+    
+    prompt = f"""Оцени релевантность документов для вопроса.
+
+ВОПРОС: {question}
+
+ДОКУМЕНТЫ:
+{docs_joined}
+
+Верни ТОЛЬКО номера {top_k} самых релевантных документов через запятую, от лучшего к худшему.
+Пример ответа: 3,7,1,4,9,2,0,5,8,6
+
+Номера:"""
+
+    try:
+        response = requests.post(
+            f"{ROUTERAI_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {ROUTERAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "openai/gpt-4.1-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 100,
+                "temperature": 0
+            },
+            timeout=30
+        )
+        
+        result = response.json()
+        if "choices" not in result:
+            logger.warning(f"Rerank: нет choices в ответе")
+            return candidates[:top_k]
+        
+        answer = result["choices"][0]["message"]["content"].strip()
+        
+        # Парсим номера
+        indices = []
+        for part in answer.replace(" ", "").split(","):
+            try:
+                idx = int(part.strip())
+                if 0 <= idx < len(candidates) and idx not in indices:
+                    indices.append(idx)
+            except ValueError:
+                continue
+        
+        if not indices:
+            logger.warning(f"Rerank: не удалось распарсить ответ '{answer}'")
+            return candidates[:top_k]
+        
+        # Собираем результаты в новом порядке
+        reranked = [candidates[i] for i in indices[:top_k]]
+        
+        # Добавляем оставшиеся если не хватает
+        if len(reranked) < top_k:
+            for r in candidates:
+                if r not in reranked:
+                    reranked.append(r)
+                if len(reranked) >= top_k:
+                    break
+        
+        logger.info(f"Rerank: {len(candidates)} -> {len(reranked)} (top {top_k})")
+        return reranked
+        
+    except Exception as e:
+        logger.error(f"Ошибка reranking: {e}")
+        return candidates[:top_k]
 
 async def process_rag_query(question: str, chat_context: str = "") -> str:
     """Основная функция обработки RAG-запроса с учётом временного контекста."""
@@ -722,6 +812,10 @@ async def process_rag_query(question: str, chat_context: str = "") -> str:
     
     logger.info(f"Всего в БД: {len(db_results)}")
     
+    # Reranking — переранжируем результаты через LLM
+    if len(db_results) > 10:
+        db_results = rerank_results(question, db_results, top_k=15)
+    
     # Поиск в интернете
     web_results = ""
     web_citations = []
@@ -729,7 +823,6 @@ async def process_rag_query(question: str, chat_context: str = "") -> str:
         web_results, web_citations = search_internet(question)
     
     return generate_response(question, db_results, web_results, web_citations, chat_context)
-
 
 async def index_new_message(table_name: str, message_id: int, content: str):
     """Индексирует новое сообщение для векторного поиска."""
