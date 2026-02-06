@@ -199,7 +199,7 @@ def diversify_by_source_id(
 
     return out
 
-def search_telegram_chats_sql(query: str, limit: int = 10) -> list:
+def search_telegram_chats_sql(query: str, limit: int = 30) -> list:
     """SQL-поиск по чатам (точное совпадение слов)."""
     results = []
     conn = get_db_connection()
@@ -227,7 +227,7 @@ def search_telegram_chats_sql(query: str, limit: int = 10) -> list:
     return results[:limit]
 
 
-def search_telegram_chats_vector(query: str, limit: int = 10, time_context: dict = None) -> list:
+def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict = None) -> list:
     """Векторный (семантический) поиск по чатам с учётом свежести."""
     if not VECTOR_SEARCH_ENABLED:
         return []
@@ -276,7 +276,7 @@ def search_telegram_chats_vector(query: str, limit: int = 10, time_context: dict
         logger.error(f"Ошибка векторного поиска: {e}")
         return []
 
-def search_emails_sql(query: str, limit: int = 10) -> list:
+def search_emails_sql(query: str, limit: int = 30) -> list:
     """SQL/keyword поиск по email — для точных совпадений (артикулы, номера, ИНН)."""
     results = []
     conn = get_db_connection()
@@ -341,7 +341,7 @@ def search_emails_sql(query: str, limit: int = 10) -> list:
     logger.info(f"Email SQL поиск: {len(results)} результатов")
     return results
 
-def search_emails_vector(query: str, limit: int = 10, time_context: dict = None) -> list:
+def search_emails_vector(query: str, limit: int = 30, time_context: dict = None) -> list:
     """Семантический поиск по email с учётом свежести + diversity по source_id (чанки одного письма)."""
     if not VECTOR_SEARCH_ENABLED:
         return []
@@ -406,7 +406,7 @@ def search_emails_vector(query: str, limit: int = 10, time_context: dict = None)
 
     return results
 
-def search_emails(query: str, limit: int = 10, time_context: dict = None) -> list:
+def search_emails(query: str, limit: int = 30, time_context: dict = None) -> list:
     """
     Комбинированный поиск по email:
     1. Векторный поиск (семантический) — находит по смыслу
@@ -442,7 +442,7 @@ def search_emails(query: str, limit: int = 10, time_context: dict = None) -> lis
     logger.info(f"Поиск email: {len(results)} результатов (vector + sql)")
     return results[:limit]
 
-def search_telegram_chats(query: str, limit: int = 10, time_context: dict = None) -> list:
+def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None) -> list:
     """
     Комбинированный поиск по чатам:
     1. Векторный поиск (семантический) — находит по смыслу с учётом свежести
@@ -475,7 +475,7 @@ def search_telegram_chats(query: str, limit: int = 10, time_context: dict = None
     return results[:limit]
 
 
-def search_1c_data(query: str, limit: int = 10) -> list:
+def search_1c_data(query: str, limit: int = 30) -> list:
     """SQL-поиск по данным 1С (цены, номенклатура, контрагенты)."""
     prices = []
     nomenclature = []
