@@ -1619,7 +1619,7 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"📍 Чат: {chat_title}\n"
                         f"👤 Отправил: {sender_name}\n"
                         f"📎 Файл: {filename.strip(' ()') or message_type}\n\n"
-                        f"{media_analysis}"
+                        f"{media_analysis.replace('*', '✱').replace('_', '‗')}"
                     )
                     
                     # Получаем список всех пользователей с включённой рассылкой
