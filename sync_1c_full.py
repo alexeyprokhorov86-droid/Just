@@ -5,8 +5,15 @@
 - Продажи (реализация + корректировки)
 - Справочник номенклатуры
 - Справочник видов номенклатуры
+
+Режимы запуска:
+  python sync_1c_full.py              # полная синхронизация (по умолчанию)
+  python sync_1c_full.py --full       # полная синхронизация
+  python sync_1c_full.py --incremental # только новые документы
 """
 import os
+import sys
+import argparse
 import pathlib
 from dotenv import load_dotenv
 import requests
@@ -38,6 +45,63 @@ CONFIG_PG = {
 }
 
 EMPTY_UUID = "00000000-0000-0000-0000-000000000000"
+
+
+# ============================================================
+# ИНКРЕМЕНТАЛЬНАЯ СИНХРОНИЗАЦИЯ
+# ============================================================
+
+def ensure_sync_status_table(conn):
+    """Создаёт таблицу sync_status если её нет."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sync_status (
+                    id SERIAL PRIMARY KEY,
+                    entity_type VARCHAR(100) UNIQUE NOT NULL,
+                    last_sync_at TIMESTAMP,
+                    records_synced INTEGER DEFAULT 0,
+                    last_error TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            conn.commit()
+    except Exception as e:
+        print(f"Ошибка создания таблицы sync_status: {e}")
+
+
+def get_last_sync_date(conn, entity_type: str) -> datetime:
+    """Получает дату последней успешной синхронизации."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT last_sync_at FROM sync_status 
+                WHERE entity_type = %s
+            """, (entity_type,))
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+    except Exception as e:
+        print(f"Ошибка получения даты синхронизации: {e}")
+    
+    # По умолчанию — 7 дней назад
+    return datetime.now() - timedelta(days=7)
+
+
+def update_last_sync_date(conn, entity_type: str, records_count: int = 0):
+    """Обновляет дату последней синхронизации."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO sync_status (entity_type, last_sync_at, records_synced, updated_at)
+                VALUES (%s, NOW(), %s, NOW())
+                ON CONFLICT (entity_type) 
+                DO UPDATE SET last_sync_at = NOW(), records_synced = %s, updated_at = NOW()
+            """, (entity_type, records_count, records_count))
+            conn.commit()
+    except Exception as e:
+        print(f"Ошибка обновления даты синхронизации: {e}")
 
 # ============================================================
 # КЛАСС СИНХРОНИЗАЦИИ
@@ -184,6 +248,54 @@ class Sync1C:
                 print(f"      {pd}")
             print()
         
+        return all_docs
+
+    def get_documents_since(self, entity_name: str, since_date: datetime, batch_size: int = 500):
+        """Загрузка документов начиная с указанной даты (инкрементально)."""
+        from urllib.parse import quote
+        
+        encoded_entity = quote(entity_name, safe='_')
+        url = f"{self.base_url}/{encoded_entity}"
+        all_docs = []
+        skip = 0
+        
+        # Формат даты для OData
+        date_str = since_date.strftime("%Y-%m-%dT%H:%M:%S")
+        
+        print(f"    Инкрементально с {since_date.strftime('%d.%m.%Y %H:%M')}")
+        
+        while True:
+            params = {
+                "$format": "json",
+                "$top": str(batch_size),
+                "$skip": str(skip),
+                "$filter": f"Date gt datetime'{date_str}' and Posted eq true",
+                "$orderby": "Date asc"
+            }
+            
+            try:
+                r = self.session.get(url, params=params, timeout=120)
+                if r.status_code != 200:
+                    print(f"    Ошибка HTTP {r.status_code}")
+                    break
+                
+                batch = r.json().get('value', [])
+                if not batch:
+                    break
+                
+                all_docs.extend(batch)
+                
+                if len(batch) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.3)
+                
+            except Exception as e:
+                print(f"    Ошибка загрузки: {e}")
+                break
+        
+        print(f"    Найдено: {len(all_docs)} новых документов")
         return all_docs
     
     def get_catalog(self, catalog_name, batch_size=1000):
@@ -806,30 +918,8 @@ class Sync1C:
 # ГЛАВНАЯ ФУНКЦИЯ
 # ============================================================
 
-def main():
-    print("=" * 60)
-    print("СИНХРОНИЗАЦИЯ 1С → PostgreSQL")
-    print("Закупки + Продажи + Справочники")
-    print("=" * 60)
-    
-    sync = Sync1C()
-    
-    # Проверка подключения к 1С
-    print("\n[1] Проверка подключения к 1С...")
-    if not sync.test_connection():
-        print("ОШИБКА: Не удалось подключиться к 1С")
-        return
-    print("OK")
-    
-    # Подключение к PostgreSQL
-    print("\n[2] Подключение к PostgreSQL...")
-    try:
-        conn = psycopg2.connect(**CONFIG_PG)
-        print("OK")
-    except Exception as e:
-        print(f"ОШИБКА: {e}")
-        return
-    
+def main_full(sync, conn):
+    """Полная синхронизация."""
     # Период синхронизации
     date_to = datetime.now().date()
     date_from = date_to - timedelta(days=365)
@@ -851,8 +941,83 @@ def main():
     
     sync.sync_purchases(conn, date_from, date_to)
     sync.sync_sales(conn, date_from, date_to)
+
+
+def main_incremental(sync, conn):
+    """Инкрементальная синхронизация (только новые документы)."""
+    ensure_sync_status_table(conn)
     
-    conn.close()
+    print("\n" + "=" * 60)
+    print("ИНКРЕМЕНТАЛЬНАЯ СИНХРОНИЗАЦИЯ")
+    print("=" * 60)
+    
+    # Закупки
+    print("\n[Закупки]")
+    last_sync = get_last_sync_date(conn, "purchases")
+    docs = sync.get_documents_since("Document_ПриобретениеТоваровУслуг", last_sync)
+    if docs:
+        date_from = last_sync.date()
+        date_to = datetime.now().date()
+        # Используем существующий метод, но он загрузит все — это временное решение
+        # В будущем можно оптимизировать, передавая уже загруженные docs
+        sync.sync_purchases(conn, date_from, date_to)
+        update_last_sync_date(conn, "purchases", len(docs))
+    else:
+        print("    Новых документов нет")
+    
+    # Продажи
+    print("\n[Продажи]")
+    last_sync = get_last_sync_date(conn, "sales")
+    docs = sync.get_documents_since("Document_РеализацияТоваровУслуг", last_sync)
+    if docs:
+        date_from = last_sync.date()
+        date_to = datetime.now().date()
+        sync.sync_sales(conn, date_from, date_to)
+        update_last_sync_date(conn, "sales", len(docs))
+    else:
+        print("    Новых документов нет")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Синхронизация 1С → PostgreSQL')
+    parser.add_argument('--incremental', '-i', action='store_true', 
+                        help='Инкрементальная синхронизация (только новые документы)')
+    parser.add_argument('--full', '-f', action='store_true',
+                        help='Полная синхронизация (все документы за год)')
+    args = parser.parse_args()
+    
+    mode = "incremental" if args.incremental else "full"
+    
+    print("=" * 60)
+    print("СИНХРОНИЗАЦИЯ 1С → PostgreSQL")
+    print(f"Режим: {mode.upper()}")
+    print("=" * 60)
+    
+    sync = Sync1C()
+    
+    # Проверка подключения к 1С
+    print("\n[1] Проверка подключения к 1С...")
+    if not sync.test_connection():
+        print("ОШИБКА: Не удалось подключиться к 1С")
+        return
+    print("OK")
+    
+    # Подключение к PostgreSQL
+    print("\n[2] Подключение к PostgreSQL...")
+    try:
+        conn = psycopg2.connect(**CONFIG_PG)
+        print("OK")
+    except Exception as e:
+        print(f"ОШИБКА: {e}")
+        return
+    
+    try:
+        if args.incremental:
+            main_incremental(sync, conn)
+        else:
+            main_full(sync, conn)
+    finally:
+        conn.close()
     
     print("\n" + "=" * 60)
     print("ГОТОВО!")
