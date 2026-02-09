@@ -22,6 +22,51 @@ import psycopg2
 from psycopg2.extras import execute_values
 from datetime import datetime, timedelta, date
 import time
+import re
+
+def sanitize_string(value):
+    """Очищает строку от битых символов."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+    
+    # Убираем BOM
+    value = value.replace('\ufeff', '')
+    
+    # Убираем нулевые байты
+    value = value.replace('\x00', '')
+    
+    # Убираем управляющие символы (кроме \n, \r, \t)
+    value = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value)
+    
+    # Убираем невалидные суррогатные пары Unicode
+    value = value.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
+    
+    # Заменяем символ замены на пустую строку
+    value = value.replace('\ufffd', '')
+    
+    return value.strip()
+
+
+def sanitize_dict(data: dict) -> dict:
+    """Рекурсивно очищает все строковые значения в словаре."""
+    if not isinstance(data, dict):
+        return data
+    
+    result = {}
+    for key, value in data.items():
+        if isinstance(value, str):
+            result[key] = sanitize_string(value)
+        elif isinstance(value, dict):
+            result[key] = sanitize_dict(value)
+        elif isinstance(value, list):
+            result[key] = [sanitize_dict(item) if isinstance(item, dict) else 
+                          sanitize_string(item) if isinstance(item, str) else item 
+                          for item in value]
+        else:
+            result[key] = value
+    return result
 
 # Загружаем переменные окружения
 env_path = pathlib.Path(__file__).parent / '.env'
@@ -367,6 +412,8 @@ class Sync1C:
                     break
                 
                 batch = data.get('value', [])
+                # Очищаем данные от битых символов
+                batch = [sanitize_dict(doc) for doc in batch]
                 if not batch:
                     break
                 
@@ -416,6 +463,8 @@ class Sync1C:
                     break
                 
                 batch = data.get('value', [])
+                # Очищаем данные от битых символов
+                batch = [sanitize_dict(doc) for doc in batch]
                 if not batch:
                     break
                 
