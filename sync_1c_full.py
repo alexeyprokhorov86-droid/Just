@@ -935,12 +935,17 @@ class Sync1C:
         consecutive_errors = 0
         max_consecutive_errors = 10
         
+        # Формируем фильтр по дате
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
         while consecutive_errors < max_consecutive_errors:
             params = {
                 "$format": "json",
-                "$filter": "Posted eq true",
+                "$filter": f"Date ge datetime'{date_from_str}' and Date le datetime'{date_to_str}' and Posted eq true",
                 "$top": str(batch_size),
-                "$skip": str(skip)
+                "$skip": str(skip),
+                "$orderby": "Date desc"
             }
             
             try:
@@ -963,15 +968,8 @@ class Sync1C:
                 if not docs:
                     break
                 
-                # Фильтруем по дате локально
-                for doc in docs:
-                    doc_date_str = doc.get('Date', '')[:10]
-                    try:
-                        doc_date = datetime.strptime(doc_date_str, "%Y-%m-%d").date()
-                        if date_from <= doc_date <= date_to:
-                            sales_docs.append(doc)
-                    except:
-                        continue
+                # Данные уже отфильтрованы на стороне 1С
+                sales_docs.extend(docs)
                 
                 print(f"  Обработано {skip + len(docs)}, подходящих: {len(sales_docs)}...")
                 
@@ -1004,9 +1002,10 @@ class Sync1C:
         while consecutive_errors < max_consecutive_errors:
             params = {
                 "$format": "json",
-                "$filter": "Posted eq true",
+                "$filter": f"Date ge datetime'{date_from_str}' and Date le datetime'{date_to_str}' and Posted eq true",
                 "$top": str(batch_size),
-                "$skip": str(skip)
+                "$skip": str(skip),
+                "$orderby": "Date desc"
             }
             
             try:
@@ -1026,14 +1025,8 @@ class Sync1C:
                 if not docs:
                     break
                 
-                for doc in docs:
-                    doc_date_str = doc.get('Date', '')[:10]
-                    try:
-                        doc_date = datetime.strptime(doc_date_str, "%Y-%m-%d").date()
-                        if date_from <= doc_date <= date_to:
-                            corrections.append(doc)
-                    except:
-                        continue
+                # Данные уже отфильтрованы на стороне 1С
+                corrections.extend(docs)
                 
                 consecutive_errors = 0
                 
