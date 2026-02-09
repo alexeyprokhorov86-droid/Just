@@ -195,6 +195,152 @@ def ensure_catalog_tables(conn):
     except Exception as e:
         print(f"Ошибка создания таблиц справочников: {e}")
 
+def ensure_production_tables(conn):
+    """Создаёт таблицы для документов производства."""
+    try:
+        with conn.cursor() as cur:
+            # Производство без заказа
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_production (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    department_key VARCHAR(50),
+                    comment TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Выходные изделия (табличная часть производства)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_production_items (
+                    id SERIAL PRIMARY KEY,
+                    production_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_key VARCHAR(50),
+                    specification_key VARCHAR(50),
+                    quantity NUMERIC(15,3),
+                    price NUMERIC(15,2),
+                    sum_total NUMERIC(15,2),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_production_items_prod_key 
+                ON c1_production_items(production_key)
+            """)
+            
+            # Списание затрат на выпуск
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_cost_allocation (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    department_key VARCHAR(50),
+                    comment TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Материалы списания затрат (табличная часть)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_cost_allocation_materials (
+                    id SERIAL PRIMARY KEY,
+                    doc_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_key VARCHAR(50),
+                    quantity NUMERIC(15,3),
+                    sum_total NUMERIC(15,2),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cost_alloc_mat_doc_key 
+                ON c1_cost_allocation_materials(doc_key)
+            """)
+            
+            # Заказ материалов в производство
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_material_orders (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    department_key VARCHAR(50),
+                    comment TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Товары заказа материалов (табличная часть)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_material_order_items (
+                    id SERIAL PRIMARY KEY,
+                    order_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_key VARCHAR(50),
+                    quantity NUMERIC(15,3),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_mat_order_items_order_key 
+                ON c1_material_order_items(order_key)
+            """)
+            
+            # Передача материалов в производство
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_material_transfers (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    department_key VARCHAR(50),
+                    warehouse_key VARCHAR(50),
+                    comment TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Товары передачи материалов (табличная часть)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_material_transfer_items (
+                    id SERIAL PRIMARY KEY,
+                    transfer_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_key VARCHAR(50),
+                    quantity NUMERIC(15,3),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_mat_transfer_items_key 
+                ON c1_material_transfer_items(transfer_key)
+            """)
+            
+            conn.commit()
+            print("✅ Таблицы производства готовы")
+    except Exception as e:
+        print(f"Ошибка создания таблиц производства: {e}")
+
 def get_last_sync_date(conn, entity_type: str) -> datetime:
     """Получает дату последней успешной синхронизации."""
     try:
@@ -684,6 +830,427 @@ class Sync1C:
         self.sync_employees(conn)
         self.sync_cash_flow_items(conn)
         self.sync_specifications(conn)
+
+    def sync_production(self, conn, date_from, date_to):
+        """Синхронизация документов 'Производство без заказа'."""
+        from urllib.parse import quote
+        
+        print("\n[Производство без заказа]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ПроизводствоБезЗаказа", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    print(f"    Ошибка HTTP {r.status_code}")
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        # Сохраняем в БД
+        with conn.cursor() as cur:
+            # Очищаем за период
+            cur.execute(
+                "DELETE FROM c1_production WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            cur.execute(
+                """DELETE FROM c1_production_items WHERE production_key IN 
+                   (SELECT ref_key FROM c1_production WHERE doc_date BETWEEN %s AND %s)""",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_production (ref_key, doc_number, doc_date, posted, 
+                        organization_key, department_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        posted = EXCLUDED.posted,
+                        organization_key = EXCLUDED.organization_key,
+                        department_key = EXCLUDED.department_key,
+                        comment = EXCLUDED.comment,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Подразделение_Key') if doc.get('Подразделение_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                # Табличная часть - выходные изделия
+                for item in doc.get('ВыходныеИзделия', []):
+                    cur.execute("""
+                        INSERT INTO c1_production_items (production_key, line_number, 
+                            nomenclature_key, specification_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Спецификация_Key') if item.get('Спецификация_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0),
+                        item.get('Цена', 0),
+                        item.get('Сумма', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} документов производства")
+        return len(all_docs)
+
+    def sync_cost_allocation(self, conn, date_from, date_to):
+        """Синхронизация документов 'Списание затрат на выпуск'."""
+        from urllib.parse import quote
+        
+        print("\n[Списание затрат на выпуск]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_СписаниеЗатратНаВыпуск", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_cost_allocation WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_cost_allocation (ref_key, doc_number, doc_date, posted,
+                        organization_key, department_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Подразделение_Key') if doc.get('Подразделение_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                # Материалы
+                for item in doc.get('МатериалыИУслуги', []):
+                    cur.execute("""
+                        INSERT INTO c1_cost_allocation_materials (doc_key, line_number,
+                            nomenclature_key, quantity, sum_total)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0),
+                        item.get('Сумма', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} документов списания затрат")
+        return len(all_docs)
+
+    def sync_material_orders(self, conn, date_from, date_to):
+        """Синхронизация документов 'Заказ материалов в производство'."""
+        from urllib.parse import quote
+        
+        print("\n[Заказ материалов в производство]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ЗаказМатериаловВПроизводство", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_material_orders WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_material_orders (ref_key, doc_number, doc_date, posted,
+                        organization_key, department_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Подразделение_Key') if doc.get('Подразделение_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_material_order_items (order_key, line_number,
+                            nomenclature_key, quantity)
+                        VALUES (%s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} заказов материалов")
+        return len(all_docs)
+
+    def sync_material_transfers(self, conn, date_from, date_to):
+        """Синхронизация документов 'Передача материалов в производство'."""
+        from urllib.parse import quote
+        
+        print("\n[Передача материалов в производство]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ПередачаМатериаловВПроизводство", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_material_transfers WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_material_transfers (ref_key, doc_number, doc_date, posted,
+                        organization_key, department_key, warehouse_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Подразделение_Key') if doc.get('Подразделение_Key') != EMPTY_UUID else None,
+                    doc.get('Склад_Key') if doc.get('Склад_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_material_transfer_items (transfer_key, line_number,
+                            nomenclature_key, quantity)
+                        VALUES (%s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} передач материалов")
+        return len(all_docs)
+
+    def sync_all_production(self, conn, date_from, date_to):
+        """Синхронизация всех документов производства."""
+        print("\n" + "=" * 60)
+        print("ДОКУМЕНТЫ ПРОИЗВОДСТВА")
+        print("=" * 60)
+        
+        ensure_production_tables(conn)
+        
+        self.sync_production(conn, date_from, date_to)
+        self.sync_cost_allocation(conn, date_from, date_to)
+        self.sync_material_orders(conn, date_from, date_to)
+        self.sync_material_transfers(conn, date_from, date_to)
+  
   
     def get_catalog(self, catalog_name, batch_size=1000):
         """Загрузка справочника"""
@@ -1329,7 +1896,8 @@ def main_full(sync, conn):
     
     sync.sync_purchases(conn, date_from, date_to)
     sync.sync_sales(conn, date_from, date_to)
-
+    # Документы производства
+    sync.sync_all_production(conn, date_from, date_to)
 
 def main_incremental(sync, conn):
     """Инкрементальная синхронизация (только новые документы)."""
