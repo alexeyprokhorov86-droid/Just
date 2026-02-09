@@ -285,7 +285,8 @@ class Sync1C:
             try:
                 r = self.session.get(url, params=params, timeout=120)
                 if r.status_code == 200:
-                    return r.json().get('value', [])
+                    batch = r.json().get('value', [])
+                    return [sanitize_dict(doc) for doc in batch]
                 return None
             except:
                 return None
@@ -710,6 +711,7 @@ class Sync1C:
                 
                 data = r.json()
                 items = data.get('value', [])
+                items = [sanitize_dict(item) for item in items]
                 
                 if not items:
                     break
@@ -956,6 +958,7 @@ class Sync1C:
                     break
                 
                 docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
                 
                 if not docs:
                     break
@@ -1018,6 +1021,7 @@ class Sync1C:
                     break
                 
                 docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
                 
                 if not docs:
                     break
