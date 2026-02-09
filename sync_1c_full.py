@@ -918,16 +918,19 @@ class Sync1C:
     # ========== ПРОДАЖИ ==========
     
     def sync_sales(self, conn, date_from, date_to):
-        """Синхронизация продаж с локальной фильтрацией по дате"""
+        """Синхронизация продаж с фильтрацией по дате на стороне 1С"""
         from urllib.parse import quote
         
         print("\n[ПРОДАЖИ]")
+        
+        # Формируем даты для фильтра
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
         
         # Загружаем реализации порциями
         print("  Загрузка реализаций...")
         
         encoded_entity = quote("Document_РеализацияТоваровУслуг", safe='_')
-        url = f"{self.base_url}/{encoded_entity}"
         
         sales_docs = []
         skip = 0
@@ -935,21 +938,19 @@ class Sync1C:
         consecutive_errors = 0
         max_consecutive_errors = 10
         
-        # Формируем фильтр по дате
-        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
-        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
-        
         while consecutive_errors < max_consecutive_errors:
-            params = {
-                "$format": "json",
-                "$filter": f"Date ge datetime'{date_from_str}' and Date le datetime'{date_to_str}' and Posted eq true",
-                "$top": str(batch_size),
-                "$skip": str(skip),
-                "$orderby": "Date desc"
-            }
+            # Формируем URL вручную (requests кодирует $ что ломает запрос)
+            url = (
+                f"{self.base_url}/{encoded_entity}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
             
             try:
-                r = self.session.get(url, params=params, timeout=120)
+                r = self.session.get(url, timeout=120)
                 
                 if r.status_code == 500:
                     print(f"  Ошибка 500 на skip={skip}, пропускаем порцию...")
@@ -993,23 +994,24 @@ class Sync1C:
         print("  Загрузка корректировок...")
         
         encoded_corr = quote("Document_КорректировкаРеализации", safe='_')
-        url_corr = f"{self.base_url}/{encoded_corr}"
         
         corrections = []
         skip = 0
         consecutive_errors = 0
         
         while consecutive_errors < max_consecutive_errors:
-            params = {
-                "$format": "json",
-                "$filter": f"Date ge datetime'{date_from_str}' and Date le datetime'{date_to_str}' and Posted eq true",
-                "$top": str(batch_size),
-                "$skip": str(skip),
-                "$orderby": "Date desc"
-            }
+            # Формируем URL вручную
+            url_corr = (
+                f"{self.base_url}/{encoded_corr}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
             
             try:
-                r = self.session.get(url_corr, params=params, timeout=120)
+                r = self.session.get(url_corr, timeout=120)
                 
                 if r.status_code == 500:
                     skip += batch_size
