@@ -341,6 +341,150 @@ def ensure_production_tables(conn):
     except Exception as e:
         print(f"Ошибка создания таблиц производства: {e}")
 
+def ensure_warehouse_tables(conn):
+    """Создаёт таблицы для складских документов."""
+    try:
+        with conn.cursor() as cur:
+            # Пересчет товаров
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_inventory_count (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    warehouse_key VARCHAR(50),
+                    comment TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_inventory_count_items (
+                    id SERIAL PRIMARY KEY,
+                    doc_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_key VARCHAR(50),
+                    quantity_fact NUMERIC(15,3),
+                    quantity_account NUMERIC(15,3),
+                    deviation NUMERIC(15,3),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_inv_count_items_key 
+                ON c1_inventory_count_items(doc_key)
+            """)
+            
+            # Оприходование излишков
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_surplus (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    warehouse_key VARCHAR(50),
+                    comment TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_surplus_items (
+                    id SERIAL PRIMARY KEY,
+                    doc_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_key VARCHAR(50),
+                    quantity NUMERIC(15,3),
+                    price NUMERIC(15,2),
+                    sum_total NUMERIC(15,2),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_surplus_items_key 
+                ON c1_surplus_items(doc_key)
+            """)
+            
+            # Пересортица товаров
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_regrade (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    warehouse_key VARCHAR(50),
+                    comment TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_regrade_items (
+                    id SERIAL PRIMARY KEY,
+                    doc_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_from_key VARCHAR(50),
+                    nomenclature_to_key VARCHAR(50),
+                    quantity NUMERIC(15,3),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_regrade_items_key 
+                ON c1_regrade_items(doc_key)
+            """)
+            
+            # Списание недостач
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_shortage (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    warehouse_key VARCHAR(50),
+                    comment TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_shortage_items (
+                    id SERIAL PRIMARY KEY,
+                    doc_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_key VARCHAR(50),
+                    quantity NUMERIC(15,3),
+                    price NUMERIC(15,2),
+                    sum_total NUMERIC(15,2),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_shortage_items_key 
+                ON c1_shortage_items(doc_key)
+            """)
+            
+            conn.commit()
+            print("✅ Таблицы складских документов готовы")
+    except Exception as e:
+        print(f"Ошибка создания таблиц складских документов: {e}")
+
 def get_last_sync_date(conn, entity_type: str) -> datetime:
     """Получает дату последней успешной синхронизации."""
     try:
@@ -357,7 +501,6 @@ def get_last_sync_date(conn, entity_type: str) -> datetime:
     
     # По умолчанию — 7 дней назад
     return datetime.now() - timedelta(days=7)
-
 
 def update_last_sync_date(conn, entity_type: str, records_count: int = 0):
     """Обновляет дату последней синхронизации."""
@@ -1251,6 +1394,413 @@ class Sync1C:
         self.sync_material_orders(conn, date_from, date_to)
         self.sync_material_transfers(conn, date_from, date_to)
   
+    def sync_inventory_count(self, conn, date_from, date_to):
+        """Синхронизация документов 'Пересчет товаров'."""
+        from urllib.parse import quote
+        
+        print("\n[Пересчет товаров]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ПересчетТоваров", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_inventory_count WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_inventory_count (ref_key, doc_number, doc_date, posted,
+                        organization_key, warehouse_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Склад_Key') if doc.get('Склад_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_inventory_count_items (doc_key, line_number,
+                            nomenclature_key, quantity_fact, quantity_account, deviation)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('КоличествоФакт', 0),
+                        item.get('КоличествоУчет', 0),
+                        item.get('Отклонение', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} пересчетов")
+        return len(all_docs)
+
+    def sync_surplus(self, conn, date_from, date_to):
+        """Синхронизация документов 'Оприходование излишков товаров'."""
+        from urllib.parse import quote
+        
+        print("\n[Оприходование излишков]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ОприходованиеИзлишковТоваров", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_surplus WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_surplus (ref_key, doc_number, doc_date, posted,
+                        organization_key, warehouse_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Склад_Key') if doc.get('Склад_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_surplus_items (doc_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0),
+                        item.get('Цена', 0),
+                        item.get('Сумма', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} оприходований")
+        return len(all_docs)
+
+    def sync_regrade(self, conn, date_from, date_to):
+        """Синхронизация документов 'Пересортица товаров'."""
+        from urllib.parse import quote
+        
+        print("\n[Пересортица товаров]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ПересортицаТоваров", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_regrade WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_regrade (ref_key, doc_number, doc_date, posted,
+                        organization_key, warehouse_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Склад_Key') if doc.get('Склад_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_regrade_items (doc_key, line_number,
+                            nomenclature_from_key, nomenclature_to_key, quantity)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('НоменклатураСписание_Key') if item.get('НоменклатураСписание_Key') != EMPTY_UUID else None,
+                        item.get('НоменклатураОприходование_Key') if item.get('НоменклатураОприходование_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} пересортиц")
+        return len(all_docs)
+
+    def sync_shortage(self, conn, date_from, date_to):
+        """Синхронизация документов 'Списание недостач товаров'."""
+        from urllib.parse import quote
+        
+        print("\n[Списание недостач]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_СписаниеНедостачТоваров", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_shortage WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_shortage (ref_key, doc_number, doc_date, posted,
+                        organization_key, warehouse_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Склад_Key') if doc.get('Склад_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_shortage_items (doc_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0),
+                        item.get('Цена', 0),
+                        item.get('Сумма', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} списаний недостач")
+        return len(all_docs)
+
+    def sync_all_warehouse(self, conn, date_from, date_to):
+        """Синхронизация всех складских документов."""
+        print("\n" + "=" * 60)
+        print("СКЛАДСКИЕ ДОКУМЕНТЫ")
+        print("=" * 60)
+        
+        ensure_warehouse_tables(conn)
+        
+        self.sync_inventory_count(conn, date_from, date_to)
+        self.sync_surplus(conn, date_from, date_to)
+        self.sync_regrade(conn, date_from, date_to)
+        self.sync_shortage(conn, date_from, date_to)
   
     def get_catalog(self, catalog_name, batch_size=1000):
         """Загрузка справочника"""
@@ -1898,6 +2448,8 @@ def main_full(sync, conn):
     sync.sync_sales(conn, date_from, date_to)
     # Документы производства
     sync.sync_all_production(conn, date_from, date_to)
+    # Складские документы
+    sync.sync_all_warehouse(conn, date_from, date_to)
 
 def main_incremental(sync, conn):
     """Инкрементальная синхронизация (только новые документы)."""
