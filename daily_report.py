@@ -180,6 +180,35 @@ def cleanup_orphan_embeddings() -> int:
     
     return deleted
 
+def cleanup_old_backups(keep_count: int = 3) -> dict:
+    """Удаляет старые бэкапы, оставляя только последние keep_count."""
+    backup_dir = pathlib.Path("/home/admin/telegram_logger_bot/backups")
+    
+    result = {"deleted": 0, "freed_mb": 0, "kept": 0}
+    
+    if not backup_dir.exists():
+        return result
+    
+    try:
+        # Находим все бэкапы
+        backups = sorted(backup_dir.glob("backup_*.sql.gz"), key=lambda f: f.stat().st_mtime, reverse=True)
+        
+        result["kept"] = min(len(backups), keep_count)
+        
+        # Удаляем старые
+        for backup in backups[keep_count:]:
+            size_mb = backup.stat().st_size / (1024 * 1024)
+            backup.unlink()
+            result["deleted"] += 1
+            result["freed_mb"] += size_mb
+            log(f"Удалён бэкап: {backup.name} ({size_mb:.0f} MB)")
+        
+        result["freed_mb"] = round(result["freed_mb"], 0)
+        
+    except Exception as e:
+        log(f"Ошибка очистки бэкапов: {e}")
+    
+    return result
 
 def check_sync_1c_status() -> dict:
     """Проверяет статус синхронизации 1С."""
@@ -298,13 +327,13 @@ def generate_report() -> str:
         usage = routerai.get('usage_monthly', 0)
         limit = routerai.get('limit', 0)
         if isinstance(usage, (int, float)):
-            report_parts.append(f"  • Использовано за месяц: ${usage:.2f}")
+            report_parts.append(f"  • Использовано за месяц: Р{usage:.2f}")
         else:
             report_parts.append(f"  • Использовано за месяц: {usage}")
         if limit and limit > 0:
             remaining = routerai.get('limit_remaining', 0)
-            report_parts.append(f"  • Лимит: ${limit:.2f}")
-            report_parts.append(f"  • Осталось: ${remaining:.2f}")
+            report_parts.append(f"  • Лимит: Р{limit:.2f}")
+            report_parts.append(f"  • Осталось: Р{remaining:.2f}")
         else:
             report_parts.append(f"  • Тариф: безлимитный")
         report_parts.append("")
@@ -318,8 +347,13 @@ def generate_report() -> str:
     
     # === Очистка ===
     orphans_deleted = cleanup_orphan_embeddings()
+    backups_cleaned = cleanup_old_backups(keep_count=3)
+    
     report_parts.append("🧹 <b>Очистка:</b>")
-    report_parts.append(f"  • Удалено сирот: {orphans_deleted}\n")
+    report_parts.append(f"  • Удалено сирот: {orphans_deleted}")
+    if backups_cleaned["deleted"] > 0:
+        report_parts.append(f"  • Удалено бэкапов: {backups_cleaned['deleted']} (освобождено {backups_cleaned['freed_mb']:.0f} MB)")
+    report_parts.append(f"  • Бэкапов сохранено: {backups_cleaned['kept']}\n")
     
     # === Предупреждения ===
     warnings = []
