@@ -2252,6 +2252,308 @@ class Sync1C:
         print(f"  ✅ Сохранено: {len(all_docs)} заказов клиентов")
         return len(all_docs)
 
+    def sync_sales_plan_light(self, conn, date_from, date_to):
+        """Синхронизация планов продаж с маленьким batch_size."""
+        from urllib.parse import quote
+        
+        print("\n[План продаж]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ПланПродаж", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 20  # Маленький batch для тяжёлых документов
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=180)  # Увеличенный таймаут
+                if r.status_code != 200:
+                    print(f"    Ошибка HTTP {r.status_code}")
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.5)  # Пауза между запросами
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_sales_plan WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_sales_plan (ref_key, doc_number, doc_date, posted,
+                        organization_key, partner_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_sales_plan_items WHERE plan_key = %s", (ref_key,))
+                
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_sales_plan_items (plan_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0),
+                        item.get('Цена', 0),
+                        item.get('Сумма', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} планов продаж")
+        return len(all_docs)
+
+    def sync_production_plan_light(self, conn, date_from, date_to):
+        """Синхронизация планов производства с маленьким batch_size."""
+        from urllib.parse import quote
+        
+        print("\n[План производства]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ПланПроизводства", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 20
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=180)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_production_plan WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_production_plan (ref_key, doc_number, doc_date, posted,
+                        organization_key, department_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Подразделение_Key') if doc.get('Подразделение_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                cur.execute("DELETE FROM c1_production_plan_items WHERE plan_key = %s", (ref_key,))
+                
+                for item in doc.get('Продукция', []):
+                    cur.execute("""
+                        INSERT INTO c1_production_plan_items (plan_key, line_number,
+                            nomenclature_key, quantity)
+                        VALUES (%s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} планов производства")
+        return len(all_docs)
+
+    def sync_purchase_plan_light(self, conn, date_from, date_to):
+        """Синхронизация планов закупок с маленьким batch_size."""
+        from urllib.parse import quote
+        
+        print("\n[План закупок]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ПланЗакупок", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 20
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=180)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_purchase_plan WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                cur.execute("""
+                    INSERT INTO c1_purchase_plan (ref_key, doc_number, doc_date, posted,
+                        organization_key, comment, is_deleted, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                cur.execute("DELETE FROM c1_purchase_plan_items WHERE plan_key = %s", (ref_key,))
+                
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_purchase_plan_items (plan_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0),
+                        item.get('Цена', 0),
+                        item.get('Сумма', 0)
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} планов закупок")
+        return len(all_docs)
+
     def sync_supplier_orders(self, conn, date_from, date_to):
         """Синхронизация документов 'Заказ поставщику'."""
         from urllib.parse import quote
@@ -3546,6 +3848,81 @@ def main_incremental(sync, conn):
     else:
         print("    Новых документов нет")
 
+def main_quick(sync, conn):
+    """Быстрая синхронизация каждые 5 минут — продажи и заказы за 3 дня."""
+    print("\n" + "=" * 60)
+    print("БЫСТРАЯ СИНХРОНИЗАЦИЯ (5 мин)")
+    print("=" * 60)
+    
+    date_to = datetime.now().date()
+    date_from = date_to - timedelta(days=3)
+    print(f"Период: {date_from} — {date_to}")
+    
+    sync.sync_sales(conn, date_from, date_to)
+    sync.sync_customer_orders(conn, date_from, date_to)
+
+
+def main_hourly(sync, conn):
+    """Часовая синхронизация — закупки, производство, материалы за 3 дня."""
+    print("\n" + "=" * 60)
+    print("ЧАСОВАЯ СИНХРОНИЗАЦИЯ (30 мин)")
+    print("=" * 60)
+    
+    date_to = datetime.now().date()
+    date_from = date_to - timedelta(days=3)
+    print(f"Период: {date_from} — {date_to}")
+    
+    ensure_production_tables(conn)
+    
+    sync.sync_purchases(conn, date_from, date_to)
+    sync.sync_production(conn, date_from, date_to)
+    sync.sync_cost_allocation(conn, date_from, date_to)
+    sync.sync_material_orders(conn, date_from, date_to)
+    sync.sync_material_transfers(conn, date_from, date_to)
+
+
+def main_daily(sync, conn):
+    """Ежедневная синхронизация — все документы за 7 дней."""
+    print("\n" + "=" * 60)
+    print("ЕЖЕДНЕВНАЯ СИНХРОНИЗАЦИЯ")
+    print("=" * 60)
+    
+    date_to = datetime.now().date()
+    date_from = date_to - timedelta(days=7)
+    print(f"Период: {date_from} — {date_to}")
+    
+    # Таблицы
+    ensure_production_tables(conn)
+    ensure_warehouse_tables(conn)
+    ensure_finance_tables(conn)
+    
+    # Продажи и закупки
+    sync.sync_sales(conn, date_from, date_to)
+    sync.sync_purchases(conn, date_from, date_to)
+    
+    # Производство
+    sync.sync_production(conn, date_from, date_to)
+    sync.sync_cost_allocation(conn, date_from, date_to)
+    sync.sync_material_orders(conn, date_from, date_to)
+    sync.sync_material_transfers(conn, date_from, date_to)
+    
+    # Складские
+    sync.sync_inventory_count(conn, date_from, date_to)
+    sync.sync_surplus(conn, date_from, date_to)
+    sync.sync_regrade(conn, date_from, date_to)
+    sync.sync_shortage(conn, date_from, date_to)
+    
+    # Финансовые (кроме тяжёлых планов)
+    sync.sync_bank_expenses(conn, date_from, date_to)
+    sync.sync_customer_orders(conn, date_from, date_to)
+    sync.sync_supplier_orders(conn, date_from, date_to)
+    sync.sync_internal_consumption(conn, date_from, date_to)
+    sync.sync_debt_offset(conn, date_from, date_to)
+    
+    # Тяжёлые планы — с маленьким batch_size
+    sync.sync_sales_plan_light(conn, date_from, date_to)
+    sync.sync_production_plan_light(conn, date_from, date_to)
+    sync.sync_purchase_plan_light(conn, date_from, date_to)
 
 def main():
     parser = argparse.ArgumentParser(description='Синхронизация 1С → PostgreSQL')
@@ -3553,6 +3930,12 @@ def main():
                         help='Инкрементальная синхронизация (только новые документы)')
     parser.add_argument('--full', '-f', action='store_true',
                         help='Полная синхронизация (все документы за год)')
+    parser.add_argument('--quick', '-q', action='store_true',
+                        help='Быстрая синхронизация (продажи и заказы за 3 дня)')
+    parser.add_argument('--hourly', action='store_true',
+                        help='Часовая синхронизация (закупки, производство за 3 дня)')
+    parser.add_argument('--daily', '-d', action='store_true',
+                        help='Ежедневная синхронизация (все документы за 7 дней)')
     args = parser.parse_args()
     
     mode = "incremental" if args.incremental else "full"
@@ -3581,7 +3964,13 @@ def main():
         return
     
     try:
-        if args.incremental:
+        if args.quick:
+            main_quick(sync, conn)
+        elif args.hourly:
+            main_hourly(sync, conn)
+        elif args.daily:
+            main_daily(sync, conn)
+        elif args.incremental:
             main_incremental(sync, conn)
         else:
             main_full(sync, conn)
