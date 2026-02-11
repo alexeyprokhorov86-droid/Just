@@ -1324,9 +1324,10 @@ class Sync1C:
                 # Табличная часть - выходные изделия
                 for item in doc.get('ВыходныеИзделия', []):
                     cur.execute("""
-                        INSERT INTO c1_production_items (production_key, line_number, 
-                            nomenclature_key, specification_key, quantity, price, sum_total)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -1523,9 +1524,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_material_order_items (order_key, line_number,
-                            nomenclature_key, quantity)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -1621,9 +1623,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_material_transfer_items (transfer_key, line_number,
-                            nomenclature_key, quantity)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -1731,9 +1734,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_inventory_count_items (doc_key, line_number,
-                            nomenclature_key, quantity_fact, quantity_account, deviation)
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -1830,9 +1834,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_surplus_items (doc_key, line_number,
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -1929,9 +1934,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_regrade_items (doc_key, line_number,
-                            nomenclature_from_key, nomenclature_to_key, quantity)
-                        VALUES (%s, %s, %s, %s, %s)
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2027,9 +2033,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_shortage_items (doc_key, line_number,
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2238,6 +2245,7 @@ class Sync1C:
                         INSERT INTO c1_customer_order_items (order_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2338,9 +2346,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_sales_plan_items (plan_key, line_number,
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2439,9 +2448,10 @@ class Sync1C:
                 
                 for item in doc.get('Продукция', []):
                     cur.execute("""
-                        INSERT INTO c1_production_plan_items (plan_key, line_number,
-                            nomenclature_key, quantity)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2537,9 +2547,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_purchase_plan_items (plan_key, line_number,
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2642,9 +2653,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_supplier_order_items (order_key, line_number,
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2741,9 +2753,10 @@ class Sync1C:
                 
                 for item in doc.get('Продукция', []):
                     cur.execute("""
-                        INSERT INTO c1_production_plan_items (plan_key, line_number,
-                            nomenclature_key, quantity)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2837,9 +2850,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_purchase_plan_items (plan_key, line_number,
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2937,9 +2951,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_internal_consumption_items (doc_key, line_number,
-                            nomenclature_key, quantity, sum_total)
-                        VALUES (%s, %s, %s, %s, %s)
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                            nomenclature_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -3129,9 +3144,10 @@ class Sync1C:
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_sales_plan_items (plan_key, line_number,
+                        INSERT INTO c1_customer_order_items (order_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
