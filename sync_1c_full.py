@@ -2215,16 +2215,22 @@ class Sync1C:
             for doc in all_docs:
                 ref_key = doc.get('Ref_Key')
                 
+                shipment_date_raw = doc.get('ДатаОтгрузки', '')
+                shipment_date = shipment_date_raw[:10] if shipment_date_raw and shipment_date_raw[:4] != '0001' else None
+
                 cur.execute("""
                     INSERT INTO c1_customer_orders (ref_key, doc_number, doc_date, posted,
                         organization_key, partner_key, warehouse_key, amount, status, 
-                        comment, is_deleted, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        comment, is_deleted, deletion_mark, shipment_date, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ref_key) DO UPDATE SET
                         doc_number = EXCLUDED.doc_number,
                         doc_date = EXCLUDED.doc_date,
                         amount = EXCLUDED.amount,
                         status = EXCLUDED.status,
+                        is_deleted = EXCLUDED.is_deleted,
+                        deletion_mark = EXCLUDED.deletion_mark,
+                        shipment_date = EXCLUDED.shipment_date,
                         updated_at = NOW()
                 """, (
                     ref_key,
@@ -2237,7 +2243,9 @@ class Sync1C:
                     doc.get('СуммаДокумента', 0),
                     doc.get('Статус', ''),
                     doc.get('Комментарий', ''),
-                    doc.get('DeletionMark', False)
+                    doc.get('DeletionMark', False),
+                    doc.get('DeletionMark', False),
+                    shipment_date
                 ))
                 
                 for item in doc.get('Товары', []):
