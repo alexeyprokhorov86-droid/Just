@@ -25,7 +25,7 @@ DB_CONFIG = {
     'password': os.getenv('DB_PASSWORD', '')
 }
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_ADMIN_ID', '')  # ID администратора
 
 
