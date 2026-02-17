@@ -3194,8 +3194,9 @@ class Sync1C:
         encoded_catalog = quote(catalog_name, safe='_')
         
         params = {
-            "$format": "json",
-            "$top": str(batch_size)
+          "$format": "json",
+          "$top": str(batch_size),
+          "$orderby": "Ref_Key"
         }
         url = f"{self.base_url}/{encoded_catalog}"
         all_items = []
