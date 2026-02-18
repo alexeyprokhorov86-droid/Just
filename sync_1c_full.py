@@ -1652,12 +1652,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_material_order_items WHERE order_key = %s", (ref_key,))
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
-                            nomenclature_key, quantity, price, sum_total)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
+                        INSERT INTO c1_material_order_items (order_key, line_number,
+                            nomenclature_key, quantity)
+                        VALUES (%s, %s, %s, %s)
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -1750,13 +1752,15 @@ class Sync1C:
                     doc.get('Комментарий', ''),
                     doc.get('DeletionMark', False)
                 ))
+
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_material_transfer_items WHERE transfer_key = %s", (ref_key,))
                 
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
-                            nomenclature_key, quantity, price, sum_total)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
+                        INSERT INTO c1_material_transfer_items (transfer_key, line_number,
+                            nomenclature_key, quantity)
+                        VALUES (%s, %s, %s, %s)
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -1861,13 +1865,15 @@ class Sync1C:
                     doc.get('Комментарий', ''),
                     doc.get('DeletionMark', False)
                 ))
-                
+
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_inventory_count_items WHERE doc_key = %s", (ref_key,))
+              
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
-                            nomenclature_key, quantity, price, sum_total)
+                        INSERT INTO c1_inventory_count_items (doc_key, line_number,
+                            nomenclature_key, quantity_fact, quantity_account, deviation)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -1962,12 +1968,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_surplus_items WHERE doc_key = %s", (ref_key,))
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                        INSERT INTO c1_surplus_items (doc_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2062,12 +2070,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_regrade_items WHERE doc_key = %s", (ref_key,))
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
-                            nomenclature_key, quantity, price, sum_total)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
+                        INSERT INTO c1_regrade_items (doc_key, line_number,
+                            nomenclature_from_key, nomenclature_to_key, quantity)
+                        VALUES (%s, %s, %s, %s, %s)
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2161,12 +2171,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_shortage_items WHERE doc_key = %s", (ref_key,))
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                        INSERT INTO c1_shortage_items (doc_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2377,7 +2389,10 @@ class Sync1C:
                     doc.get('DeletionMark', False),
                     shipment_date
                 ))
-                
+
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_customer_order_items WHERE order_key = %s", (ref_key,))
+              
                 for item in doc.get('Товары', []):
                     cur.execute("""
                         INSERT INTO c1_customer_order_items (order_key, line_number,
@@ -2481,13 +2496,12 @@ class Sync1C:
                 
                 # Удаляем старые позиции
                 cur.execute("DELETE FROM c1_sales_plan_items WHERE plan_key = %s", (ref_key,))
-                
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                        INSERT INTO c1_sales_plan_items (plan_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2582,14 +2596,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
                 cur.execute("DELETE FROM c1_production_plan_items WHERE plan_key = %s", (ref_key,))
-                
+
                 for item in doc.get('Продукция', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
-                            nomenclature_key, quantity, price, sum_total)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
+                        INSERT INTO c1_production_plan_items (plan_key, line_number,
+                            nomenclature_key, quantity)
+                        VALUES (%s, %s, %s, %s)
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2681,14 +2695,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
                 cur.execute("DELETE FROM c1_purchase_plan_items WHERE plan_key = %s", (ref_key,))
-                
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                        INSERT INTO c1_purchase_plan_items (plan_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2789,12 +2803,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_supplier_order_items WHERE order_key = %s", (ref_key,))
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                        INSERT INTO c1_supplier_order_items (order_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2889,12 +2905,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_production_plan_items WHERE plan_key = %s", (ref_key,))
+
                 for item in doc.get('Продукция', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
-                            nomenclature_key, quantity, price, sum_total)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
+                        INSERT INTO c1_production_plan_items (plan_key, line_number,
+                            nomenclature_key, quantity)
+                        VALUES (%s, %s, %s, %s)
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -2986,12 +3004,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_purchase_plan_items WHERE plan_key = %s", (ref_key,))
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                        INSERT INTO c1_purchase_plan_items (plan_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -3087,12 +3107,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_internal_consumption_items WHERE doc_key = %s", (ref_key,))
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
-                            nomenclature_key, quantity, price, sum_total)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
+                        INSERT INTO c1_internal_consumption_items (doc_key, line_number,
+                            nomenclature_key, quantity, sum_total)
+                        VALUES (%s, %s, %s, %s, %s)
                     """, (
                         ref_key,
                         item.get('LineNumber'),
@@ -3280,12 +3302,14 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_sales_plan_items WHERE plan_key = %s", (ref_key,))
+
                 for item in doc.get('Товары', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
+                        INSERT INTO c1_sales_plan_items (plan_key, line_number,
                             nomenclature_key, quantity, price, sum_total)
                         VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
