@@ -740,6 +740,50 @@ def ensure_finance_tables(conn):
     except Exception as e:
         print(f"Ошибка создания таблиц финансовых документов: {e}")
 
+def ensure_units_table(conn):
+    """Создаёт таблицу для единиц измерения и обновляет c1_specifications."""
+    try:
+        with conn.cursor() as cur:
+            # Таблица единиц измерения
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_units (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    code VARCHAR(50),
+                    name VARCHAR(100),
+                    full_name VARCHAR(500),
+                    international_abbr VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Добавляем недостающие колонки в c1_specifications
+            cur.execute("""
+                ALTER TABLE c1_specifications 
+                ADD COLUMN IF NOT EXISTS product_key VARCHAR(50),
+                ADD COLUMN IF NOT EXISTS product_quantity NUMERIC(15,6),
+                ADD COLUMN IF NOT EXISTS status VARCHAR(50),
+                ADD COLUMN IF NOT EXISTS auto_select VARCHAR(50),
+                ADD COLUMN IF NOT EXISTS has_nested BOOLEAN DEFAULT FALSE
+            """)
+            
+            # Индексы для быстрого поиска
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_c1_spec_product_key 
+                ON c1_specifications(product_key)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_c1_spec_status 
+                ON c1_specifications(status)
+            """)
+            
+            conn.commit()
+            print("✅ Таблицы единиц измерения и спецификаций обновлены")
+    except Exception as e:
+        print(f"Ошибка создания таблиц: {e}")
+        conn.rollback()
+
 def get_last_sync_date(conn, entity_type: str) -> datetime:
     """Получает дату последней успешной синхронизации."""
     try:
@@ -1178,37 +1222,121 @@ class Sync1C:
         print(f"  ✅ Сохранено: {count} статей ДДС")
         return count
 
-    def sync_specifications(self, conn):
-        """Синхронизация ресурсных спецификаций."""
-        print("\n[Ресурсные спецификации]")
-        items = self.get_catalog_items("Catalog_РесурсныеСпецификации")
+    def sync_units(self, conn):
+        """Синхронизация единиц измерения."""
+        print("\n[Единицы измерения]")
+        items = self.get_catalog_items("Catalog_ЕдиницыИзмерения")
         
         if not items:
+            print("  Нет данных")
             return 0
         
         count = 0
         with conn.cursor() as cur:
             for item in items:
                 try:
+                    ref_key = item.get('Ref_Key')
+                    if not ref_key or ref_key == EMPTY_UUID:
+                        continue
+                    
                     cur.execute("""
-                        INSERT INTO c1_specifications (ref_key, code, name, owner_key, is_deleted, updated_at)
+                        INSERT INTO c1_units (ref_key, code, name, full_name, international_abbr, updated_at)
                         VALUES (%s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (ref_key) DO UPDATE SET
+                            code = EXCLUDED.code,
+                            name = EXCLUDED.name,
+                            full_name = EXCLUDED.full_name,
+                            international_abbr = EXCLUDED.international_abbr,
+                            updated_at = NOW()
+                    """, (
+                        ref_key,
+                        item.get('Code', ''),
+                        item.get('Description', ''),
+                        item.get('НаименованиеПолное', ''),
+                        item.get('МеждународноеСокращение', ''),
+                    ))
+                    count += 1
+                except Exception as e:
+                    print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {count} единиц измерения")
+        return count
+
+  
+    def sync_specifications(self, conn):
+        """Синхронизация ресурсных спецификаций с полными данными."""
+        print("\n[Ресурсные спецификации]")
+        
+        items = self.get_catalog_items("Catalog_РесурсныеСпецификации")
+        
+        if not items:
+            print("  Нет данных")
+            return 0
+        
+        count = 0
+        with conn.cursor() as cur:
+            for item in items:
+                try:
+                    ref_key = item.get('Ref_Key')
+                    if not ref_key or ref_key == EMPTY_UUID:
+                        continue
+                    
+                    # Статус
+                    status_raw = item.get('Статус', '')
+                    status = status_raw if isinstance(status_raw, str) else ''
+                    
+                    # Автоматический выбор (инвертируем флаг исключения)
+                    exclude_auto = item.get('ИсключитьАвтоматическийВыборВДокументах', False)
+                    auto_select = 'Вручную' if exclude_auto else 'Автоматически'
+                    
+                    # Основное изделие (номенклатура) - КЛЮЧЕВОЕ ПОЛЕ!
+                    product_key = item.get('ОсновноеИзделиеНоменклатура_Key')
+                    if product_key == EMPTY_UUID:
+                        product_key = None
+                    
+                    # Количество выхода
+                    product_qty = item.get('ОсновноеИзделиеКоличествоУпаковок', 0)
+                    try:
+                        product_qty = float(product_qty) if product_qty else 0
+                    except:
+                        product_qty = 0
+                    
+                    # Есть вложенные спецификации
+                    has_nested = item.get('ЕстьВложенныеСпецификации', False)
+                    
+                    cur.execute("""
+                        INSERT INTO c1_specifications 
+                        (ref_key, code, name, owner_key, is_deleted, updated_at,
+                         product_key, product_quantity, status, auto_select, has_nested)
+                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s)
                         ON CONFLICT (ref_key) DO UPDATE SET
                             code = EXCLUDED.code,
                             name = EXCLUDED.name,
                             owner_key = EXCLUDED.owner_key,
                             is_deleted = EXCLUDED.is_deleted,
-                            updated_at = NOW()
+                            updated_at = NOW(),
+                            product_key = EXCLUDED.product_key,
+                            product_quantity = EXCLUDED.product_quantity,
+                            status = EXCLUDED.status,
+                            auto_select = EXCLUDED.auto_select,
+                            has_nested = EXCLUDED.has_nested
                     """, (
-                        item.get('Ref_Key'),
+                        ref_key,
                         item.get('Code', ''),
                         item.get('Description', ''),
                         item.get('Owner_Key') if item.get('Owner_Key') != EMPTY_UUID else None,
-                        item.get('DeletionMark', False)
+                        item.get('DeletionMark', False),
+                        product_key,
+                        product_qty,
+                        status,
+                        auto_select,
+                        has_nested
                     ))
                     count += 1
                 except Exception as e:
-                    print(f"    Ошибка записи: {e}")
+                    print(f"    Ошибка записи спецификации: {e}")
             
             conn.commit()
         
@@ -1222,11 +1350,13 @@ class Sync1C:
         print("=" * 60)
         
         ensure_catalog_tables(conn)
+        ensure_units_table(conn)  # <-- ДОБАВЛЕНО
         
         self.sync_departments(conn)
         self.sync_positions(conn)
         self.sync_employees(conn)
         self.sync_cash_flow_items(conn)
+        self.sync_units(conn)        # <-- ДОБАВЛЕНО
         self.sync_specifications(conn)
 
     def sync_production(self, conn, date_from, date_to):
@@ -3302,13 +3432,25 @@ class Sync1C:
         print(f"  Сохранено {len(values)} видов номенклатуры")
     
     def sync_nomenclature(self, conn):
-        """Синхронизация номенклатуры"""
+        """Синхронизация номенклатуры с единицами измерения."""
         print("\n[НОМЕНКЛАТУРА]")
         items = self.get_catalog("Catalog_Номенклатура")
         print(f"  Получено {len(items)} позиций")
         
         if not items:
             return
+        
+        # Загружаем справочник единиц измерения в кэш
+        units_cache = {}
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT ref_key, name FROM c1_units")
+            for row in cur.fetchall():
+                units_cache[row[0]] = row[1]
+            cur.close()
+            print(f"  Загружено {len(units_cache)} единиц измерения в кэш")
+        except Exception as e:
+            print(f"  Предупреждение: не удалось загрузить единицы измерения: {e}")
         
         cur = conn.cursor()
         cur.execute("DELETE FROM nomenclature")
@@ -3331,8 +3473,14 @@ class Sync1C:
             if unit_key == EMPTY_UUID:
                 unit_key = None
             
-            # Вес
+            # Получаем название единицы измерения из кэша
+            unit_name = units_cache.get(unit_key, '') if unit_key else ''
+            
+            # Вес и единица веса
             weight = None
+            weight_unit_key = item.get('ВесЕдиницаИзмерения_Key')
+            weight_unit = units_cache.get(weight_unit_key, '') if weight_unit_key and weight_unit_key != EMPTY_UUID else ''
+            
             if item.get('ВесЧислитель') and item.get('ВесЗнаменатель'):
                 try:
                     num = float(item.get('ВесЧислитель', 0) or 0)
@@ -3352,9 +3500,9 @@ class Sync1C:
                 item.get('Артикул', ''),
                 type_key,
                 unit_key,
-                '',  # unit_name - заполним позже
+                unit_name,
                 weight,
-                '',  # weight_unit
+                weight_unit,
             ))
             
             # Кэшируем
@@ -3369,7 +3517,9 @@ class Sync1C:
                    VALUES %s ON CONFLICT (id) DO UPDATE SET
                    parent_id=EXCLUDED.parent_id, name=EXCLUDED.name, 
                    full_name=EXCLUDED.full_name, article=EXCLUDED.article,
-                   type_id=EXCLUDED.type_id, weight=EXCLUDED.weight""",
+                   type_id=EXCLUDED.type_id, unit_id=EXCLUDED.unit_id,
+                   unit_name=EXCLUDED.unit_name, weight=EXCLUDED.weight,
+                   weight_unit=EXCLUDED.weight_unit""",
                 values
             )
         
@@ -3813,17 +3963,18 @@ def main_full(sync, conn):
     date_from = date_to - timedelta(days=365)
     print(f"\n[3] Период: {date_from} — {date_to}")
     
-    # Синхронизация справочников (старые)
+    # Синхронизация справочников (базовые)
     print("\n" + "=" * 60)
     print("СПРАВОЧНИКИ (базовые)")
     print("=" * 60)
     
     sync.sync_nomenclature_types(conn)
+    # Синхронизация новых справочников
+    sync.sync_all_catalogs(conn)
     sync.sync_nomenclature(conn)
     sync.sync_clients(conn)
     
-    # Синхронизация новых справочников
-    sync.sync_all_catalogs(conn)
+    
     
     # Синхронизация документов
     print("\n" + "=" * 60)
@@ -3832,11 +3983,8 @@ def main_full(sync, conn):
     
     sync.sync_purchases(conn, date_from, date_to)
     sync.sync_sales(conn, date_from, date_to)
-    # Документы производства
     sync.sync_all_production(conn, date_from, date_to)
-    # Складские документы
     sync.sync_all_warehouse(conn, date_from, date_to)
-    # Финансовые документы и заказы
     sync.sync_all_finance(conn, date_from, date_to)
 
 def main_incremental(sync, conn):
