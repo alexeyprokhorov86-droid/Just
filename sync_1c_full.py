@@ -1225,7 +1225,7 @@ class Sync1C:
     def sync_units(self, conn):
         """Синхронизация единиц измерения."""
         print("\n[Единицы измерения]")
-        items = self.get_catalog_items("Catalog_ЕдиницыИзмерения")
+        items = self.get_catalog_items("Catalog_УпаковкиЕдиницыИзмерения")
         
         if not items:
             print("  Нет данных")
@@ -1454,10 +1454,10 @@ class Sync1C:
                 # Табличная часть - выходные изделия
                 for item in doc.get('ВыходныеИзделия', []):
                     cur.execute("""
-                        INSERT INTO c1_customer_order_items (order_key, line_number,
-                            nomenclature_key, quantity, price, sum_total)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
+                        INSERT INTO c1_production_items (production_key, line_number,
+                            nomenclature_key, specification_key, quantity, price, sum_total)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (production_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
