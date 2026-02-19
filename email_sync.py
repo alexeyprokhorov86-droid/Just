@@ -680,11 +680,31 @@ def notify_thread_closed(thread_id: int, subject: str, summary_short: str, statu
     logger.info(f"Thread {thread_id}: уведомления отправлены {len(users)} пользователям")
 
 
-def process_thread_closure(cur, thread_id: int, body_text: str, subject: str):
+def process_thread_closure(cur, thread_id: int, body_text: str, subject: str, from_address: str = ""):
     """
     Основная функция: проверяет закрытие, генерирует сводку, уведомляет.
     Вызывается после каждого нового письма.
     """
+    # Фильтр 1: пропускаем noreply и автоуведомления
+    skip_senders = ['noreply@', 'no-reply@', 'robot@', 'donotreply@', 'автоответ']
+    if any(s in (from_address or "").lower() for s in skip_senders):
+        logger.info(f"Thread {thread_id}: пропускаем — отправитель noreply/автоуведомление")
+        return
+
+    # Фильтр 2: внешние отправители — проверяем есть ли ответ от наших сотрудников
+    our_domains = ['totsamiy.com', 'lacannelle.ru']
+    is_internal = any(d in (from_address or "").lower() for d in our_domains)
+    if not is_internal:
+        cur.execute("""
+            SELECT COUNT(*) FROM email_messages
+            WHERE thread_id = %s
+            AND (from_address LIKE '%totsamiy.com' OR from_address LIKE '%lacannelle.ru')
+        """, (thread_id,))
+        our_replies = cur.fetchone()[0]
+        if our_replies == 0:
+            logger.info(f"Thread {thread_id}: пропускаем — внешний отправитель, нет ответов от сотрудников")
+            return
+
     # Проверяем, не обработана ли уже эта цепочка
     cur.execute("""
         SELECT status, resolution_detected_at FROM email_threads WHERE id = %s
@@ -883,7 +903,7 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
     update_thread_stats(cur, thread_id, parsed)
     
     # Проверяем закрытие цепочки
-    process_thread_closure(cur, thread_id, parsed.body_text, parsed.subject)
+    process_thread_closure(cur, thread_id, parsed.body_text, parsed.subject, parsed.from_address)
 
 def sync_all_mailboxes():
     """Синхронизирует все активные почтовые ящики."""
