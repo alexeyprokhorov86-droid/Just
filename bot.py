@@ -26,6 +26,7 @@ from telegram.helpers import escape_markdown
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from company_context import get_company_profile
+from fact_extractor import extract_and_save_facts
 
 # Загружаем переменные окружения
 # Ищем .env в директории скрипта или в текущей директории
@@ -1417,6 +1418,13 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
     except Exception as e:
         logger.error(f"Ошибка обработки медиа: {e}")
 
+    # Автоизвлечение фактов из анализа
+    if media_analysis and len(media_analysis) > 50:
+        try:
+            await extract_and_save_facts(media_analysis, source=f"document:{filename or media_type_str}")
+        except Exception as e:
+            logger.debug(f"Fact extraction error: {e}")
+
     return media_type_str, media_analysis, content_text
 
 
@@ -1521,7 +1529,13 @@ async def analyze_daily_documents(bot, chat_id: int, chat_title: str):
                 messages=[{"role": "user", "content": summary_prompt}],
             )
             summary_analysis = response.choices[0].message.content
-
+            
+            # Автоизвлечение фактов из сводного анализа дня
+            try:
+                await extract_and_save_facts(summary_analysis, source=f"daily_analysis:{chat_title}")
+            except Exception as e:
+                logger.debug(f"Fact extraction from daily analysis error: {e}")
+            
             # Сохраняем сводный анализ в БД для последнего документа дня
             # (или можно создать отдельную таблицу для дневных отчетов)
             conn = get_db_connection()
