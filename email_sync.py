@@ -26,6 +26,7 @@ from typing import Optional, List, Generator
 from dataclasses import dataclass
 import pathlib
 from company_context import get_company_profile
+from fact_extractor import extract_facts_from_thread_summary_sync
 
 from dotenv import load_dotenv
 import psycopg2
@@ -754,6 +755,12 @@ def process_thread_closure(cur, thread_id: int, body_text: str, subject: str, fr
     
     # Сохраняем сводку
     save_thread_summary(cur, thread_id, summary_data, marker)
+    
+    # Автоизвлечение фактов из сводки
+    try:
+        extract_facts_from_thread_summary_sync(summary_data, thread_id, subject)
+    except Exception as e:
+        logger.debug(f"Fact extraction from thread error: {e}")
     
     # Отправляем уведомление
     new_status = "closed" if summary_data.get("status") != "closed_cancelled" else "cancelled"
