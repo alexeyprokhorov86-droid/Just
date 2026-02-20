@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Generator
 from dataclasses import dataclass
 import pathlib
+from company_context import get_company_profile
 
 from dotenv import load_dotenv
 import psycopg2
@@ -530,7 +531,12 @@ def generate_thread_summary(thread_id: int, messages: list, closure_marker: str)
     
     conversation_text = "\n---\n".join(conversation)
     
-    prompt = f"""Проанализируй эту email-переписку и создай краткую сводку.
+    company_profile = get_company_profile()
+    
+    prompt = f"""{company_profile}
+
+Проанализируй эту email-переписку компании Фрумелад и создай краткую сводку.
+Используй знания о компании из профиля выше: учитывай кто такие контрагенты, какие бренды, кто из сотрудников участвует.
 
 ПЕРЕПИСКА:
 {conversation_text}
