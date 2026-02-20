@@ -6,6 +6,7 @@ RAG Agent для поиска по базе знаний и интернету.
 import os
 import pathlib
 from dotenv import load_dotenv
+from company_context import get_company_profile
 
 env_path = pathlib.Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path if env_path.exists() else None)
@@ -630,7 +631,11 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
         
         context = "\n".join(context_parts)
         
-        prompt = f"""Ты — RAG-агент компании. Отвечай на русском.
+        company_profile = get_company_profile()
+        
+        prompt = f"""{company_profile}
+
+Ты — RAG-агент компании Фрумелад. Отвечай на русском. Используй знания из профиля компании выше.
 
 ВОПРОС: {question}
 
