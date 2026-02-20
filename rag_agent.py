@@ -17,7 +17,7 @@ import requests
 import psycopg2
 from psycopg2 import sql
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 logger = logging.getLogger(__name__)
 
@@ -476,33 +476,218 @@ def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None
     return results[:limit]
 
 
-def search_1c_data(query: str, limit: int = 30) -> list:
-    """Универсальный поиск по данным 1С с JOIN-ами по справочникам.
+def _resolve_period(period_str):
+    """Преобразует строку периода из Router в дату начала."""
+    if not period_str or period_str == "null":
+        return None
     
-    Приоритет результатов:
-    1. Закупочные цены (purchase_prices)
-    2. Продажи (sales) 
-    3. Заказы клиентов (c1_customer_orders + items)
-    4. Заказы поставщикам (c1_supplier_orders + items)
-    5. Производство (c1_production + items)
-    6. Банковские расходы (c1_bank_expenses)
-    7. Внутреннее потребление (c1_internal_consumption + items)
-    8. Инвентаризация (c1_inventory_count + items)
-    9. Номенклатура справочник
-    10. Клиенты справочник
-    """
-    # Категории результатов с приоритетами
+    today = date.today()
+    
+    period_map = {
+        "today": today,
+        "yesterday": today - timedelta(days=1),
+        "week": today - timedelta(weeks=1),
+        "2weeks": today - timedelta(weeks=2),
+        "month": today - timedelta(days=30),
+        "quarter": today - timedelta(days=90),
+        "half_year": today - timedelta(days=180),
+        "year": today - timedelta(days=365),
+    }
+    
+    if period_str in period_map:
+        return period_map[period_str]
+    
+    months = {
+        'january': 1, 'february': 2, 'march': 3, 'april': 4,
+        'may': 5, 'june': 6, 'july': 7, 'august': 8,
+        'september': 9, 'october': 10, 'november': 11, 'december': 12
+    }
+    if period_str in months:
+        month_num = months[period_str]
+        year = today.year
+        if month_num > today.month:
+            year -= 1
+        return date(year, month_num, 1)
+    
+    return None
+
+
+def search_1c_analytics(analytics_type, keywords="", period_date=None, 
+                         entities=None, limit=20):
+    """Агрегированные запросы по данным 1С (топ клиентов, товаров, поставщиков)."""
+    results = []
+    conn = get_db_connection()
+    
+    try:
+        with conn.cursor() as cur:
+            
+            # ТОП КЛИЕНТОВ ПО ПРОДАЖАМ
+            if analytics_type in ("top_clients", "sales_summary"):
+                try:
+                    sql = """
+                        SELECT client_name, 
+                               COUNT(*) as positions,
+                               SUM(sum_with_vat) as revenue,
+                               MIN(doc_date) as first_date,
+                               MAX(doc_date) as last_date,
+                               COUNT(DISTINCT doc_number) as docs_count
+                        FROM sales 
+                        WHERE doc_type = 'Реализация'
+                    """
+                    params = []
+                    if period_date:
+                        sql += " AND doc_date >= %s"
+                        params.append(period_date)
+                    if entities and entities.get("clients"):
+                        client_filters = []
+                        for client in entities["clients"]:
+                            client_filters.append("client_name ILIKE %s")
+                            params.append(f"%{client}%")
+                        sql += " AND (" + " OR ".join(client_filters) + ")"
+                    sql += " GROUP BY client_name ORDER BY revenue DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(sql, params)
+                    
+                    for row in cur.fetchall():
+                        revenue = f"{row[2]:,.0f}" if row[2] else "0"
+                        period = ""
+                        if row[3] and row[4]:
+                            period = f" (период: {row[3].strftime('%d.%m.%Y')} — {row[4].strftime('%d.%m.%Y')})"
+                        results.append({
+                            "source": "1С: АНАЛИТИКА ПРОДАЖ ПО КЛИЕНТАМ",
+                            "date": row[4].strftime("%d.%m.%Y") if row[4] else "",
+                            "content": f"{row[0]}: выручка {revenue} руб., "
+                                       f"{row[1]} позиций, {row[5]} документов{period}",
+                            "type": "analytics_sales_client"
+                        })
+                except Exception as e:
+                    logger.debug(f"Ошибка аналитики клиентов: {e}")
+            
+            # ТОП ТОВАРОВ ПО ПРОДАЖАМ
+            if analytics_type in ("top_products", "sales_summary"):
+                try:
+                    sql = """
+                        SELECT nomenclature_name,
+                               SUM(quantity) as total_qty,
+                               SUM(sum_with_vat) as revenue,
+                               AVG(price) as avg_price,
+                               COUNT(DISTINCT client_name) as clients_count
+                        FROM sales
+                        WHERE doc_type = 'Реализация'
+                    """
+                    params = []
+                    if period_date:
+                        sql += " AND doc_date >= %s"
+                        params.append(period_date)
+                    if entities and entities.get("products"):
+                        prod_filters = []
+                        for prod in entities["products"]:
+                            prod_filters.append("nomenclature_name ILIKE %s")
+                            params.append(f"%{prod}%")
+                        sql += " AND (" + " OR ".join(prod_filters) + ")"
+                    sql += " GROUP BY nomenclature_name ORDER BY revenue DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(sql, params)
+                    
+                    for row in cur.fetchall():
+                        revenue = f"{row[2]:,.0f}" if row[2] else "0"
+                        avg_price = f"{row[3]:,.2f}" if row[3] else "?"
+                        results.append({
+                            "source": "1С: АНАЛИТИКА ПРОДАЖ ПО ТОВАРАМ",
+                            "date": "",
+                            "content": f"{row[0]}: выручка {revenue} руб., "
+                                       f"кол-во: {row[1]}, ср.цена: {avg_price} руб., "
+                                       f"клиентов: {row[4]}",
+                            "type": "analytics_sales_product"
+                        })
+                except Exception as e:
+                    logger.debug(f"Ошибка аналитики товаров: {e}")
+            
+            # ТОП ПОСТАВЩИКОВ ПО ЗАКУПКАМ
+            if analytics_type in ("top_suppliers", "purchase_summary"):
+                try:
+                    sql = """
+                        SELECT contractor_name,
+                               COUNT(*) as positions,
+                               SUM(sum_total) as total_sum,
+                               COUNT(DISTINCT nomenclature_name) as products_count,
+                               MAX(doc_date) as last_date
+                        FROM purchase_prices
+                    """
+                    params = []
+                    if period_date:
+                        sql += " WHERE doc_date >= %s"
+                        params.append(period_date)
+                    if entities and entities.get("suppliers"):
+                        prefix = " AND " if period_date else " WHERE "
+                        supp_filters = []
+                        for supp in entities["suppliers"]:
+                            supp_filters.append("contractor_name ILIKE %s")
+                            params.append(f"%{supp}%")
+                        sql += prefix + "(" + " OR ".join(supp_filters) + ")"
+                    sql += " GROUP BY contractor_name ORDER BY total_sum DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(sql, params)
+                    
+                    for row in cur.fetchall():
+                        total = f"{row[2]:,.0f}" if row[2] else "0"
+                        results.append({
+                            "source": "1С: АНАЛИТИКА ЗАКУПОК ПО ПОСТАВЩИКАМ",
+                            "date": row[4].strftime("%d.%m.%Y") if row[4] else "",
+                            "content": f"{row[0]}: сумма закупок {total} руб., "
+                                       f"{row[1]} позиций, {row[3]} наименований",
+                            "type": "analytics_purchases"
+                        })
+                except Exception as e:
+                    logger.debug(f"Ошибка аналитики закупок: {e}")
+            
+            # АНАЛИТИКА ПРОИЗВОДСТВА
+            if analytics_type == "production_summary":
+                try:
+                    sql = """
+                        SELECT n.name as product,
+                               SUM(pi.quantity) as total_qty,
+                               SUM(pi.sum_total) as total_sum,
+                               COUNT(DISTINCT p.ref_key) as docs_count,
+                               MAX(p.doc_date) as last_date
+                        FROM c1_production p
+                        JOIN c1_production_items pi ON pi.production_key = p.ref_key
+                        LEFT JOIN nomenclature n ON pi.nomenclature_key = n.id::text
+                        WHERE p.is_deleted = false
+                    """
+                    params = []
+                    if period_date:
+                        sql += " AND p.doc_date >= %s"
+                        params.append(period_date)
+                    sql += " GROUP BY n.name ORDER BY total_sum DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(sql, params)
+                    
+                    for row in cur.fetchall():
+                        total = f"{row[2]:,.0f}" if row[2] else "0"
+                        results.append({
+                            "source": "1С: АНАЛИТИКА ПРОИЗВОДСТВА",
+                            "date": row[4].strftime("%d.%m.%Y") if row[4] else "",
+                            "content": f"{row[0] or '?'}: произведено {row[1]}, "
+                                       f"сумма: {total} руб., документов: {row[3]}",
+                            "type": "analytics_production"
+                        })
+                except Exception as e:
+                    logger.debug(f"Ошибка аналитики производства: {e}")
+    
+    finally:
+        conn.close()
+    
+    logger.info(f"Аналитика 1С [{analytics_type}]: {len(results)} результатов")
+    return results
+
+
+def search_1c_data(query, limit=30, period_date=None, entities=None):
+    """Универсальный поиск по данным 1С с JOIN-ами по справочникам."""
     results_by_category = {
-        "prices": [],        # приоритет 1
-        "sales": [],         # приоритет 2
-        "cust_orders": [],   # приоритет 3
-        "supp_orders": [],   # приоритет 4
-        "production": [],    # приоритет 5
-        "bank": [],          # приоритет 6
-        "consumption": [],   # приоритет 7
-        "inventory": [],     # приоритет 8
-        "nomenclature": [],  # приоритет 9
-        "clients": [],       # приоритет 10
+        "prices": [], "sales": [], "cust_orders": [], "supp_orders": [],
+        "production": [], "bank": [], "consumption": [], "inventory": [],
+        "nomenclature": [], "clients": [],
     }
     
     conn = get_db_connection()
@@ -511,32 +696,25 @@ def search_1c_data(query: str, limit: int = 30) -> list:
     if not keywords:
         return []
     
-    # Строим условие ILIKE для нескольких ключевых слов
-    def ilike_conditions(columns: list, keyword: str) -> tuple:
-        """Возвращает (SQL условие, параметры) для поиска по нескольким колонкам."""
-        parts = []
-        params = []
-        for col in columns:
-            parts.append(f"{col} ILIKE %s")
-            params.append(f"%{keyword}%")
-        return " OR ".join(parts), params
-    
     try:
         with conn.cursor() as cur:
             for keyword in keywords[:3]:
                 
-                # ═══════════════════════════════════════
-                # 1. ЗАКУПОЧНЫЕ ЦЕНЫ (purchase_prices)
-                # ═══════════════════════════════════════
+                # 1. ЗАКУПОЧНЫЕ ЦЕНЫ
                 try:
-                    cur.execute("""
+                    q = """
                         SELECT doc_date, doc_number, contractor_name, 
                                nomenclature_name, quantity, price, sum_total 
                         FROM purchase_prices 
-                        WHERE nomenclature_name ILIKE %s 
-                           OR contractor_name ILIKE %s 
-                        ORDER BY doc_date DESC LIMIT %s
-                    """, (f"%{keyword}%", f"%{keyword}%", limit))
+                        WHERE (nomenclature_name ILIKE %s OR contractor_name ILIKE %s)
+                    """
+                    params = [f"%{keyword}%", f"%{keyword}%"]
+                    if period_date:
+                        q += " AND doc_date >= %s"
+                        params.append(period_date)
+                    q += " ORDER BY doc_date DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
                     for row in cur.fetchall():
                         result = {
                             "source": "1С: ЗАКУПОЧНЫЕ ЦЕНЫ",
@@ -550,19 +728,21 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                 except Exception as e:
                     logger.debug(f"Ошибка закупочных цен: {e}")
                 
-                # ═══════════════════════════════════════
-                # 2. ПРОДАЖИ (sales) — уже денормализована
-                # ═══════════════════════════════════════
+                # 2. ПРОДАЖИ
                 try:
-                    cur.execute("""
+                    q = """
                         SELECT doc_date, doc_number, doc_type, client_name, 
                                nomenclature_name, quantity, price, sum_with_vat
                         FROM sales 
-                        WHERE client_name ILIKE %s 
-                           OR nomenclature_name ILIKE %s
-                           OR consignee_name ILIKE %s
-                        ORDER BY doc_date DESC LIMIT %s
-                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                        WHERE (client_name ILIKE %s OR nomenclature_name ILIKE %s OR consignee_name ILIKE %s)
+                    """
+                    params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+                    if period_date:
+                        q += " AND doc_date >= %s"
+                        params.append(period_date)
+                    q += " ORDER BY doc_date DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
                     for row in cur.fetchall():
                         result = {
                             "source": f"1С: ПРОДАЖИ ({row[2]})",
@@ -576,11 +756,9 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                 except Exception as e:
                     logger.debug(f"Ошибка продаж: {e}")
                 
-                # ═══════════════════════════════════════
-                # 3. ЗАКАЗЫ КЛИЕНТОВ (c1_customer_orders + items)
-                # ═══════════════════════════════════════
+                # 3. ЗАКАЗЫ КЛИЕНТОВ
                 try:
-                    cur.execute("""
+                    q = """
                         SELECT co.doc_date, co.doc_number, c.name as client,
                                n.name as product, coi.quantity, coi.price, coi.sum_total,
                                co.status, co.shipment_date
@@ -590,8 +768,14 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                         LEFT JOIN nomenclature n ON coi.nomenclature_key = n.id::text
                         WHERE (c.name ILIKE %s OR n.name ILIKE %s OR co.doc_number ILIKE %s)
                           AND co.is_deleted = false
-                        ORDER BY co.doc_date DESC LIMIT %s
-                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                    """
+                    params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+                    if period_date:
+                        q += " AND co.doc_date >= %s"
+                        params.append(period_date)
+                    q += " ORDER BY co.doc_date DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
                     for row in cur.fetchall():
                         shipment = f", отгрузка: {row[8].strftime('%d.%m.%Y')}" if row[8] else ""
                         result = {
@@ -607,11 +791,9 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                 except Exception as e:
                     logger.debug(f"Ошибка заказов клиентов: {e}")
                 
-                # ═══════════════════════════════════════
-                # 4. ЗАКАЗЫ ПОСТАВЩИКАМ (c1_supplier_orders + items)
-                # ═══════════════════════════════════════
+                # 4. ЗАКАЗЫ ПОСТАВЩИКАМ
                 try:
-                    cur.execute("""
+                    q = """
                         SELECT so.doc_date, so.doc_number, c.name as supplier,
                                n.name as product, soi.quantity, soi.price, soi.sum_total,
                                so.status
@@ -621,8 +803,14 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                         LEFT JOIN nomenclature n ON soi.nomenclature_key = n.id::text
                         WHERE (c.name ILIKE %s OR n.name ILIKE %s OR so.doc_number ILIKE %s)
                           AND so.is_deleted = false
-                        ORDER BY so.doc_date DESC LIMIT %s
-                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                    """
+                    params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+                    if period_date:
+                        q += " AND so.doc_date >= %s"
+                        params.append(period_date)
+                    q += " ORDER BY so.doc_date DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
                     for row in cur.fetchall():
                         result = {
                             "source": "1С: ЗАКАЗЫ ПОСТАВЩИКАМ",
@@ -637,11 +825,9 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                 except Exception as e:
                     logger.debug(f"Ошибка заказов поставщикам: {e}")
                 
-                # ═══════════════════════════════════════
-                # 5. ПРОИЗВОДСТВО (c1_production + items)
-                # ═══════════════════════════════════════
+                # 5. ПРОИЗВОДСТВО
                 try:
-                    cur.execute("""
+                    q = """
                         SELECT p.doc_date, p.doc_number, 
                                n.name as product, pi.quantity, pi.price, pi.sum_total
                         FROM c1_production p
@@ -649,8 +835,14 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                         LEFT JOIN nomenclature n ON pi.nomenclature_key = n.id::text
                         WHERE (n.name ILIKE %s OR p.doc_number ILIKE %s OR p.comment ILIKE %s)
                           AND p.is_deleted = false
-                        ORDER BY p.doc_date DESC LIMIT %s
-                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                    """
+                    params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+                    if period_date:
+                        q += " AND p.doc_date >= %s"
+                        params.append(period_date)
+                    q += " ORDER BY p.doc_date DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
                     for row in cur.fetchall():
                         result = {
                             "source": "1С: ПРОИЗВОДСТВО",
@@ -664,11 +856,9 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                 except Exception as e:
                     logger.debug(f"Ошибка производства: {e}")
                 
-                # ═══════════════════════════════════════
-                # 6. БАНКОВСКИЕ РАСХОДЫ (c1_bank_expenses)
-                # ═══════════════════════════════════════
+                # 6. БАНКОВСКИЕ РАСХОДЫ
                 try:
-                    cur.execute("""
+                    q = """
                         SELECT be.doc_date, be.doc_number, c.name as counterparty,
                                be.amount, be.purpose, be.comment
                         FROM c1_bank_expenses be
@@ -676,8 +866,14 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                         WHERE (c.name ILIKE %s OR be.purpose ILIKE %s 
                                OR be.comment ILIKE %s OR be.doc_number ILIKE %s)
                           AND be.is_deleted = false
-                        ORDER BY be.doc_date DESC LIMIT %s
-                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                    """
+                    params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+                    if period_date:
+                        q += " AND be.doc_date >= %s"
+                        params.append(period_date)
+                    q += " ORDER BY be.doc_date DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
                     for row in cur.fetchall():
                         purpose = row[4][:100] if row[4] else ""
                         result = {
@@ -692,11 +888,9 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                 except Exception as e:
                     logger.debug(f"Ошибка банковских расходов: {e}")
                 
-                # ═══════════════════════════════════════
-                # 7. ВНУТРЕННЕЕ ПОТРЕБЛЕНИЕ (c1_internal_consumption + items)
-                # ═══════════════════════════════════════
+                # 7. ВНУТРЕННЕЕ ПОТРЕБЛЕНИЕ
                 try:
-                    cur.execute("""
+                    q = """
                         SELECT ic.doc_date, ic.doc_number,
                                n.name as product, ici.quantity, ici.sum_total
                         FROM c1_internal_consumption ic
@@ -704,8 +898,14 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                         LEFT JOIN nomenclature n ON ici.nomenclature_key = n.id::text
                         WHERE (n.name ILIKE %s OR ic.doc_number ILIKE %s OR ic.comment ILIKE %s)
                           AND ic.is_deleted = false
-                        ORDER BY ic.doc_date DESC LIMIT %s
-                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                    """
+                    params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+                    if period_date:
+                        q += " AND ic.doc_date >= %s"
+                        params.append(period_date)
+                    q += " ORDER BY ic.doc_date DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
                     for row in cur.fetchall():
                         result = {
                             "source": "1С: ВНУТРЕННЕЕ ПОТРЕБЛЕНИЕ",
@@ -719,11 +919,9 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                 except Exception as e:
                     logger.debug(f"Ошибка внутреннего потребления: {e}")
                 
-                # ═══════════════════════════════════════
-                # 8. ИНВЕНТАРИЗАЦИЯ (c1_inventory_count + items)
-                # ═══════════════════════════════════════
+                # 8. ИНВЕНТАРИЗАЦИЯ
                 try:
-                    cur.execute("""
+                    q = """
                         SELECT inv.doc_date, inv.doc_number,
                                n.name as product, ii.quantity_fact, 
                                ii.quantity_account, ii.deviation
@@ -732,11 +930,17 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                         LEFT JOIN nomenclature n ON ii.nomenclature_key = n.id::text
                         WHERE (n.name ILIKE %s OR inv.doc_number ILIKE %s)
                           AND inv.is_deleted = false
-                        ORDER BY inv.doc_date DESC LIMIT %s
-                    """, (f"%{keyword}%", f"%{keyword}%", limit))
+                    """
+                    params = [f"%{keyword}%", f"%{keyword}%"]
+                    if period_date:
+                        q += " AND inv.doc_date >= %s"
+                        params.append(period_date)
+                    q += " ORDER BY inv.doc_date DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
                     for row in cur.fetchall():
                         deviation = row[5] if row[5] else 0
-                        dev_str = f"+{deviation}" if deviation > 0 else str(deviation)
+                        dev_str = f"+{deviation}" if deviation and deviation > 0 else str(deviation)
                         result = {
                             "source": "1С: ИНВЕНТАРИЗАЦИЯ",
                             "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
@@ -749,14 +953,11 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                 except Exception as e:
                     logger.debug(f"Ошибка инвентаризации: {e}")
                 
-                # ═══════════════════════════════════════
-                # 9. НОМЕНКЛАТУРА (справочник)
-                # ═══════════════════════════════════════
+                # 9. НОМЕНКЛАТУРА
                 try:
                     cur.execute("""
                         SELECT name, code, unit FROM nomenclature 
-                        WHERE name ILIKE %s OR code ILIKE %s 
-                        LIMIT %s
+                        WHERE name ILIKE %s OR code ILIKE %s LIMIT %s
                     """, (f"%{keyword}%", f"%{keyword}%", limit))
                     for row in cur.fetchall():
                         result = {
@@ -769,14 +970,11 @@ def search_1c_data(query: str, limit: int = 30) -> list:
                 except Exception as e:
                     logger.debug(f"Ошибка номенклатуры: {e}")
                 
-                # ═══════════════════════════════════════
-                # 10. КЛИЕНТЫ (справочник)
-                # ═══════════════════════════════════════
+                # 10. КЛИЕНТЫ
                 try:
                     cur.execute("""
                         SELECT name, inn FROM clients 
-                        WHERE name ILIKE %s OR inn ILIKE %s 
-                        LIMIT %s
+                        WHERE name ILIKE %s OR inn ILIKE %s LIMIT %s
                     """, (f"%{keyword}%", f"%{keyword}%", limit))
                     for row in cur.fetchall():
                         result = {
@@ -792,16 +990,12 @@ def search_1c_data(query: str, limit: int = 30) -> list:
     finally:
         conn.close()
     
-    # ═══════════════════════════════════════
-    # СБОРКА РЕЗУЛЬТАТОВ ПО ПРИОРИТЕТУ
-    # ═══════════════════════════════════════
-    # Порядок категорий определяет приоритет
+    # Сборка по приоритету
     category_order = [
         "prices", "sales", "cust_orders", "supp_orders",
         "production", "bank", "consumption", "inventory",
         "nomenclature", "clients"
     ]
-    
     final_results = []
     for cat in category_order:
         items = results_by_category[cat]
@@ -810,10 +1004,8 @@ def search_1c_data(query: str, limit: int = 30) -> list:
             break
         final_results.extend(items[:remaining])
     
-    # Логирование
     counts = {cat: len(items) for cat, items in results_by_category.items() if items}
     logger.info(f"Поиск 1С по {keywords}: {counts}, итого: {len(final_results)}")
-    
     return final_results[:limit]
 
 
@@ -843,7 +1035,7 @@ def search_internet(query: str) -> tuple:
         return "", []
 
 
-def generate_response(question: str, db_results: list, web_results: str, web_citations: list = None, chat_context: str = "") -> str:
+def generate_response(question, db_results, web_results, web_citations=None, chat_context=""):
     """Генерация ответа на основе найденных данных."""
     if not ROUTERAI_API_KEY:
         return "API ключ не настроен"
@@ -851,24 +1043,57 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
         context_parts = []
         
         # Группируем результаты по типу
+        analytics = [r for r in db_results if r.get('type', '').startswith('analytics_')]
         prices = [r for r in db_results if r.get('type') == 'price']
-        other_1c = [r for r in db_results if r.get('source', '').startswith('1С') and r.get('type') != 'price']
+        sales = [r for r in db_results if r.get('type') == 'sales']
+        orders = [r for r in db_results if r.get('type') in ('customer_order', 'supplier_order')]
+        production = [r for r in db_results if r.get('type') in ('production', 'consumption')]
+        finance = [r for r in db_results if r.get('type') == 'bank_expense']
+        inventory = [r for r in db_results if r.get('type') == 'inventory']
+        refs = [r for r in db_results if r.get('type') in ('nomenclature', 'client')]
         chats = [r for r in db_results if r.get('source', '').startswith('Чат')]
         emails = [r for r in db_results if r.get('source', '').startswith('Email')]
         
-        # Сначала закупочные цены (ПРИОРИТЕТ!)
+        if analytics:
+            context_parts.append("=== АНАЛИТИКА (агрегированные данные) ===")
+            for i, res in enumerate(analytics, 1):
+                context_parts.append(f"{i}. [{res['source']}] {res['content']}")
+        
         if prices:
-            context_parts.append("=== ЗАКУПОЧНЫЕ ЦЕНЫ КОМПАНИИ (данные 1С) ===")
-            for i, res in enumerate(prices, 1):
+            context_parts.append("\n=== ЗАКУПОЧНЫЕ ЦЕНЫ ===")
+            for i, res in enumerate(prices[:10], 1):
                 context_parts.append(f"{i}. {res.get('date', '')} {res['content']}")
         
-        # Потом справочники 1С
-        if other_1c:
-            context_parts.append("\n=== СПРАВОЧНИКИ 1С ===")
-            for i, res in enumerate(other_1c, 1):
-                context_parts.append(f"{i}. [{res['source']}] {res['content'][:300]}")
+        if sales:
+            context_parts.append("\n=== ПРОДАЖИ (документы) ===")
+            for i, res in enumerate(sales[:10], 1):
+                context_parts.append(f"{i}. {res.get('date', '')} {res['content']}")
         
-        # Потом чаты
+        if orders:
+            context_parts.append("\n=== ЗАКАЗЫ ===")
+            for i, res in enumerate(orders[:10], 1):
+                context_parts.append(f"{i}. [{res['source']}] {res.get('date', '')} {res['content']}")
+        
+        if production:
+            context_parts.append("\n=== ПРОИЗВОДСТВО ===")
+            for i, res in enumerate(production[:10], 1):
+                context_parts.append(f"{i}. [{res['source']}] {res.get('date', '')} {res['content']}")
+        
+        if finance:
+            context_parts.append("\n=== ФИНАНСЫ ===")
+            for i, res in enumerate(finance[:10], 1):
+                context_parts.append(f"{i}. {res.get('date', '')} {res['content']}")
+        
+        if inventory:
+            context_parts.append("\n=== ИНВЕНТАРИЗАЦИЯ ===")
+            for i, res in enumerate(inventory[:5], 1):
+                context_parts.append(f"{i}. {res.get('date', '')} {res['content']}")
+        
+        if refs:
+            context_parts.append("\n=== СПРАВОЧНИКИ ===")
+            for i, res in enumerate(refs[:5], 1):
+                context_parts.append(f"{i}. [{res['source']}] {res['content']}")
+        
         if chats:
             context_parts.append("\n=== ИЗ ЧАТОВ ===")
             for i, res in enumerate(chats[:5], 1):
@@ -880,7 +1105,6 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
                 date_info = f" ({res['date']})" if res.get('date') else ""
                 context_parts.append(f"{i}.{score_info}{date_info} {res['content'][:300]}")
         
-        # Потом email
         if emails:
             context_parts.append("\n=== ИЗ EMAIL ===")
             for i, res in enumerate(emails[:5], 1):
@@ -891,19 +1115,13 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
                 header = ""
                 if subj or frm:
                     header = f"{subj} | {frm}".strip(" |")
-
-                context_parts.append(
-                    f"{i}.{score_info}{date_info} {header}\n{res['content'][:400]}"
-                )
-
+                context_parts.append(f"{i}.{score_info}{date_info} {header}\n{res['content'][:400]}")
         
-        # Интернет
         if web_results:
             context_parts.append("\n=== ИНТЕРНЕТ ===")
             context_parts.append(web_results[:2000])
         
         context = "\n".join(context_parts)
-        
         company_profile = get_company_profile()
         
         prompt = f"""{company_profile}
@@ -917,51 +1135,111 @@ def generate_response(question: str, db_results: list, web_results: str, web_cit
 
 ИНСТРУКЦИИ:
 1. Используй знания из профиля компании и найденные данные для ответа
-2. Данные из 1С (закупки, продажи, номенклатура) — это реальные данные компании
-3. Данные из ЧАТОВ и EMAIL — внутренняя переписка сотрудников
-4. Указывай конкретные цифры, даты, имена — если они есть в данных
-5. Если данных недостаточно — скажи об этом, не придумывай
-6. Отвечай по существу вопроса, кратко и структурированно
+2. Секция АНАЛИТИКА содержит агрегированные итоги — используй их для ответов про "топ", "основные", "сколько всего"
+3. Данные из 1С (закупки, продажи, заказы, производство) — это реальные данные компании
+4. Данные из ЧАТОВ и EMAIL — внутренняя переписка сотрудников
+5. Указывай конкретные цифры, даты, имена — если они есть в данных
+6. Если данных недостаточно — скажи об этом, не придумывай
+7. Отвечай по существу вопроса, кратко и структурированно
 
 Ответ:"""
 
-        response = requests.post(f"{ROUTERAI_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"}, json={"model": "google/gemini-3-flash-preview", "messages": [{"role": "user", "content": prompt}], "max_tokens": 2000}, timeout=60)
+        response = requests.post(
+            f"{ROUTERAI_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "google/gemini-3-flash-preview", "messages": [{"role": "user", "content": prompt}], "max_tokens": 2000, "temperature": 0},
+            timeout=60
+        )
         result = response.json()
         if "choices" in result:
             response_text = result["choices"][0]["message"]["content"]
-            
             if web_citations:
                 response_text += "\n\n📎 **Источники:**"
                 for i, url in enumerate(web_citations[:5], 1):
                     response_text += f"\n{i}. {url}"
-            
             return response_text
         return "Ошибка генерации"
     except Exception as e:
         return f"Ошибка: {e}"
 
-
-def classify_question(question: str) -> dict:
-    """Классификация вопроса для выбора источников поиска."""
+def route_query(question, chat_context=""):
+    """Router на GPT-4.1-mini — анализирует вопрос и строит план выполнения."""
     if not ROUTERAI_API_KEY:
-        return {"search_1c": True, "search_chats": True, "search_email": True, "search_web": False, "keywords": question, "priority": "1c"}
+        return _default_plan(question)
+    
     try:
-        prompt = f"""Определи где искать информацию.
-Источники: 1С (цены, закупки, товары), Чаты (обсуждения в Telegram), Email (переписка по почте), Интернет (внешняя информация).
-Извлеки 1-3 КЛЮЧЕВЫХ СЛОВА (существительные без запятых: сахар мука торт)
+        prompt = f"""Ты — маршрутизатор запросов для бизнес-ассистента кондитерской компании "Фрумелад".
+
+Доступные источники данных:
+- 1С_ANALYTICS: агрегированные данные (топ клиентов, суммы продаж за период, рейтинги товаров, объёмы производства, суммы закупок). Используй когда нужны ИТОГИ, СУММЫ, РЕЙТИНГИ, СРАВНЕНИЯ.
+- 1С_SEARCH: поиск конкретных документов (найти заказ, посмотреть цену товара, конкретная закупка). Используй когда нужен КОНКРЕТНЫЙ документ или запись.
+- CHATS: переписка сотрудников в Telegram (обсуждения, договорённости, решения).
+- EMAIL: деловая переписка по почте (с клиентами, поставщиками, подрядчиками).
+- WEB: интернет-поиск. Только для внешней информации.
+
+Типы аналитики (для 1С_ANALYTICS):
+- top_clients: топ клиентов по продажам
+- top_products: топ товаров по продажам
+- sales_summary: сводка продаж
+- top_suppliers: топ поставщиков по закупкам
+- production_summary: сводка производства
+- purchase_summary: сводка закупок
 
 Вопрос: {question}
 
-JSON: {{"search_1c": true/false, "search_chats": true/false, "search_email": true/false, "search_web": true/false, "keywords": "слово1 слово2", "priority": "1c/chats/email/web"}}"""
-        response = requests.post(f"{ROUTERAI_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"}, json={"model": "google/gemini-3-flash-preview", "messages": [{"role": "user", "content": prompt}], "max_tokens": 200}, timeout=30)
+Верни ТОЛЬКО JSON без markdown:
+{{"query_type": "analytics|search|lookup|chat_search|web|mixed", "steps": [{{"source": "1С_ANALYTICS|1С_SEARCH|CHATS|EMAIL|WEB", "action": "что искать", "analytics_type": "top_clients|top_products|sales_summary|top_suppliers|production_summary|purchase_summary|null", "keywords": "ключевые слова через пробел"}}], "entities": {{"clients": [], "products": [], "suppliers": []}}, "period": "today|yesterday|week|2weeks|month|quarter|half_year|year|january|february|march|april|may|june|july|august|september|october|november|december|null", "keywords": "основные ключевые слова"}}
+
+Правила:
+- Для аналитических вопросов (топ, основные, сколько всего, с цифрами) — 1С_ANALYTICS первым
+- Для конкретных поисков (найди заказ, цена на X) — 1С_SEARCH
+- Можно комбинировать шаги
+- keywords — существительные БЕЗ запятых
+- period из контекста: "за 2 недели" = "2weeks", "в январе" = "january"
+"""
+        
+        response = requests.post(
+            f"{ROUTERAI_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "openai/gpt-4.1-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 500, "temperature": 0},
+            timeout=15
+        )
+        
         result = response.json()
         if "choices" in result:
-            match = re.search(r'\{[^}]+\}', result["choices"][0]["message"]["content"])
-            if match:
-                return json.loads(match.group())
-        return {"search_1c": True, "search_chats": True, "search_email": True, "search_web": False, "keywords": question, "priority": "1c"}
-    except:
-        return {"search_1c": True, "search_chats": True, "search_email": True, "search_web": False, "keywords": question, "priority": "1c"}
+            content = result["choices"][0]["message"]["content"].strip()
+            content = re.sub(r'^```(?:json)?\s*', '', content)
+            content = re.sub(r'\s*```$', '', content)
+            plan = json.loads(content)
+            
+            if "steps" not in plan or not plan["steps"]:
+                plan["steps"] = [{"source": "1С_SEARCH", "action": "поиск", "keywords": plan.get("keywords", question)}]
+            if "keywords" not in plan:
+                plan["keywords"] = question
+            
+            logger.info(f"Router: type={plan.get('query_type')}, steps={len(plan['steps'])}, period={plan.get('period')}")
+            return plan
+        
+        return _default_plan(question)
+    
+    except Exception as e:
+        logger.error(f"Router error: {e}")
+        return _default_plan(question)
+
+
+def _default_plan(question):
+    """План по умолчанию если Router недоступен."""
+    return {
+        "query_type": "mixed",
+        "steps": [
+            {"source": "1С_SEARCH", "action": "поиск", "keywords": question},
+            {"source": "CHATS", "action": "поиск", "keywords": question},
+            {"source": "EMAIL", "action": "поиск", "keywords": question}
+        ],
+        "entities": {"clients": [], "products": [], "suppliers": []},
+        "period": None,
+        "keywords": question
+    }
 
 def rerank_results(question: str, results: list, top_k: int = 10) -> list:
     """
@@ -1054,52 +1332,76 @@ def rerank_results(question: str, results: list, top_k: int = 10) -> list:
         logger.error(f"Ошибка reranking: {e}")
         return candidates[:top_k]
 
-async def process_rag_query(question: str, chat_context: str = "") -> str:
-    """Основная функция обработки RAG-запроса с учётом временного контекста."""
+async def process_rag_query(question, chat_context=""):
+    """Основная функция обработки RAG-запроса с Router."""
     logger.info(f"RAG запрос: {question}")
     
-    # Извлекаем временной контекст из вопроса
+    # Шаг 1: Router определяет план выполнения
+    plan = route_query(question, chat_context)
+    logger.info(f"Query plan: {plan.get('query_type')}, steps: {len(plan.get('steps', []))}")
+    
+    # Извлекаем параметры из плана
+    period_date = _resolve_period(plan.get("period"))
+    entities = plan.get("entities", {})
+    keywords = plan.get("keywords", question)
+    
+    # Временной контекст для векторного поиска
     time_context = extract_time_context(question)
     if time_context["has_time_filter"]:
-        logger.info(f"Временной контекст: decay_days={time_context['decay_days']}, fw={time_context['freshness_weight']}")
+        logger.info(f"Временной контекст: decay_days={time_context['decay_days']}")
     
-    # Классифицируем вопрос
-    classification = classify_question(question)
-    logger.info(f"Классификация: {classification}")
-    
-    keywords = classification.get("keywords", question)
     db_results = []
+    web_results = ""
+    web_citations = []
     
-    # Поиск в 1С (SQL) — всегда первым
-    if classification.get("search_1c", True):
-        c1_results = search_1c_data(keywords, limit=30)
-        db_results.extend(c1_results)
-        logger.info(f"Найдено в 1С: {len(c1_results)}")
-    
-    # Поиск в чатах (векторный с учётом свежести + SQL)
-    if classification.get("search_chats", True):
-        chat_results = search_telegram_chats(keywords, limit=30, time_context=time_context)
-        db_results.extend(chat_results)
-        logger.info(f"Найдено в чатах: {len(chat_results)}")
-    
-    # Поиск в email (векторный с учётом свежести)
-    if classification.get("search_email", True):
-        email_results = search_emails(keywords, limit=30, time_context=time_context)
-        db_results.extend(email_results)
-        logger.info(f"Найдено в email: {len(email_results)}")
+    # Шаг 2: Выполняем шаги плана
+    for step in plan.get("steps", []):
+        source = step.get("source", "")
+        step_keywords = step.get("keywords", keywords)
+        analytics_type = step.get("analytics_type")
+        
+        if source == "1С_ANALYTICS" and analytics_type:
+            results = search_1c_analytics(
+                analytics_type=analytics_type,
+                keywords=step_keywords,
+                period_date=period_date,
+                entities=entities,
+                limit=20
+            )
+            db_results.extend(results)
+            logger.info(f"Step [{source}/{analytics_type}]: {len(results)} результатов")
+        
+        elif source == "1С_SEARCH":
+            results = search_1c_data(
+                query=step_keywords,
+                limit=30,
+                period_date=period_date,
+                entities=entities
+            )
+            db_results.extend(results)
+            logger.info(f"Step [{source}]: {len(results)} результатов")
+        
+        elif source == "CHATS":
+            results = search_telegram_chats(step_keywords, limit=30, time_context=time_context)
+            db_results.extend(results)
+            logger.info(f"Step [{source}]: {len(results)} результатов")
+        
+        elif source == "EMAIL":
+            results = search_emails(step_keywords, limit=30, time_context=time_context)
+            db_results.extend(results)
+            logger.info(f"Step [{source}]: {len(results)} результатов")
+        
+        elif source == "WEB":
+            web_results, web_citations = search_internet(step_keywords)
+            logger.info(f"Step [{source}]: получен ответ")
     
     logger.info(f"Всего в БД: {len(db_results)}")
     
-    # Reranking — переранжируем результаты через LLM
+    # Шаг 3: Reranking
     if len(db_results) > 10:
         db_results = rerank_results(question, db_results, top_k=15)
     
-    # Поиск в интернете
-    web_results = ""
-    web_citations = []
-    if classification.get("search_web", False):
-        web_results, web_citations = search_internet(question)
-    
+    # Шаг 4: Генерация ответа
     return generate_response(question, db_results, web_results, web_citations, chat_context)
 
 async def index_new_message(table_name: str, message_id: int, content: str):
