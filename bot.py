@@ -1493,7 +1493,11 @@ async def analyze_daily_documents(bot, chat_id: int, chat_title: str):
     context = get_full_chat_context(table_name, chat_id, chat_title, 24)  # 24 часа
 
     # Создаем сводный анализ
-    summary_prompt = f"""Проанализируй все документы, отправленные в чат "{chat_title}" за сегодня.
+    company_profile = get_company_profile()
+    summary_prompt = f"""{company_profile}
+
+Проанализируй все документы, отправленные в чат "{chat_title}" компании Фрумелад за сегодня.
+Используй знания о компании из профиля выше.
 
 === СПИСОК ДОКУМЕНТОВ ЗА ДЕНЬ ===
 {chr(10).join(all_docs_info)}
