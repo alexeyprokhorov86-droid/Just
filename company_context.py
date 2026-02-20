@@ -12,6 +12,8 @@
 import os
 import logging
 import psycopg2
+from dotenv import load_dotenv
+load_dotenv('/home/admin/telegram_logger_bot/.env')
 from functools import lru_cache
 from datetime import datetime, timedelta
 
