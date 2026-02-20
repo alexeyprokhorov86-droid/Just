@@ -477,71 +477,344 @@ def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None
 
 
 def search_1c_data(query: str, limit: int = 30) -> list:
-    """SQL-поиск по данным 1С (цены, номенклатура, контрагенты)."""
-    prices = []
-    nomenclature = []
-    contractors = []
+    """Универсальный поиск по данным 1С с JOIN-ами по справочникам.
+    
+    Приоритет результатов:
+    1. Закупочные цены (purchase_prices)
+    2. Продажи (sales) 
+    3. Заказы клиентов (c1_customer_orders + items)
+    4. Заказы поставщикам (c1_supplier_orders + items)
+    5. Производство (c1_production + items)
+    6. Банковские расходы (c1_bank_expenses)
+    7. Внутреннее потребление (c1_internal_consumption + items)
+    8. Инвентаризация (c1_inventory_count + items)
+    9. Номенклатура справочник
+    10. Клиенты справочник
+    """
+    # Категории результатов с приоритетами
+    results_by_category = {
+        "prices": [],        # приоритет 1
+        "sales": [],         # приоритет 2
+        "cust_orders": [],   # приоритет 3
+        "supp_orders": [],   # приоритет 4
+        "production": [],    # приоритет 5
+        "bank": [],          # приоритет 6
+        "consumption": [],   # приоритет 7
+        "inventory": [],     # приоритет 8
+        "nomenclature": [],  # приоритет 9
+        "clients": [],       # приоритет 10
+    }
     
     conn = get_db_connection()
     keywords = clean_keywords(query)
     
+    if not keywords:
+        return []
+    
+    # Строим условие ILIKE для нескольких ключевых слов
+    def ilike_conditions(columns: list, keyword: str) -> tuple:
+        """Возвращает (SQL условие, параметры) для поиска по нескольким колонкам."""
+        parts = []
+        params = []
+        for col in columns:
+            parts.append(f"{col} ILIKE %s")
+            params.append(f"%{keyword}%")
+        return " OR ".join(parts), params
+    
     try:
         with conn.cursor() as cur:
-            # 1. ЗАКУПОЧНЫЕ ЦЕНЫ (приоритет!)
             for keyword in keywords[:3]:
+                
+                # ═══════════════════════════════════════
+                # 1. ЗАКУПОЧНЫЕ ЦЕНЫ (purchase_prices)
+                # ═══════════════════════════════════════
                 try:
                     cur.execute("""
-                        SELECT doc_date, doc_number, contractor_name, nomenclature_name, quantity, price, sum_total 
+                        SELECT doc_date, doc_number, contractor_name, 
+                               nomenclature_name, quantity, price, sum_total 
                         FROM purchase_prices 
-                        WHERE nomenclature_name ILIKE %s OR contractor_name ILIKE %s 
+                        WHERE nomenclature_name ILIKE %s 
+                           OR contractor_name ILIKE %s 
                         ORDER BY doc_date DESC LIMIT %s
                     """, (f"%{keyword}%", f"%{keyword}%", limit))
                     for row in cur.fetchall():
                         result = {
-                            "source": "1С: ЗАКУПОЧНЫЕ ЦЕНЫ", 
-                            "date": row[0].strftime("%d.%m.%Y") if row[0] else "", 
-                            "content": f"{row[3]} от {row[2]}: {row[5]} руб./ед., кол-во: {row[4]}, сумма: {row[6]} руб. (док. {row[1]})", 
+                            "source": "1С: ЗАКУПОЧНЫЕ ЦЕНЫ",
+                            "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
+                            "content": f"{row[3]} от {row[2]}: {row[5]} руб./ед., "
+                                       f"кол-во: {row[4]}, сумма: {row[6]} руб. (док. {row[1]})",
                             "type": "price"
                         }
-                        if result not in prices:
-                            prices.append(result)
+                        if result not in results_by_category["prices"]:
+                            results_by_category["prices"].append(result)
                 except Exception as e:
                     logger.debug(f"Ошибка закупочных цен: {e}")
-            
-            # 2. Номенклатура (справочно)
-            for keyword in keywords[:3]:
+                
+                # ═══════════════════════════════════════
+                # 2. ПРОДАЖИ (sales) — уже денормализована
+                # ═══════════════════════════════════════
                 try:
-                    cur.execute("SELECT name, code, unit FROM nomenclature WHERE name ILIKE %s OR code ILIKE %s LIMIT %s", (f"%{keyword}%", f"%{keyword}%", limit))
+                    cur.execute("""
+                        SELECT doc_date, doc_number, doc_type, client_name, 
+                               nomenclature_name, quantity, price, sum_with_vat
+                        FROM sales 
+                        WHERE client_name ILIKE %s 
+                           OR nomenclature_name ILIKE %s
+                           OR consignee_name ILIKE %s
+                        ORDER BY doc_date DESC LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
                     for row in cur.fetchall():
-                        result = {"source": "1С: Номенклатура", "content": f"{row[0]} (код: {row[1]}, ед.: {row[2]})", "type": "nomenclature"}
-                        if result not in nomenclature:
-                            nomenclature.append(result)
-                except:
-                    pass
-            
-            # 3. Контрагенты (справочно)
-            for keyword in keywords[:3]:
+                        result = {
+                            "source": f"1С: ПРОДАЖИ ({row[2]})",
+                            "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
+                            "content": f"{row[4]} → {row[3]}: {row[6]} руб./ед., "
+                                       f"кол-во: {row[5]}, сумма: {row[7]} руб. (док. {row[1]})",
+                            "type": "sales"
+                        }
+                        if result not in results_by_category["sales"]:
+                            results_by_category["sales"].append(result)
+                except Exception as e:
+                    logger.debug(f"Ошибка продаж: {e}")
+                
+                # ═══════════════════════════════════════
+                # 3. ЗАКАЗЫ КЛИЕНТОВ (c1_customer_orders + items)
+                # ═══════════════════════════════════════
                 try:
-                    cur.execute("SELECT name, inn, full_name FROM contractors WHERE name ILIKE %s OR inn ILIKE %s LIMIT %s", (f"%{keyword}%", f"%{keyword}%", limit))
+                    cur.execute("""
+                        SELECT co.doc_date, co.doc_number, c.name as client,
+                               n.name as product, coi.quantity, coi.price, coi.sum_total,
+                               co.status, co.shipment_date
+                        FROM c1_customer_orders co
+                        JOIN c1_customer_order_items coi ON coi.order_key = co.ref_key
+                        LEFT JOIN clients c ON co.partner_key = c.id::text
+                        LEFT JOIN nomenclature n ON coi.nomenclature_key = n.id::text
+                        WHERE (c.name ILIKE %s OR n.name ILIKE %s OR co.doc_number ILIKE %s)
+                          AND co.is_deleted = false
+                        ORDER BY co.doc_date DESC LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
                     for row in cur.fetchall():
-                        result = {"source": "1С: Контрагенты", "content": f"{row[0]} (ИНН: {row[1]})", "type": "contractor"}
-                        if result not in contractors:
-                            contractors.append(result)
-                except:
-                    pass
+                        shipment = f", отгрузка: {row[8].strftime('%d.%m.%Y')}" if row[8] else ""
+                        result = {
+                            "source": "1С: ЗАКАЗЫ КЛИЕНТОВ",
+                            "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
+                            "content": f"{row[3] or '?'} → {row[2] or '?'}: {row[5]} руб., "
+                                       f"кол-во: {row[4]}, сумма: {row[6]} руб. "
+                                       f"(док. {row[1]}, статус: {row[7] or '?'}{shipment})",
+                            "type": "customer_order"
+                        }
+                        if result not in results_by_category["cust_orders"]:
+                            results_by_category["cust_orders"].append(result)
+                except Exception as e:
+                    logger.debug(f"Ошибка заказов клиентов: {e}")
+                
+                # ═══════════════════════════════════════
+                # 4. ЗАКАЗЫ ПОСТАВЩИКАМ (c1_supplier_orders + items)
+                # ═══════════════════════════════════════
+                try:
+                    cur.execute("""
+                        SELECT so.doc_date, so.doc_number, c.name as supplier,
+                               n.name as product, soi.quantity, soi.price, soi.sum_total,
+                               so.status
+                        FROM c1_supplier_orders so
+                        JOIN c1_supplier_order_items soi ON soi.order_key = so.ref_key
+                        LEFT JOIN clients c ON so.partner_key = c.id::text
+                        LEFT JOIN nomenclature n ON soi.nomenclature_key = n.id::text
+                        WHERE (c.name ILIKE %s OR n.name ILIKE %s OR so.doc_number ILIKE %s)
+                          AND so.is_deleted = false
+                        ORDER BY so.doc_date DESC LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                    for row in cur.fetchall():
+                        result = {
+                            "source": "1С: ЗАКАЗЫ ПОСТАВЩИКАМ",
+                            "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
+                            "content": f"{row[3] or '?'} от {row[2] or '?'}: {row[5]} руб., "
+                                       f"кол-во: {row[4]}, сумма: {row[6]} руб. "
+                                       f"(док. {row[1]}, статус: {row[7] or '?'})",
+                            "type": "supplier_order"
+                        }
+                        if result not in results_by_category["supp_orders"]:
+                            results_by_category["supp_orders"].append(result)
+                except Exception as e:
+                    logger.debug(f"Ошибка заказов поставщикам: {e}")
+                
+                # ═══════════════════════════════════════
+                # 5. ПРОИЗВОДСТВО (c1_production + items)
+                # ═══════════════════════════════════════
+                try:
+                    cur.execute("""
+                        SELECT p.doc_date, p.doc_number, 
+                               n.name as product, pi.quantity, pi.price, pi.sum_total
+                        FROM c1_production p
+                        JOIN c1_production_items pi ON pi.production_key = p.ref_key
+                        LEFT JOIN nomenclature n ON pi.nomenclature_key = n.id::text
+                        WHERE (n.name ILIKE %s OR p.doc_number ILIKE %s OR p.comment ILIKE %s)
+                          AND p.is_deleted = false
+                        ORDER BY p.doc_date DESC LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                    for row in cur.fetchall():
+                        result = {
+                            "source": "1С: ПРОИЗВОДСТВО",
+                            "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
+                            "content": f"{row[2] or '?'}: кол-во: {row[3]}, "
+                                       f"цена: {row[4]} руб., сумма: {row[5]} руб. (док. {row[1]})",
+                            "type": "production"
+                        }
+                        if result not in results_by_category["production"]:
+                            results_by_category["production"].append(result)
+                except Exception as e:
+                    logger.debug(f"Ошибка производства: {e}")
+                
+                # ═══════════════════════════════════════
+                # 6. БАНКОВСКИЕ РАСХОДЫ (c1_bank_expenses)
+                # ═══════════════════════════════════════
+                try:
+                    cur.execute("""
+                        SELECT be.doc_date, be.doc_number, c.name as counterparty,
+                               be.amount, be.purpose, be.comment
+                        FROM c1_bank_expenses be
+                        LEFT JOIN clients c ON be.counterparty_key = c.id::text
+                        WHERE (c.name ILIKE %s OR be.purpose ILIKE %s 
+                               OR be.comment ILIKE %s OR be.doc_number ILIKE %s)
+                          AND be.is_deleted = false
+                        ORDER BY be.doc_date DESC LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                    for row in cur.fetchall():
+                        purpose = row[4][:100] if row[4] else ""
+                        result = {
+                            "source": "1С: БАНКОВСКИЕ РАСХОДЫ",
+                            "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
+                            "content": f"{row[2] or '?'}: {row[3]} руб. "
+                                       f"Назначение: {purpose} (док. {row[1]})",
+                            "type": "bank_expense"
+                        }
+                        if result not in results_by_category["bank"]:
+                            results_by_category["bank"].append(result)
+                except Exception as e:
+                    logger.debug(f"Ошибка банковских расходов: {e}")
+                
+                # ═══════════════════════════════════════
+                # 7. ВНУТРЕННЕЕ ПОТРЕБЛЕНИЕ (c1_internal_consumption + items)
+                # ═══════════════════════════════════════
+                try:
+                    cur.execute("""
+                        SELECT ic.doc_date, ic.doc_number,
+                               n.name as product, ici.quantity, ici.sum_total
+                        FROM c1_internal_consumption ic
+                        JOIN c1_internal_consumption_items ici ON ici.doc_key = ic.ref_key
+                        LEFT JOIN nomenclature n ON ici.nomenclature_key = n.id::text
+                        WHERE (n.name ILIKE %s OR ic.doc_number ILIKE %s OR ic.comment ILIKE %s)
+                          AND ic.is_deleted = false
+                        ORDER BY ic.doc_date DESC LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                    for row in cur.fetchall():
+                        result = {
+                            "source": "1С: ВНУТРЕННЕЕ ПОТРЕБЛЕНИЕ",
+                            "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
+                            "content": f"{row[2] or '?'}: кол-во: {row[3]}, "
+                                       f"сумма: {row[4]} руб. (док. {row[1]})",
+                            "type": "consumption"
+                        }
+                        if result not in results_by_category["consumption"]:
+                            results_by_category["consumption"].append(result)
+                except Exception as e:
+                    logger.debug(f"Ошибка внутреннего потребления: {e}")
+                
+                # ═══════════════════════════════════════
+                # 8. ИНВЕНТАРИЗАЦИЯ (c1_inventory_count + items)
+                # ═══════════════════════════════════════
+                try:
+                    cur.execute("""
+                        SELECT inv.doc_date, inv.doc_number,
+                               n.name as product, ii.quantity_fact, 
+                               ii.quantity_account, ii.deviation
+                        FROM c1_inventory_count inv
+                        JOIN c1_inventory_count_items ii ON ii.doc_key = inv.ref_key
+                        LEFT JOIN nomenclature n ON ii.nomenclature_key = n.id::text
+                        WHERE (n.name ILIKE %s OR inv.doc_number ILIKE %s)
+                          AND inv.is_deleted = false
+                        ORDER BY inv.doc_date DESC LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", limit))
+                    for row in cur.fetchall():
+                        deviation = row[5] if row[5] else 0
+                        dev_str = f"+{deviation}" if deviation > 0 else str(deviation)
+                        result = {
+                            "source": "1С: ИНВЕНТАРИЗАЦИЯ",
+                            "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
+                            "content": f"{row[2] or '?'}: факт: {row[3]}, учёт: {row[4]}, "
+                                       f"отклонение: {dev_str} (док. {row[1]})",
+                            "type": "inventory"
+                        }
+                        if result not in results_by_category["inventory"]:
+                            results_by_category["inventory"].append(result)
+                except Exception as e:
+                    logger.debug(f"Ошибка инвентаризации: {e}")
+                
+                # ═══════════════════════════════════════
+                # 9. НОМЕНКЛАТУРА (справочник)
+                # ═══════════════════════════════════════
+                try:
+                    cur.execute("""
+                        SELECT name, code, unit FROM nomenclature 
+                        WHERE name ILIKE %s OR code ILIKE %s 
+                        LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", limit))
+                    for row in cur.fetchall():
+                        result = {
+                            "source": "1С: Номенклатура",
+                            "content": f"{row[0]} (код: {row[1]}, ед.: {row[2]})",
+                            "type": "nomenclature"
+                        }
+                        if result not in results_by_category["nomenclature"]:
+                            results_by_category["nomenclature"].append(result)
+                except Exception as e:
+                    logger.debug(f"Ошибка номенклатуры: {e}")
+                
+                # ═══════════════════════════════════════
+                # 10. КЛИЕНТЫ (справочник)
+                # ═══════════════════════════════════════
+                try:
+                    cur.execute("""
+                        SELECT name, inn FROM clients 
+                        WHERE name ILIKE %s OR inn ILIKE %s 
+                        LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", limit))
+                    for row in cur.fetchall():
+                        result = {
+                            "source": "1С: Клиенты",
+                            "content": f"{row[0]} (ИНН: {row[1]})",
+                            "type": "client"
+                        }
+                        if result not in results_by_category["clients"]:
+                            results_by_category["clients"].append(result)
+                except Exception as e:
+                    logger.debug(f"Ошибка клиентов: {e}")
+    
     finally:
         conn.close()
     
-    results = prices[:limit]
-    remaining = limit - len(results)
-    if remaining > 0:
-        results.extend(nomenclature[:remaining])
-        remaining = limit - len(results)
-    if remaining > 0:
-        results.extend(contractors[:remaining])
+    # ═══════════════════════════════════════
+    # СБОРКА РЕЗУЛЬТАТОВ ПО ПРИОРИТЕТУ
+    # ═══════════════════════════════════════
+    # Порядок категорий определяет приоритет
+    category_order = [
+        "prices", "sales", "cust_orders", "supp_orders",
+        "production", "bank", "consumption", "inventory",
+        "nomenclature", "clients"
+    ]
     
-    logger.info(f"Поиск 1С по {keywords}: цены={len(prices)}, номенклатура={len(nomenclature)}, контрагенты={len(contractors)}")
-    return results[:limit]
+    final_results = []
+    for cat in category_order:
+        items = results_by_category[cat]
+        remaining = limit - len(final_results)
+        if remaining <= 0:
+            break
+        final_results.extend(items[:remaining])
+    
+    # Логирование
+    counts = {cat: len(items) for cat, items in results_by_category.items() if items}
+    logger.info(f"Поиск 1С по {keywords}: {counts}, итого: {len(final_results)}")
+    
+    return final_results[:limit]
 
 
 def search_internet(query: str) -> tuple:
