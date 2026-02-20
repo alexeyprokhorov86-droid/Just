@@ -25,6 +25,7 @@ from rag_agent import process_rag_query, index_new_message
 from telegram.helpers import escape_markdown
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from company_context import get_company_profile
 
 # Загружаем переменные окружения
 # Ищем .env в директории скрипта или в текущей директории
@@ -519,9 +520,14 @@ def get_full_chat_context(table_name: str, chat_id: int, chat_title: str, hours:
 # ============================================================
 
 def build_analysis_prompt(doc_type: str, doc_content: str, context: str, filename: str = "") -> str:
-    """Создаёт промпт для анализа документа с учётом контекста чата."""
+    """Создаёт промпт для анализа документа с учётом контекста чата и знаний о компании."""
     
-    prompt = f"""Ты — участник рабочего чата, который получил документ от коллеги.
+    company_profile = get_company_profile()
+    
+    prompt = f"""{company_profile}
+
+Ты — участник рабочего чата компании Фрумелад, который получил документ от коллеги.
+Используй знания о компании из профиля выше для более точного анализа.
 Твоя задача — проанализировать документ так, как его воспримут участники чата, учитывая контекст обсуждения.
 
 """
