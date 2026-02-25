@@ -1605,6 +1605,8 @@ class Sync1C:
         self.sync_cash_flow_items(conn)
         self.sync_units(conn)        # <-- ДОБАВЛЕНО
         self.sync_specifications(conn)
+        self.sync_staff_history(conn)
+        self.sync_planned_accruals(conn)
 
     def sync_production(self, conn, date_from, date_to):
         """Синхронизация документов 'Производство без заказа'."""
