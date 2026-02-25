@@ -477,26 +477,57 @@ def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None
 
 
 def _resolve_period(period_str):
-    """Преобразует строку периода из Router в дату начала."""
+    """Преобразует строку периода из Router в (date_from, date_to)."""
     if not period_str or period_str == "null":
-        return None
+        return None, None
     
     today = date.today()
     
-    period_map = {
+    # Календарная неделя (пн-вс)
+    if period_str == "week":
+        monday = today - timedelta(days=today.weekday())
+        return monday, today
+    
+    if period_str == "last_week":
+        monday = today - timedelta(days=today.weekday() + 7)
+        sunday = monday + timedelta(days=6)
+        return monday, sunday
+    
+    # Календарный месяц
+    if period_str == "month":
+        return date(today.year, today.month, 1), today
+    
+    if period_str == "last_month":
+        first_this = date(today.year, today.month, 1)
+        last_prev = first_this - timedelta(days=1)
+        first_prev = date(last_prev.year, last_prev.month, 1)
+        return first_prev, last_prev
+    
+    # Календарный квартал
+    if period_str == "quarter":
+        q_month = ((today.month - 1) // 3) * 3 + 1
+        return date(today.year, q_month, 1), today
+    
+    if period_str == "last_quarter":
+        q_month = ((today.month - 1) // 3) * 3 + 1
+        q_start = date(today.year, q_month, 1)
+        last_q_end = q_start - timedelta(days=1)
+        last_q_month = ((last_q_end.month - 1) // 3) * 3 + 1
+        return date(last_q_end.year, last_q_month, 1), last_q_end
+    
+    # Не календарные — просто N дней назад, без верхней границы
+    simple_map = {
         "today": today,
         "yesterday": today - timedelta(days=1),
-        "week": today - timedelta(weeks=1),
         "2weeks": today - timedelta(weeks=2),
-        "month": today - timedelta(days=30),
-        "quarter": today - timedelta(days=90),
         "half_year": today - timedelta(days=180),
         "year": today - timedelta(days=365),
     }
     
-    if period_str in period_map:
-        return period_map[period_str]
+    if period_str in simple_map:
+        return simple_map[period_str], None
     
+    # Конкретный месяц (january, february, ...)
     months = {
         'january': 1, 'february': 2, 'march': 3, 'april': 4,
         'may': 5, 'june': 6, 'july': 7, 'august': 8,
@@ -507,9 +538,14 @@ def _resolve_period(period_str):
         year = today.year
         if month_num > today.month:
             year -= 1
-        return date(year, month_num, 1)
+        first_day = date(year, month_num, 1)
+        if month_num == 12:
+            last_day = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            last_day = date(year, month_num + 1, 1) - timedelta(days=1)
+        return first_day, last_day
     
-    return None
+    return None, None
 
 
 def search_1c_analytics(analytics_type, keywords="", period_date=None, 
@@ -538,6 +574,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     if period_date:
                         sql += " AND doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        sql += " AND doc_date <= %s"
+                        params.append(period_end)
                     if entities and entities.get("clients"):
                         client_filters = []
                         for client in entities["clients"]:
@@ -579,6 +618,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     if period_date:
                         sql += " AND doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        sql += " AND doc_date <= %s"
+                        params.append(period_end)
                     if entities and entities.get("products"):
                         prod_filters = []
                         for prod in entities["products"]:
@@ -618,6 +660,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     if period_date:
                         sql += " WHERE doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        sql += " AND doc_date <= %s"
+                        params.append(period_end)
                     if entities and entities.get("suppliers"):
                         prefix = " AND " if period_date else " WHERE "
                         supp_filters = []
@@ -659,6 +704,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     if period_date:
                         sql += " AND p.doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        sql += " AND p.doc_date <= %s"
+                        params.append(period_end)
                     sql += " GROUP BY n.name ORDER BY total_sum DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(sql, params)
@@ -712,6 +760,9 @@ def search_1c_data(query, limit=30, period_date=None, entities=None):
                     if period_date:
                         q += " AND doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        q += " AND doc_date <= %s"
+                        params.append(period_end)
                     q += " ORDER BY doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -740,6 +791,9 @@ def search_1c_data(query, limit=30, period_date=None, entities=None):
                     if period_date:
                         q += " AND doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        q += " AND doc_date <= %s"
+                        params.append(period_end)
                     q += " ORDER BY doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -773,6 +827,9 @@ def search_1c_data(query, limit=30, period_date=None, entities=None):
                     if period_date:
                         q += " AND co.doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        q += " AND co.doc_date <= %s"
+                        params.append(period_end)
                     q += " ORDER BY co.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -808,6 +865,9 @@ def search_1c_data(query, limit=30, period_date=None, entities=None):
                     if period_date:
                         q += " AND so.doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        q += " AND so.doc_date <= %s"
+                        params.append(period_end)
                     q += " ORDER BY so.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -840,6 +900,9 @@ def search_1c_data(query, limit=30, period_date=None, entities=None):
                     if period_date:
                         q += " AND p.doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        q += " AND p.doc_date <= %s"
+                        params.append(period_end)
                     q += " ORDER BY p.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -871,6 +934,9 @@ def search_1c_data(query, limit=30, period_date=None, entities=None):
                     if period_date:
                         q += " AND be.doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        q += " AND be.doc_date <= %s"
+                        params.append(period_end)
                     q += " ORDER BY be.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -903,6 +969,9 @@ def search_1c_data(query, limit=30, period_date=None, entities=None):
                     if period_date:
                         q += " AND ic.doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        q += " AND ic.doc_date <= %s"
+                        params.append(period_end)
                     q += " ORDER BY ic.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -935,6 +1004,9 @@ def search_1c_data(query, limit=30, period_date=None, entities=None):
                     if period_date:
                         q += " AND inv.doc_date >= %s"
                         params.append(period_date)
+                    if period_end:
+                        q += " AND inv.doc_date <= %s"
+                        params.append(period_end)
                     q += " ORDER BY inv.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -1341,7 +1413,7 @@ async def process_rag_query(question, chat_context=""):
     logger.info(f"Query plan: {plan.get('query_type')}, steps: {len(plan.get('steps', []))}")
     
     # Извлекаем параметры из плана
-    period_date = _resolve_period(plan.get("period"))
+    period_date, period_end = _resolve_period(plan.get("period"))
     entities = plan.get("entities", {})
     keywords = plan.get("keywords", question)
     
