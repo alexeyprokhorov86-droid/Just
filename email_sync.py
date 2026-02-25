@@ -797,6 +797,7 @@ def sync_mailbox(mailbox_id: int, email_addr: str, password: str, last_uid_inbox
             for parsed in fetch_messages(conn_imap, "INBOX", uids):
                 try:
                     process_email(cur, parsed, mailbox_id, "INBOX", "inbound")
+                    conn_db.commit()
                     new_uid_inbox = max(new_uid_inbox, parsed.uid)
                     stats['inbox'] += 1
                 except Exception as e:
@@ -815,11 +816,13 @@ def sync_mailbox(mailbox_id: int, email_addr: str, password: str, last_uid_inbox
                 for parsed in fetch_messages(conn_imap, sent_folder, uids):
                     try:
                         process_email(cur, parsed, mailbox_id, "Sent", "outbound")
+                        conn_db.commit()
                         new_uid_sent = max(new_uid_sent, parsed.uid)
                         stats['sent'] += 1
                     except Exception as e:
                         logger.error(f"Error processing sent {parsed.uid}: {e}")
                         stats['errors'] += 1
+                        conn_db.rollback()
             
             # Обновляем статус ящика
             cur.execute("""
