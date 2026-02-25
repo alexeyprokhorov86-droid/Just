@@ -1437,6 +1437,7 @@ async def process_rag_query(question, chat_context=""):
                 analytics_type=analytics_type,
                 keywords=step_keywords,
                 period_date=period_date,
+                period_end=period_end,
                 entities=entities,
                 limit=20
             )
@@ -1448,6 +1449,7 @@ async def process_rag_query(question, chat_context=""):
                 query=step_keywords,
                 limit=30,
                 period_date=period_date,
+                period_end=period_end,
                 entities=entities
             )
             db_results.extend(results)
