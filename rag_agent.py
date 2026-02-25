@@ -548,8 +548,8 @@ def _resolve_period(period_str):
     return None, None
 
 
-def search_1c_analytics(analytics_type, keywords="", period_date=None, 
-                         entities=None, limit=20):
+def search_1c_analytics(analytics_type, keywords="", period_date=None,
+                         period_end=None, entities=None, limit=20):
     """Агрегированные запросы по данным 1С (топ клиентов, товаров, поставщиков)."""
     results = []
     conn = get_db_connection()
@@ -730,7 +730,7 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
     return results
 
 
-def search_1c_data(query, limit=30, period_date=None, entities=None):
+def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=None):
     """Универсальный поиск по данным 1С с JOIN-ами по справочникам."""
     results_by_category = {
         "prices": [], "sales": [], "cust_orders": [], "supp_orders": [],
