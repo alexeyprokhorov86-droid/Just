@@ -848,7 +848,242 @@ class Sync1C:
         except Exception as e:
             print(f"Ошибка подключения: {e}")
             return False
-    
+
+    def sync_staff_history(self, conn):
+        """Синхронизация кадровой истории сотрудников."""
+        from urllib.parse import quote
+        
+        print("\n[Кадровая история]")
+        
+        entity = quote("InformationRegister_КадроваяИсторияСотрудников", safe='_')
+        url = f"{self.base_url}/{entity}"
+        
+        all_records = []
+        skip = 0
+        batch_size = 500
+        
+        while True:
+            params = {
+                "$format": "json",
+                "$top": str(batch_size),
+                "$skip": str(skip)
+            }
+            
+            try:
+                r = self.session.get(url, params=params, timeout=180)
+                if r.status_code != 200:
+                    print(f"  Ошибка HTTP {r.status_code}")
+                    break
+                
+                items = r.json().get('value', [])
+                if not items:
+                    break
+                
+                for item in items:
+                    recorder = item.get('Recorder', '')
+                    recorder_type = item.get('Recorder_Type', '')
+                    record_set = item.get('RecordSet', [])
+                    
+                    for rec in record_set:
+                        rec['_recorder'] = recorder
+                        rec['_recorder_type'] = recorder_type
+                        all_records.append(rec)
+                
+                print(f"  ... загружено {len(all_records)} записей", end='\r')
+                
+                if len(items) < batch_size:
+                    break
+                skip += batch_size
+                
+            except Exception as e:
+                print(f"  Ошибка загрузки: {e}")
+                break
+        
+        print(f"  Загружено: {len(all_records)} записей кадровой истории")
+        
+        if not all_records:
+            return 0
+        
+        count = 0
+        errors = 0
+        with conn.cursor() as cur:
+            for rec in all_records:
+                try:
+                    # Обработка ДействуетДо — пустая дата 0001-01-01
+                    valid_until = rec.get('ДействуетДо')
+                    if valid_until and str(valid_until).startswith('0001'):
+                        valid_until = None
+                    
+                    cur.execute("""
+                        INSERT INTO c1_staff_history (
+                            recorder, recorder_type, period, line_number, active,
+                            employee_key, organization_key, department_key,
+                            position_key, position_staff_key, event_type,
+                            head_employee_key, contract_type, valid_until,
+                            is_head_employee, num_rates, physical_person_key,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (recorder, line_number) DO UPDATE SET
+                            recorder_type = EXCLUDED.recorder_type,
+                            period = EXCLUDED.period,
+                            active = EXCLUDED.active,
+                            employee_key = EXCLUDED.employee_key,
+                            organization_key = EXCLUDED.organization_key,
+                            department_key = EXCLUDED.department_key,
+                            position_key = EXCLUDED.position_key,
+                            position_staff_key = EXCLUDED.position_staff_key,
+                            event_type = EXCLUDED.event_type,
+                            head_employee_key = EXCLUDED.head_employee_key,
+                            contract_type = EXCLUDED.contract_type,
+                            valid_until = EXCLUDED.valid_until,
+                            is_head_employee = EXCLUDED.is_head_employee,
+                            num_rates = EXCLUDED.num_rates,
+                            physical_person_key = EXCLUDED.physical_person_key,
+                            updated_at = NOW()
+                    """, (
+                        rec.get('_recorder'),
+                        rec.get('_recorder_type', ''),
+                        rec.get('Period'),
+                        int(rec.get('LineNumber', 0)),
+                        rec.get('Active', True),
+                        rec.get('Сотрудник_Key'),
+                        rec.get('Организация_Key') if rec.get('Организация_Key') != EMPTY_UUID else None,
+                        rec.get('Подразделение_Key') if rec.get('Подразделение_Key') != EMPTY_UUID else None,
+                        rec.get('Должность_Key') if rec.get('Должность_Key') != EMPTY_UUID else None,
+                        rec.get('ДолжностьПоШтатномуРасписанию_Key') if rec.get('ДолжностьПоШтатномуРасписанию_Key') != EMPTY_UUID else None,
+                        rec.get('ВидСобытия', ''),
+                        rec.get('ГоловнойСотрудник_Key') if rec.get('ГоловнойСотрудник_Key') != EMPTY_UUID else None,
+                        rec.get('ВидДоговора', ''),
+                        valid_until,
+                        rec.get('ЭтоГоловнойСотрудник', False),
+                        float(rec.get('КоличествоСтавок', 1)),
+                        rec.get('ФизическоеЛицо_Key') if rec.get('ФизическоеЛицо_Key') != EMPTY_UUID else None,
+                    ))
+                    count += 1
+                except Exception as e:
+                    errors += 1
+                    if errors <= 3:
+                        print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        if errors > 3:
+            print(f"  ⚠️ Ещё {errors - 3} ошибок не показано")
+        print(f"  ✅ Сохранено: {count} записей кадровой истории")
+        return count
+
+    def sync_planned_accruals(self, conn):
+        """Синхронизация плановых начислений (оклад/тариф)."""
+        from urllib.parse import quote
+        
+        print("\n[Плановые начисления (оклад/тариф)]")
+        
+        entity = quote("InformationRegister_ПлановыеНачисления", safe='_')
+        url = f"{self.base_url}/{entity}"
+        
+        all_records = []
+        skip = 0
+        batch_size = 500
+        
+        while True:
+            params = {
+                "$format": "json",
+                "$top": str(batch_size),
+                "$skip": str(skip)
+            }
+            
+            try:
+                r = self.session.get(url, params=params, timeout=180)
+                if r.status_code != 200:
+                    print(f"  Ошибка HTTP {r.status_code}")
+                    break
+                
+                items = r.json().get('value', [])
+                if not items:
+                    break
+                
+                for item in items:
+                    recorder = item.get('Recorder', '')
+                    recorder_type = item.get('Recorder_Type', '')
+                    record_set = item.get('RecordSet', [])
+                    
+                    for rec in record_set:
+                        rec['_recorder'] = recorder
+                        rec['_recorder_type'] = recorder_type
+                        all_records.append(rec)
+                
+                print(f"  ... загружено {len(all_records)} записей", end='\r')
+                
+                if len(items) < batch_size:
+                    break
+                skip += batch_size
+                
+            except Exception as e:
+                print(f"  Ошибка загрузки: {e}")
+                break
+        
+        print(f"  Загружено: {len(all_records)} записей плановых начислений")
+        
+        if not all_records:
+            return 0
+        
+        count = 0
+        errors = 0
+        with conn.cursor() as cur:
+            for rec in all_records:
+                try:
+                    valid_until = rec.get('ДействуетДо')
+                    if valid_until and str(valid_until).startswith('0001'):
+                        valid_until = None
+                    
+                    cur.execute("""
+                        INSERT INTO c1_planned_accruals (
+                            recorder, recorder_type, period, line_number, active,
+                            employee_key, accrual_key, physical_person_key,
+                            organization_key, is_used, amount, valid_until,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (recorder, line_number) DO UPDATE SET
+                            recorder_type = EXCLUDED.recorder_type,
+                            period = EXCLUDED.period,
+                            active = EXCLUDED.active,
+                            employee_key = EXCLUDED.employee_key,
+                            accrual_key = EXCLUDED.accrual_key,
+                            physical_person_key = EXCLUDED.physical_person_key,
+                            organization_key = EXCLUDED.organization_key,
+                            is_used = EXCLUDED.is_used,
+                            amount = EXCLUDED.amount,
+                            valid_until = EXCLUDED.valid_until,
+                            updated_at = NOW()
+                    """, (
+                        rec.get('_recorder'),
+                        rec.get('_recorder_type', ''),
+                        rec.get('Period'),
+                        int(rec.get('LineNumber', 0)),
+                        rec.get('Active', True),
+                        rec.get('Сотрудник_Key') if rec.get('Сотрудник_Key') != EMPTY_UUID else None,
+                        rec.get('Начисление_Key') if rec.get('Начисление_Key') != EMPTY_UUID else None,
+                        rec.get('ФизическоеЛицо_Key') if rec.get('ФизическоеЛицо_Key') != EMPTY_UUID else None,
+                        rec.get('ГоловнаяОрганизация_Key') if rec.get('ГоловнаяОрганизация_Key') != EMPTY_UUID else None,
+                        rec.get('Используется', True),
+                        float(rec.get('Размер', 0)),
+                        valid_until,
+                    ))
+                    count += 1
+                except Exception as e:
+                    errors += 1
+                    if errors <= 3:
+                        print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        if errors > 3:
+            print(f"  ⚠️ Ещё {errors - 3} ошибок не показано")
+        print(f"  ✅ Сохранено: {count} записей плановых начислений")
+        return count
+  
     def get_all_documents(self, entity_name, filter_posted=True, batch_size=500):
         """Загрузка документов порциями с поиском проблемных документов"""
         from urllib.parse import quote
@@ -1147,7 +1382,7 @@ class Sync1C:
         return count
 
     def sync_employees(self, conn):
-        """Синхронизация сотрудников."""
+        """Синхронизация сотрудников (с расширенными полями)."""
         print("\n[Сотрудники]")
         items = self.get_catalog_items("Catalog_Сотрудники")
         
@@ -1159,14 +1394,22 @@ class Sync1C:
             for item in items:
                 try:
                     cur.execute("""
-                        INSERT INTO c1_employees (ref_key, code, name, organization_key, is_archived, is_deleted, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        INSERT INTO c1_employees (
+                            ref_key, code, name, organization_key, 
+                            is_archived, is_deleted,
+                            is_nkt, is_piece_work, is_paid_by_shift,
+                            updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                         ON CONFLICT (ref_key) DO UPDATE SET
                             code = EXCLUDED.code,
                             name = EXCLUDED.name,
                             organization_key = EXCLUDED.organization_key,
                             is_archived = EXCLUDED.is_archived,
                             is_deleted = EXCLUDED.is_deleted,
+                            is_nkt = EXCLUDED.is_nkt,
+                            is_piece_work = EXCLUDED.is_piece_work,
+                            is_paid_by_shift = EXCLUDED.is_paid_by_shift,
                             updated_at = NOW()
                     """, (
                         item.get('Ref_Key'),
@@ -1174,7 +1417,10 @@ class Sync1C:
                         item.get('Description', ''),
                         item.get('ГоловнаяОрганизация_Key') if item.get('ГоловнаяОрганизация_Key') != EMPTY_UUID else None,
                         item.get('ВАрхиве', False),
-                        item.get('DeletionMark', False)
+                        item.get('DeletionMark', False),
+                        item.get('НКТ_УчитыватьТолькоДневнуюСмену', False),
+                        item.get('Сделка', False),
+                        item.get('ПлатитсяПоСтоимостиСмены', False),
                     ))
                     count += 1
                 except Exception as e:
@@ -1184,6 +1430,7 @@ class Sync1C:
         
         print(f"  ✅ Сохранено: {count} сотрудников")
         return count
+      
 
     def sync_cash_flow_items(self, conn):
         """Синхронизация статей ДДС."""
