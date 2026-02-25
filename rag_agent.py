@@ -486,7 +486,8 @@ def _resolve_period(period_str):
     # Календарная неделя (пн-вс)
     if period_str == "week":
         monday = today - timedelta(days=today.weekday())
-        return monday, today
+        sunday = monday + timedelta(days=6)
+        return monday, sunday
     
     if period_str == "last_week":
         monday = today - timedelta(days=today.weekday() + 7)
@@ -495,7 +496,12 @@ def _resolve_period(period_str):
     
     # Календарный месяц
     if period_str == "month":
-        return date(today.year, today.month, 1), today
+        first = date(today.year, today.month, 1)
+        if today.month == 12:
+            last = date(today.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            last = date(today.year, today.month + 1, 1) - timedelta(days=1)
+        return first, last
     
     if period_str == "last_month":
         first_this = date(today.year, today.month, 1)
@@ -506,7 +512,10 @@ def _resolve_period(period_str):
     # Календарный квартал
     if period_str == "quarter":
         q_month = ((today.month - 1) // 3) * 3 + 1
-        return date(today.year, q_month, 1), today
+        q_start = date(today.year, q_month, 1)
+        q_end_month = q_month + 2
+        q_end = date(today.year, q_end_month + 1, 1) - timedelta(days=1) if q_end_month < 12 else date(today.year, 12, 31)
+        return q_start, q_end
     
     if period_str == "last_quarter":
         q_month = ((today.month - 1) // 3) * 3 + 1
@@ -515,7 +524,7 @@ def _resolve_period(period_str):
         last_q_month = ((last_q_end.month - 1) // 3) * 3 + 1
         return date(last_q_end.year, last_q_month, 1), last_q_end
     
-    # Не календарные — просто N дней назад, без верхней границы
+    # Не календарные — просто N дней назад
     simple_map = {
         "today": today,
         "yesterday": today - timedelta(days=1),
@@ -540,7 +549,7 @@ def _resolve_period(period_str):
             year -= 1
         first_day = date(year, month_num, 1)
         if month_num == 12:
-            last_day = date(year + 1, 1, 1) - timedelta(days=1)
+            last_day = date(year, 12, 31)
         else:
             last_day = date(year, month_num + 1, 1) - timedelta(days=1)
         return first_day, last_day
