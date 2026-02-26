@@ -1283,7 +1283,7 @@ def route_query(question, chat_context=""):
             f"{ROUTERAI_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
             json={"model": "openai/gpt-4.1-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 500, "temperature": 0},
-            timeout=15
+            timeout=(5, 10)
         )
         
         result = response.json()
