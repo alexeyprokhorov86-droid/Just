@@ -212,10 +212,12 @@ def search_telegram_chats_sql(query: str, limit: int = 30) -> list:
             for table_name in chat_tables:
                 for keyword in keywords[:2]:
                     try:
-                        cur.execute(sql.SQL("SELECT timestamp, first_name, message_text, media_analysis, message_type FROM {} WHERE message_text ILIKE %s OR media_analysis ILIKE %s ORDER BY timestamp DESC LIMIT %s").format(sql.Identifier(table_name)), (f"%{keyword}%", f"%{keyword}%", limit))
+                        cur.execute(sql.SQL("SELECT timestamp, first_name, message_text, media_analysis, message_type, content_text FROM {} WHERE message_text ILIKE %s OR media_analysis ILIKE %s OR content_text ILIKE %s ORDER BY timestamp DESC LIMIT %s").format(sql.Identifier(table_name)), (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
                         for row in cur.fetchall():
                             chat_name = table_name.replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
                             content = row[2] or ""
+                            if row[5]:
+                                content += f"\n[Документ]: {row[5][:500]}"
                             if row[3]:
                                 content += f"\n[Анализ]: {row[3][:500]}"
                             result = {"source": f"Чат: {chat_name}", "date": row[0].strftime("%d.%m.%Y %H:%M") if row[0] else "", "author": row[1] or "", "content": content[:1000], "type": row[4] or "text"}
