@@ -1312,16 +1312,33 @@ def route_query(question, chat_context=""):
 
 def _default_plan(question):
     """План по умолчанию если Router недоступен."""
+    # Извлекаем только существительные/аббревиатуры — убираем стоп-слова
+    stop_words = {
+        'сколько', 'какой', 'какая', 'какие', 'каких', 'когда', 'где', 'кто', 'что',
+        'как', 'почему', 'зачем', 'наши', 'наших', 'наша', 'наше', 'нашим',
+        'последний', 'последние', 'последняя', 'последнюю', 'последних',
+        'который', 'которая', 'которые', 'которых',
+        'этот', 'этой', 'этих', 'этом', 'того', 'тому',
+        'можно', 'нужно', 'надо', 'есть', 'было', 'будет', 'были',
+        'очень', 'более', 'менее', 'самый', 'самые',
+        'внешней', 'внутренней', 'основные', 'основной',
+        'покажи', 'найди', 'скажи', 'расскажи', 'дай',
+        'раз', 'раза', 'разу', 'всего', 'итого',
+    }
+    clean_query = re.sub(r'[,.:;!?()"\']', ' ', question.lower())
+    words = [w.strip() for w in clean_query.split() if len(w.strip()) > 2 and w.strip() not in stop_words]
+    keywords = " ".join(words[:5]) if words else question
+    
     return {
         "query_type": "mixed",
         "steps": [
-            {"source": "1С_SEARCH", "action": "поиск", "keywords": question},
-            {"source": "CHATS", "action": "поиск", "keywords": question},
-            {"source": "EMAIL", "action": "поиск", "keywords": question}
+            {"source": "1С_SEARCH", "action": "поиск", "keywords": keywords},
+            {"source": "CHATS", "action": "поиск", "keywords": keywords},
+            {"source": "EMAIL", "action": "поиск", "keywords": keywords}
         ],
         "entities": {"clients": [], "products": [], "suppliers": []},
         "period": None,
-        "keywords": question
+        "keywords": keywords
     }
 
 def rerank_results(question: str, results: list, top_k: int = 10) -> list:
