@@ -1478,6 +1478,19 @@ async def process_rag_query(question, chat_context=""):
             web_results, web_citations = search_internet(step_keywords)
             logger.info(f"Step [{source}]: получен ответ")
     
+    # Принудительно ищем в CHATS и EMAIL если Router их не включил
+    executed_sources = [step.get("source") for step in plan.get("steps", [])]
+    
+    if "CHATS" not in executed_sources:
+        chat_results = search_telegram_chats(keywords, limit=30, time_context=time_context)
+        db_results.extend(chat_results)
+        logger.info(f"Step [CHATS/auto]: {len(chat_results)} результатов")
+    
+    if "EMAIL" not in executed_sources:
+        email_results = search_emails(keywords, limit=30, time_context=time_context)
+        db_results.extend(email_results)
+        logger.info(f"Step [EMAIL/auto]: {len(email_results)} результатов")
+    
     logger.info(f"Всего в БД: {len(db_results)}")
     
     # Шаг 3: Reranking
