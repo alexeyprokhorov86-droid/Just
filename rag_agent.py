@@ -1272,9 +1272,11 @@ def route_query(question, chat_context=""):
 {{"query_type": "analytics|search|lookup|chat_search|web|mixed", "steps": [{{"source": "1С_ANALYTICS|1С_SEARCH|CHATS|EMAIL|WEB", "action": "что искать", "analytics_type": "top_clients|top_products|sales_summary|top_suppliers|production_summary|purchase_summary|null", "keywords": "ключевые слова через пробел"}}], "entities": {{"clients": [], "products": [], "suppliers": []}}, "period": "today|yesterday|week|2weeks|month|quarter|half_year|year|january|february|march|april|may|june|july|august|september|october|november|december|null", "keywords": "основные ключевые слова"}}
 
 Правила:
-- Для аналитических вопросов (топ, основные, сколько всего, с цифрами) — 1С_ANALYTICS первым
-- Для конкретных поисков (найди заказ, цена на X) — 1С_SEARCH
-- Можно комбинировать шаги
+- ВСЕГДА включай CHATS и EMAIL как отдельные шаги — это равнозначные источники информации
+- Для аналитических вопросов (топ, основные, сколько всего, с цифрами) — 1С_ANALYTICS первым шагом, потом CHATS и EMAIL
+- Для конкретных поисков (найди заказ, цена на X) — 1С_SEARCH первым, потом CHATS и EMAIL
+- Для вопросов про обсуждения, согласования, решения — CHATS и EMAIL обязательны
+- Минимум 2-3 шага в плане, лучше больше чем меньше
 - keywords — существительные БЕЗ запятых
 - period из контекста: "за 2 недели" = "2weeks", "в январе" = "january"
 """
