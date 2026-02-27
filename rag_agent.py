@@ -270,10 +270,13 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
     """SQL-поиск по чатам (точное совпадение слов).
     
     target_tables: если задан — ищем ТОЛЬКО в этих таблицах (приоритетные чаты).
+    После нахождения сообщений подгружает соседние сообщения того же автора ±5 мин (контекстное окно).
     """
     results = []
     conn = get_db_connection()
     keywords = clean_keywords(query)
+    # Запоминаем найденные сообщения для подгрузки контекста: {table: [(timestamp, author), ...]}
+    found_anchors = {}
     try:
         with conn.cursor() as cur:
             if target_tables:
@@ -312,15 +315,62 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
                             }
                             if result not in results:
                                 results.append(result)
+                                # Запоминаем якорь для подгрузки контекста
+                                if row[0] and row[1]:
+                                    if table_name not in found_anchors:
+                                        found_anchors[table_name] = []
+                                    found_anchors[table_name].append((row[0], row[1]))
                     except:
                         continue
+
+            # === КОНТЕКСТНОЕ ОКНО: подгружаем соседние сообщения ±5 мин от того же автора ===
+            seen_content = {hash(r['content'][:200]) for r in results}
+            for table_name, anchors in found_anchors.items():
+                # Дедуплицируем якоря по автору+времени (округлённо)
+                unique_anchors = {}
+                for ts, author in anchors:
+                    key = (author, ts.strftime("%Y-%m-%d %H:%M"))
+                    if key not in unique_anchors:
+                        unique_anchors[key] = (ts, author)
+                
+                for ts, author in list(unique_anchors.values())[:10]:
+                    try:
+                        cur.execute(sql.SQL(
+                            "SELECT timestamp, first_name, message_text, media_analysis, "
+                            "message_type, content_text FROM {} "
+                            "WHERE first_name = %s "
+                            "AND timestamp BETWEEN %s AND %s "
+                            "ORDER BY timestamp"
+                        ).format(sql.Identifier(table_name)),
+                            (author, ts - timedelta(minutes=5), ts + timedelta(minutes=5)))
+                        
+                        chat_name = table_name.replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
+                        for row in cur.fetchall():
+                            content = row[2] or ""
+                            if row[5]:
+                                content += f"\n[Документ]: {row[5][:500]}"
+                            if row[3]:
+                                content += f"\n[Анализ]: {row[3][:500]}"
+                            content_hash = hash(content[:200])
+                            if content_hash not in seen_content:
+                                seen_content.add(content_hash)
+                                results.append({
+                                    "source": f"Чат: {chat_name}",
+                                    "date": row[0].strftime("%d.%m.%Y %H:%M") if row[0] else "",
+                                    "author": row[1] or "",
+                                    "content": content[:1500],
+                                    "type": row[4] or "text",
+                                    "_ts": row[0],
+                                })
+                    except:
+                        continue
+
     finally:
         conn.close()
 
     # Группируем сообщения одного автора ±3 мин
     results = _group_messages(results, window_minutes=3)
     return results[:limit]
-
 
 def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict = None) -> list:
     """Векторный (семантический) поиск по чатам с учётом свежести."""
