@@ -1,6 +1,7 @@
 """
 RAG Agent для поиска по базе знаний и интернету.
 Включает SQL-поиск и векторный (семантический) поиск с учётом свежести.
+ReAct архитектура: Smart Router → Поиск → Evaluator → (повтор) → Генерация.
 """
 
 import os
@@ -13,6 +14,7 @@ load_dotenv(dotenv_path=env_path if env_path.exists() else None)
 
 import json
 import logging
+import time
 import requests
 import psycopg2
 from psycopg2 import sql
@@ -39,6 +41,10 @@ except ImportError:
     logger.warning("embedding_service не найден, векторный поиск отключен")
 
 
+# === Кэш списка чатов из metadata ===
+_chat_list_cache = {"data": None, "ts": 0}
+
+
 def get_db_connection():
     return psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)
 
@@ -48,6 +54,50 @@ def clean_keywords(query: str) -> list:
     clean_query = re.sub(r'[,.:;!?()"\']', ' ', query)
     keywords = [w.strip() for w in clean_query.split() if len(w.strip()) > 2]
     return keywords if keywords else [query]
+
+
+def get_chat_list() -> list:
+    """Возвращает список чатов из metadata с кэшем 5 минут."""
+    now = time.time()
+    if _chat_list_cache["data"] and (now - _chat_list_cache["ts"]) < 300:
+        return _chat_list_cache["data"]
+
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT chat_id, chat_title, table_name, last_message_at
+                FROM tg_chats_metadata
+                WHERE table_name IS NOT NULL
+                ORDER BY last_message_at DESC NULLS LAST
+            """)
+            chats = []
+            for row in cur.fetchall():
+                chats.append({
+                    "chat_id": row[0],
+                    "title": row[1] or "",
+                    "table": row[2],
+                    "last_msg": row[3].strftime("%d.%m.%Y") if row[3] else "нет сообщений"
+                })
+        conn.close()
+        _chat_list_cache["data"] = chats
+        _chat_list_cache["ts"] = now
+        logger.info(f"Загружен список чатов: {len(chats)} шт")
+        return chats
+    except Exception as e:
+        logger.error(f"Ошибка загрузки списка чатов: {e}")
+        return []
+
+
+def format_chat_list_for_llm() -> str:
+    """Форматирует список чатов для передачи в LLM Router."""
+    chats = get_chat_list()
+    lines = []
+    for c in chats:
+        if c["last_msg"] != "нет сообщений":
+            lines.append(f"- {c['title']} [{c['table']}] (посл.: {c['last_msg']})")
+    return "\n".join(lines)
+
 
 def extract_time_context(question: str) -> dict:
     """
@@ -71,44 +121,23 @@ def extract_time_context(question: str) -> dict:
     
     # Паттерны для "за последний/последние N дней/недель/месяцев"
     patterns = [
-        # "за последний месяц", "за последние 2 месяца"
         (r'за последн(?:ий|ие|юю|ее)?\s*(\d+)?\s*месяц', lambda m: int(m.group(1) or 1) * 30),
         (r'за (\d+)\s*месяц', lambda m: int(m.group(1)) * 30),
-        
-        # "за последнюю неделю", "за последние 2 недели"  
         (r'за последн(?:ий|ие|юю|ее)?\s*(\d+)?\s*недел', lambda m: int(m.group(1) or 1) * 7),
         (r'за (\d+)\s*недел', lambda m: int(m.group(1)) * 7),
-        
-        # "за последний день", "за последние 3 дня"
         (r'за последн(?:ий|ие|юю|ее)?\s*(\d+)?\s*(?:день|дня|дней)', lambda m: int(m.group(1) or 1)),
         (r'за (\d+)\s*(?:день|дня|дней)', lambda m: int(m.group(1))),
-        
-        # "за последний год"
         (r'за последн(?:ий|ие|юю|ее)?\s*год', lambda m: 365),
         (r'за год', lambda m: 365),
-        
-        # "за последний квартал"
         (r'за последн(?:ий|ие|юю|ее)?\s*квартал', lambda m: 90),
         (r'за квартал', lambda m: 90),
-        
-        # "вчера"
         (r'\bвчера\b', lambda m: 2),
-        
-        # "сегодня"
         (r'\bсегодня\b', lambda m: 1),
-        
-        # "на этой неделе"
         (r'на этой неделе', lambda m: 7),
         (r'на прошлой неделе', lambda m: 14),
-        
-        # "в этом месяце"
         (r'в этом месяце', lambda m: now.day),
         (r'в прошлом месяце', lambda m: 60),
-        
-        # "недавно" - используем 14 дней
         (r'\bнедавно\b', lambda m: 14),
-        
-        # "в последнее время" - 30 дней
         (r'в последнее время', lambda m: 30),
     ]
     
@@ -119,11 +148,10 @@ def extract_time_context(question: str) -> dict:
             result["decay_days"] = days_func(match)
             result["date_from"] = now - timedelta(days=result["decay_days"])
             result["date_to"] = now
-            # Если указан конкретный период — увеличиваем вес свежести
             result["freshness_weight"] = 0.4
             break
     
-    # Паттерны для конкретных месяцев: "в январе", "в январе 2025"
+    # Паттерны для конкретных месяцев
     months = {
         'январ': 1, 'феврал': 2, 'март': 3, 'апрел': 4,
         'мае': 5, 'мая': 5, 'май': 5, 'июн': 6, 'июл': 7, 'август': 8,
@@ -135,24 +163,20 @@ def extract_time_context(question: str) -> dict:
             match = re.search(rf'в\s+{month_pattern}\w*\s*(\d{{4}})?', question_lower)
             if match:
                 year = int(match.group(1)) if match.group(1) else now.year
-                # Если месяц в будущем этого года — берём прошлый год
                 if month_num > now.month and year == now.year:
                     year -= 1
-                
-                # Первый день месяца
                 result["date_from"] = datetime(year, month_num, 1)
-                # Последний день месяца
                 if month_num == 12:
                     result["date_to"] = datetime(year + 1, 1, 1) - timedelta(days=1)
                 else:
                     result["date_to"] = datetime(year, month_num + 1, 1) - timedelta(days=1)
-                
                 result["has_time_filter"] = True
                 result["decay_days"] = (now - result["date_from"]).days or 30
-                result["freshness_weight"] = 0.5  # Точный период — высокий вес
+                result["freshness_weight"] = 0.5
                 break
     
     return result
+
 
 def diversify_by_source_id(
     items: list,
@@ -161,19 +185,10 @@ def diversify_by_source_id(
     score_key: str = "final_score",
     source_id_key: str = "source_id",
 ) -> list:
-    """
-    Ограничивает число результатов от одного источника (source_id).
-    Нужна для email, где один email = несколько чанков => много попаданий из одного письма.
-
-    Логика:
-    - ожидаем, что items уже отсортированы по score desc (или мы сортируем сами)
-    - берём по max_per_source на один source_id
-    - останавливаемся на total_limit
-    """
+    """Ограничивает число результатов от одного источника (source_id)."""
     if not items:
         return []
 
-    # На всякий случай сортируем (чтобы не зависеть от поведения БД/индекса)
     items = sorted(items, key=lambda x: x.get(score_key, 0), reverse=True)
 
     per_source_count = {}
@@ -182,7 +197,6 @@ def diversify_by_source_id(
     for it in items:
         sid = it.get(source_id_key)
         if sid is None:
-            # если source_id отсутствует — считаем как уникальный
             out.append(it)
             if len(out) >= total_limit:
                 break
@@ -200,19 +214,87 @@ def diversify_by_source_id(
 
     return out
 
-def search_telegram_chats_sql(query: str, limit: int = 30) -> list:
-    """SQL-поиск по чатам (точное совпадение слов)."""
+
+# =============================================================================
+# ПОИСК ПО TELEGRAM-ЧАТАМ
+# =============================================================================
+
+def _group_messages(messages: list, window_minutes: int = 3) -> list:
+    """
+    Группирует сообщения одного автора в окне ±N минут в один блок.
+    Входной формат: list of dict с ключами timestamp, first_name, content, ...
+    """
+    if not messages:
+        return messages
+
+    # Сортируем по времени
+    sorted_msgs = sorted(messages, key=lambda m: m.get("_ts") or datetime.min)
+
+    groups = []
+    current_group = None
+
+    for msg in sorted_msgs:
+        ts = msg.get("_ts")
+        author = msg.get("author", "")
+
+        if (current_group
+                and current_group["author"] == author
+                and ts and current_group["_last_ts"]
+                and (ts - current_group["_last_ts"]).total_seconds() <= window_minutes * 60):
+            # Добавляем к текущей группе
+            current_group["content"] += "\n" + msg.get("content", "")
+            current_group["_last_ts"] = ts
+        else:
+            # Новая группа
+            if current_group:
+                groups.append(current_group)
+            current_group = {
+                **msg,
+                "content": msg.get("content", ""),
+                "_last_ts": ts,
+            }
+
+    if current_group:
+        groups.append(current_group)
+
+    # Убираем служебное поле и обрезаем контент
+    for g in groups:
+        g.pop("_last_ts", None)
+        g.pop("_ts", None)
+        g["content"] = g["content"][:1500]
+
+    return groups
+
+
+def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list = None) -> list:
+    """SQL-поиск по чатам (точное совпадение слов).
+    
+    target_tables: если задан — ищем ТОЛЬКО в этих таблицах (приоритетные чаты).
+    """
     results = []
     conn = get_db_connection()
     keywords = clean_keywords(query)
     try:
         with conn.cursor() as cur:
-            cur.execute("""SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'tg_chat_%' AND table_name != 'tg_chats_metadata' AND table_name != 'tg_user_roles'""")
-            chat_tables = [row[0] for row in cur.fetchall()]
+            if target_tables:
+                chat_tables = target_tables
+            else:
+                cur.execute("""SELECT table_name FROM information_schema.tables 
+                              WHERE table_schema = 'public' AND table_name LIKE 'tg_chat_%' 
+                              AND table_name != 'tg_chats_metadata' AND table_name != 'tg_user_roles'""")
+                chat_tables = [row[0] for row in cur.fetchall()]
+
             for table_name in chat_tables:
-                for keyword in keywords[:2]:
+                for keyword in keywords[:3]:
                     try:
-                        cur.execute(sql.SQL("SELECT timestamp, first_name, message_text, media_analysis, message_type, content_text FROM {} WHERE message_text ILIKE %s OR media_analysis ILIKE %s OR content_text ILIKE %s ORDER BY timestamp DESC LIMIT %s").format(sql.Identifier(table_name)), (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                        cur.execute(sql.SQL(
+                            "SELECT timestamp, first_name, message_text, media_analysis, "
+                            "message_type, content_text FROM {} "
+                            "WHERE message_text ILIKE %s OR media_analysis ILIKE %s "
+                            "OR content_text ILIKE %s "
+                            "ORDER BY timestamp DESC LIMIT %s"
+                        ).format(sql.Identifier(table_name)),
+                            (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
                         for row in cur.fetchall():
                             chat_name = table_name.replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
                             content = row[2] or ""
@@ -220,13 +302,23 @@ def search_telegram_chats_sql(query: str, limit: int = 30) -> list:
                                 content += f"\n[Документ]: {row[5][:500]}"
                             if row[3]:
                                 content += f"\n[Анализ]: {row[3][:500]}"
-                            result = {"source": f"Чат: {chat_name}", "date": row[0].strftime("%d.%m.%Y %H:%M") if row[0] else "", "author": row[1] or "", "content": content[:1000], "type": row[4] or "text"}
+                            result = {
+                                "source": f"Чат: {chat_name}",
+                                "date": row[0].strftime("%d.%m.%Y %H:%M") if row[0] else "",
+                                "author": row[1] or "",
+                                "content": content[:1500],
+                                "type": row[4] or "text",
+                                "_ts": row[0],  # для группировки
+                            }
                             if result not in results:
                                 results.append(result)
                     except:
                         continue
     finally:
         conn.close()
+
+    # Группируем сообщения одного автора ±3 мин
+    results = _group_messages(results, window_minutes=3)
     return results[:limit]
 
 
@@ -235,7 +327,6 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
     if not VECTOR_SEARCH_ENABLED:
         return []
     
-    # Получаем параметры времени
     if time_context is None:
         time_context = extract_time_context(query)
     
@@ -243,7 +334,6 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
     freshness_weight = time_context.get("freshness_weight", 0.25)
     
     try:
-        # Используем взвешенный поиск с учётом свежести
         vector_results = vector_search_weighted(
             query, 
             limit=limit, 
@@ -266,7 +356,6 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
                 "search_type": "vector"
             }
             
-            # Добавляем дату если есть
             if r.get('timestamp'):
                 result["date"] = r['timestamp'].strftime("%d.%m.%Y %H:%M")
             
@@ -279,15 +368,15 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
         logger.error(f"Ошибка векторного поиска: {e}")
         return []
 
+
 def search_emails_sql(query: str, limit: int = 30) -> list:
-    """SQL/keyword поиск по email — для точных совпадений (артикулы, номера, ИНН)."""
+    """SQL/keyword поиск по email."""
     results = []
     conn = get_db_connection()
     keywords = clean_keywords(query)
     
     try:
         with conn.cursor() as cur:
-            # FTS поиск
             fts_query = ' | '.join(keywords[:3])
             cur.execute("""
                 SELECT id, subject, body_text, from_address, received_at
@@ -300,7 +389,6 @@ def search_emails_sql(query: str, limit: int = 30) -> list:
             
             fts_results = cur.fetchall()
             
-            # Если FTS не дал результатов — ILIKE fallback
             if not fts_results:
                 for keyword in keywords[:2]:
                     cur.execute("""
@@ -344,8 +432,9 @@ def search_emails_sql(query: str, limit: int = 30) -> list:
     logger.info(f"Email SQL поиск: {len(results)} результатов")
     return results
 
+
 def search_emails_vector(query: str, limit: int = 30, time_context: dict = None) -> list:
-    """Семантический поиск по email с учётом свежести + diversity по source_id (чанки одного письма)."""
+    """Семантический поиск по email с учётом свежести + diversity."""
     if not VECTOR_SEARCH_ENABLED:
         return []
 
@@ -355,9 +444,6 @@ def search_emails_vector(query: str, limit: int = 30, time_context: dict = None)
     decay_days = time_context.get("decay_days", 90)
     freshness_weight = time_context.get("freshness_weight", 0.25)
 
-    # Сколько кандидатов взять до группировки:
-    #  - если max_per_email=2 и нужно limit=10, то кандидатов лучше 50-80,
-    #    чтобы после отбрасывания дублей не остаться без результатов.
     pre_limit = max(limit * 6, 50)
     max_chunks_per_email = 2
 
@@ -371,7 +457,6 @@ def search_emails_vector(query: str, limit: int = 30, time_context: dict = None)
             decay_days=decay_days
         )
 
-        # Ключевой шаг пункта 1: ограничиваем чанки одного письма
         diversified = diversify_by_source_id(
             email_candidates,
             total_limit=limit,
@@ -395,7 +480,6 @@ def search_emails_vector(query: str, limit: int = 30, time_context: dict = None)
                 "freshness": r.get("freshness", 0),
                 "final_score": r.get("final_score", r.get("similarity", 0)),
                 "search_type": "email_vector",
-                # полезно для дальнейших шагов и отладки
                 "source_id": r.get("source_id"),
             })
 
@@ -409,17 +493,12 @@ def search_emails_vector(query: str, limit: int = 30, time_context: dict = None)
 
     return results
 
+
 def search_emails(query: str, limit: int = 30, time_context: dict = None) -> list:
-    """
-    Комбинированный поиск по email:
-    1. Векторный поиск (семантический) — находит по смыслу
-    2. SQL поиск — находит точные совпадения (артикулы, номера, ИНН)
-    3. Объединяем и дедуплицируем
-    """
+    """Комбинированный поиск по email: вектор + SQL."""
     results = []
     seen_ids = set()
     
-    # Сначала векторный поиск
     vector_results = search_emails_vector(query, limit=limit, time_context=time_context)
     for r in vector_results:
         source_id = r.get('source_id')
@@ -429,7 +508,6 @@ def search_emails(query: str, limit: int = 30, time_context: dict = None) -> lis
             seen_ids.add(source_id)
         results.append(r)
     
-    # Затем SQL поиск для точных совпадений
     sql_results = search_emails_sql(query, limit=limit)
     for r in sql_results:
         source_id = r.get('source_id')
@@ -439,23 +517,22 @@ def search_emails(query: str, limit: int = 30, time_context: dict = None) -> lis
             seen_ids.add(source_id)
         results.append(r)
     
-    # Сортируем по final_score
     results.sort(key=lambda x: x.get('final_score', 0), reverse=True)
     
     logger.info(f"Поиск email: {len(results)} результатов (vector + sql)")
     return results[:limit]
 
-def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None) -> list:
+
+def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None,
+                          target_tables: list = None) -> list:
     """
-    Комбинированный поиск по чатам:
-    1. Векторный поиск (семантический) — находит по смыслу с учётом свежести
-    2. SQL поиск — находит точные совпадения
-    3. Объединяем и дедуплицируем
+    Комбинированный поиск по чатам: вектор + SQL.
+    target_tables: если задан — SQL ищет ТОЛЬКО в этих таблицах.
     """
     results = []
     seen_content = set()
     
-    # Сначала векторный поиск (с учётом временного контекста)
+    # Векторный поиск (пока по всем чатам, фильтрация по source_table)
     vector_results = search_telegram_chats_vector(query, limit=limit, time_context=time_context)
     for r in vector_results:
         content_hash = hash(r['content'][:200])
@@ -463,18 +540,17 @@ def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None
             seen_content.add(content_hash)
             results.append(r)
     
-    # Затем SQL поиск для точных совпадений
-    sql_results = search_telegram_chats_sql(query, limit=limit)
+    # SQL поиск — в target_tables если заданы
+    sql_results = search_telegram_chats_sql(query, limit=limit, target_tables=target_tables)
     for r in sql_results:
         content_hash = hash(r['content'][:200])
         if content_hash not in seen_content:
             seen_content.add(content_hash)
             results.append(r)
     
-    # Сортируем по final_score (если есть) или similarity
     results.sort(key=lambda x: x.get('final_score', x.get('similarity', 0)), reverse=True)
     
-    logger.info(f"Поиск в чатах: {len(results)} результатов (vector + sql)")
+    logger.info(f"Поиск в чатах: {len(results)} результатов (vector + sql, target={len(target_tables) if target_tables else 'all'})")
     return results[:limit]
 
 
@@ -485,7 +561,6 @@ def _resolve_period(period_str):
     
     today = date.today()
     
-    # Календарная неделя (пн-вс)
     if period_str == "week":
         monday = today - timedelta(days=today.weekday())
         sunday = monday + timedelta(days=6)
@@ -496,7 +571,6 @@ def _resolve_period(period_str):
         sunday = monday + timedelta(days=6)
         return monday, sunday
     
-    # Календарный месяц
     if period_str == "month":
         first = date(today.year, today.month, 1)
         if today.month == 12:
@@ -511,7 +585,6 @@ def _resolve_period(period_str):
         first_prev = date(last_prev.year, last_prev.month, 1)
         return first_prev, last_prev
     
-    # Календарный квартал
     if period_str == "quarter":
         q_month = ((today.month - 1) // 3) * 3 + 1
         q_start = date(today.year, q_month, 1)
@@ -526,7 +599,6 @@ def _resolve_period(period_str):
         last_q_month = ((last_q_end.month - 1) // 3) * 3 + 1
         return date(last_q_end.year, last_q_month, 1), last_q_end
     
-    # Не календарные — просто N дней назад
     simple_map = {
         "today": today,
         "yesterday": today - timedelta(days=1),
@@ -538,7 +610,6 @@ def _resolve_period(period_str):
     if period_str in simple_map:
         return simple_map[period_str], None
     
-    # Конкретный месяц (january, february, ...)
     months = {
         'january': 1, 'february': 2, 'march': 3, 'april': 4,
         'may': 5, 'june': 6, 'july': 7, 'august': 8,
@@ -559,19 +630,22 @@ def _resolve_period(period_str):
     return None, None
 
 
+# =============================================================================
+# АНАЛИТИКА 1С
+# =============================================================================
+
 def search_1c_analytics(analytics_type, keywords="", period_date=None,
                          period_end=None, entities=None, limit=20):
-    """Агрегированные запросы по данным 1С (топ клиентов, товаров, поставщиков)."""
+    """Агрегированные запросы по данным 1С."""
     results = []
     conn = get_db_connection()
     
     try:
         with conn.cursor() as cur:
             
-            # ТОП КЛИЕНТОВ ПО ПРОДАЖАМ
             if analytics_type in ("top_clients", "sales_summary"):
                 try:
-                    sql = """
+                    q = """
                         SELECT client_name, 
                                COUNT(*) as positions,
                                SUM(sum_with_vat) as revenue,
@@ -583,20 +657,18 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     """
                     params = []
                     if period_date:
-                        sql += " AND doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        sql += " AND doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND doc_date <= %s"; params.append(period_end)
                     if entities and entities.get("clients"):
                         client_filters = []
                         for client in entities["clients"]:
                             client_filters.append("client_name ILIKE %s")
                             params.append(f"%{client}%")
-                        sql += " AND (" + " OR ".join(client_filters) + ")"
-                    sql += " GROUP BY client_name ORDER BY revenue DESC LIMIT %s"
+                        q += " AND (" + " OR ".join(client_filters) + ")"
+                    q += " GROUP BY client_name ORDER BY revenue DESC LIMIT %s"
                     params.append(limit)
-                    cur.execute(sql, params)
+                    cur.execute(q, params)
                     
                     for row in cur.fetchall():
                         revenue = f"{row[2]:,.0f}" if row[2] else "0"
@@ -613,10 +685,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                 except Exception as e:
                     logger.debug(f"Ошибка аналитики клиентов: {e}")
             
-            # ТОП ТОВАРОВ ПО ПРОДАЖАМ
             if analytics_type in ("top_products", "sales_summary"):
                 try:
-                    sql = """
+                    q = """
                         SELECT nomenclature_name,
                                SUM(quantity) as total_qty,
                                SUM(sum_with_vat) as revenue,
@@ -627,20 +698,18 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     """
                     params = []
                     if period_date:
-                        sql += " AND doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        sql += " AND doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND doc_date <= %s"; params.append(period_end)
                     if entities and entities.get("products"):
                         prod_filters = []
                         for prod in entities["products"]:
                             prod_filters.append("nomenclature_name ILIKE %s")
                             params.append(f"%{prod}%")
-                        sql += " AND (" + " OR ".join(prod_filters) + ")"
-                    sql += " GROUP BY nomenclature_name ORDER BY revenue DESC LIMIT %s"
+                        q += " AND (" + " OR ".join(prod_filters) + ")"
+                    q += " GROUP BY nomenclature_name ORDER BY revenue DESC LIMIT %s"
                     params.append(limit)
-                    cur.execute(sql, params)
+                    cur.execute(q, params)
                     
                     for row in cur.fetchall():
                         revenue = f"{row[2]:,.0f}" if row[2] else "0"
@@ -656,10 +725,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                 except Exception as e:
                     logger.debug(f"Ошибка аналитики товаров: {e}")
             
-            # ТОП ПОСТАВЩИКОВ ПО ЗАКУПКАМ
             if analytics_type in ("top_suppliers", "purchase_summary"):
                 try:
-                    sql = """
+                    q = """
                         SELECT contractor_name,
                                COUNT(*) as positions,
                                SUM(sum_total) as total_sum,
@@ -669,21 +737,19 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     """
                     params = []
                     if period_date:
-                        sql += " WHERE doc_date >= %s"
-                        params.append(period_date)
+                        q += " WHERE doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        sql += " AND doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND doc_date <= %s"; params.append(period_end)
                     if entities and entities.get("suppliers"):
                         prefix = " AND " if period_date else " WHERE "
                         supp_filters = []
                         for supp in entities["suppliers"]:
                             supp_filters.append("contractor_name ILIKE %s")
                             params.append(f"%{supp}%")
-                        sql += prefix + "(" + " OR ".join(supp_filters) + ")"
-                    sql += " GROUP BY contractor_name ORDER BY total_sum DESC LIMIT %s"
+                        q += prefix + "(" + " OR ".join(supp_filters) + ")"
+                    q += " GROUP BY contractor_name ORDER BY total_sum DESC LIMIT %s"
                     params.append(limit)
-                    cur.execute(sql, params)
+                    cur.execute(q, params)
                     
                     for row in cur.fetchall():
                         total = f"{row[2]:,.0f}" if row[2] else "0"
@@ -697,10 +763,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                 except Exception as e:
                     logger.debug(f"Ошибка аналитики закупок: {e}")
             
-            # АНАЛИТИКА ПРОИЗВОДСТВА
             if analytics_type == "production_summary":
                 try:
-                    sql = """
+                    q = """
                         SELECT n.name as product,
                                SUM(pi.quantity) as total_qty,
                                SUM(pi.sum_total) as total_sum,
@@ -713,14 +778,12 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     """
                     params = []
                     if period_date:
-                        sql += " AND p.doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND p.doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        sql += " AND p.doc_date <= %s"
-                        params.append(period_end)
-                    sql += " GROUP BY n.name ORDER BY total_sum DESC LIMIT %s"
+                        q += " AND p.doc_date <= %s"; params.append(period_end)
+                    q += " GROUP BY n.name ORDER BY total_sum DESC LIMIT %s"
                     params.append(limit)
-                    cur.execute(sql, params)
+                    cur.execute(q, params)
                     
                     for row in cur.fetchall():
                         total = f"{row[2]:,.0f}" if row[2] else "0"
@@ -740,6 +803,10 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
     logger.info(f"Аналитика 1С [{analytics_type}]: {len(results)} результатов")
     return results
 
+
+# =============================================================================
+# ПОИСК ПО 1С (документы)
+# =============================================================================
 
 def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=None):
     """Универсальный поиск по данным 1С с JOIN-ами по справочникам."""
@@ -769,11 +836,9 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
                     """
                     params = [f"%{keyword}%", f"%{keyword}%"]
                     if period_date:
-                        q += " AND doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND doc_date <= %s"; params.append(period_end)
                     q += " ORDER BY doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -800,11 +865,9 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
                     """
                     params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
                     if period_date:
-                        q += " AND doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND doc_date <= %s"; params.append(period_end)
                     q += " ORDER BY doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -836,11 +899,9 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
                     """
                     params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
                     if period_date:
-                        q += " AND co.doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND co.doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND co.doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND co.doc_date <= %s"; params.append(period_end)
                     q += " ORDER BY co.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -874,11 +935,9 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
                     """
                     params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
                     if period_date:
-                        q += " AND so.doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND so.doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND so.doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND so.doc_date <= %s"; params.append(period_end)
                     q += " ORDER BY so.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -909,11 +968,9 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
                     """
                     params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
                     if period_date:
-                        q += " AND p.doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND p.doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND p.doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND p.doc_date <= %s"; params.append(period_end)
                     q += " ORDER BY p.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -943,11 +1000,9 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
                     """
                     params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
                     if period_date:
-                        q += " AND be.doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND be.doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND be.doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND be.doc_date <= %s"; params.append(period_end)
                     q += " ORDER BY be.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -978,11 +1033,9 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
                     """
                     params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
                     if period_date:
-                        q += " AND ic.doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND ic.doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND ic.doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND ic.doc_date <= %s"; params.append(period_end)
                     q += " ORDER BY ic.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -1013,11 +1066,9 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
                     """
                     params = [f"%{keyword}%", f"%{keyword}%"]
                     if period_date:
-                        q += " AND inv.doc_date >= %s"
-                        params.append(period_date)
+                        q += " AND inv.doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND inv.doc_date <= %s"
-                        params.append(period_end)
+                        q += " AND inv.doc_date <= %s"; params.append(period_end)
                     q += " ORDER BY inv.doc_date DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -1073,7 +1124,6 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
     finally:
         conn.close()
     
-    # Сборка по приоритету
     category_order = [
         "prices", "sales", "cust_orders", "supp_orders",
         "production", "bank", "consumption", "inventory",
@@ -1093,7 +1143,7 @@ def search_1c_data(query, limit=30, period_date=None, period_end=None, entities=
 
 
 def search_internet(query: str) -> tuple:
-    """Поиск в интернете через Perplexity. Возвращает (текст, список_ссылок)."""
+    """Поиск в интернете через Perplexity."""
     if not ROUTERAI_API_KEY:
         return "", []
     try:
@@ -1118,8 +1168,12 @@ def search_internet(query: str) -> tuple:
         return "", []
 
 
+# =============================================================================
+# ГЕНЕРАЦИЯ ОТВЕТА (GPT-4.1)
+# =============================================================================
+
 def generate_response(question, db_results, web_results, web_citations=None, chat_context=""):
-    """Генерация ответа на основе найденных данных."""
+    """Генерация ответа на основе найденных данных через GPT-4.1."""
     if not ROUTERAI_API_KEY:
         return "API ключ не настроен"
     try:
@@ -1179,14 +1233,15 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
         
         if chats:
             context_parts.append("\n=== ИЗ ЧАТОВ ===")
-            for i, res in enumerate(chats[:5], 1):
+            for i, res in enumerate(chats[:8], 1):
                 score_info = ""
                 if 'final_score' in res:
                     score_info = f" [релевантность: {res['final_score']:.0%}]"
                 elif 'similarity' in res:
                     score_info = f" [релевантность: {res['similarity']:.0%}]"
                 date_info = f" ({res['date']})" if res.get('date') else ""
-                context_parts.append(f"{i}.{score_info}{date_info} {res['content'][:300]}")
+                author_info = f" [{res['author']}]" if res.get('author') else ""
+                context_parts.append(f"{i}.{score_info}{date_info}{author_info} {res['content'][:500]}")
         
         if emails:
             context_parts.append("\n=== ИЗ EMAIL ===")
@@ -1221,16 +1276,17 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
 2. Секция АНАЛИТИКА содержит агрегированные итоги — используй их для ответов про "топ", "основные", "сколько всего"
 3. Данные из 1С (закупки, продажи, заказы, производство) — это реальные данные компании
 4. Данные из ЧАТОВ и EMAIL — внутренняя переписка сотрудников
-5. Указывай конкретные цифры, даты, имена — если они есть в данных
-6. Если данных недостаточно — скажи об этом, не придумывай
-7. Отвечай по существу вопроса, кратко и структурированно
+5. Если в чатах несколько сообщений от одного автора подряд — это одна мысль, читай их вместе
+6. Указывай конкретные цифры, даты, имена — если они есть в данных
+7. Если данных недостаточно — скажи об этом, не придумывай
+8. Отвечай по существу вопроса, кратко и структурированно
 
 Ответ:"""
 
         response = requests.post(
             f"{ROUTERAI_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "google/gemini-3-flash-preview", "messages": [{"role": "user", "content": prompt}], "max_tokens": 2000, "temperature": 0},
+            json={"model": "openai/gpt-4.1", "messages": [{"role": "user", "content": prompt}], "max_tokens": 2000, "temperature": 0},
             timeout=60
         )
         result = response.json()
@@ -1245,49 +1301,68 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
     except Exception as e:
         return f"Ошибка: {e}"
 
+
+# =============================================================================
+# SMART ROUTER (GPT-4.1-mini) — с выбором чатов
+# =============================================================================
+
 def route_query(question, chat_context=""):
-    """Router на GPT-4.1-mini — анализирует вопрос и строит план выполнения."""
+    """Smart Router: анализирует вопрос, выбирает чаты, строит план."""
     if not ROUTERAI_API_KEY:
         return _default_plan(question)
     
     try:
+        chat_list = format_chat_list_for_llm()
+        
         prompt = f"""Ты — маршрутизатор запросов для бизнес-ассистента кондитерской компании "Фрумелад".
 
-Доступные источники данных:
-- 1С_ANALYTICS: агрегированные данные (топ клиентов, суммы продаж за период, рейтинги товаров, объёмы производства, суммы закупок). Используй когда нужны ИТОГИ, СУММЫ, РЕЙТИНГИ, СРАВНЕНИЯ.
-- 1С_SEARCH: поиск конкретных документов (найти заказ, посмотреть цену товара, конкретная закупка). Используй когда нужен КОНКРЕТНЫЙ документ или запись.
-- CHATS: переписка сотрудников в Telegram (обсуждения, договорённости, решения).
-- EMAIL: деловая переписка по почте (с клиентами, поставщиками, подрядчиками).
-- WEB: интернет-поиск. Только для внешней информации.
+ДОСТУПНЫЕ ЧАТЫ TELEGRAM:
+{chat_list}
 
-Типы аналитики (для 1С_ANALYTICS):
-- top_clients: топ клиентов по продажам
-- top_products: топ товаров по продажам
-- sales_summary: сводка продаж
-- top_suppliers: топ поставщиков по закупкам
-- production_summary: сводка производства
-- purchase_summary: сводка закупок
+ИСТОЧНИКИ ДАННЫХ:
+- 1С_ANALYTICS: агрегированные данные (топ клиентов, суммы продаж, рейтинги товаров, объёмы производства). Для ИТОГОВ, СУММ, РЕЙТИНГОВ.
+- 1С_SEARCH: поиск конкретных документов (заказ, цена товара, закупка). Для КОНКРЕТНЫХ записей.
+- CHATS: переписка сотрудников в Telegram.
+- EMAIL: деловая переписка по почте.
+- WEB: интернет-поиск (только внешняя информация).
 
-Вопрос: {question}
+ТИПЫ АНАЛИТИКИ (для 1С_ANALYTICS):
+top_clients, top_products, sales_summary, top_suppliers, production_summary, purchase_summary
+
+ВОПРОС: {question}
+
+ЗАДАЧА: Проанализируй вопрос и определи:
+1. Какие КОНКРЕТНЫЕ чаты из списка выше наиболее релевантны (по названию)
+2. Какие источники данных нужны
+3. Какие ключевые слова использовать для поиска
+
+РАССУЖДАЙ: например "НДС" → бухгалтерия → чаты с "бухгалтерия" и "априори" в названии.
+"Закупки сахара" → чаты "закупки" + 1С закупочные цены.
 
 Верни ТОЛЬКО JSON без markdown:
-{{"query_type": "analytics|search|lookup|chat_search|web|mixed", "steps": [{{"source": "1С_ANALYTICS|1С_SEARCH|CHATS|EMAIL|WEB", "action": "что искать", "analytics_type": "top_clients|top_products|sales_summary|top_suppliers|production_summary|purchase_summary|null", "keywords": "ключевые слова через пробел"}}], "entities": {{"clients": [], "products": [], "suppliers": []}}, "period": "today|yesterday|week|2weeks|month|quarter|half_year|year|january|february|march|april|may|june|july|august|september|october|november|december|null", "keywords": "основные ключевые слова"}}
+{{"query_type": "analytics|search|lookup|chat_search|web|mixed",
+"reasoning": "краткое объяснение логики выбора",
+"target_chats": ["tg_chat_xxx", "tg_chat_yyy"],
+"steps": [{{"source": "1С_ANALYTICS|1С_SEARCH|CHATS|EMAIL|WEB", "action": "описание", "analytics_type": "тип|null", "keywords": "слова через пробел"}}],
+"entities": {{"clients": [], "products": [], "suppliers": []}},
+"period": "today|yesterday|week|2weeks|month|quarter|half_year|year|january|...|december|null",
+"keywords": "основные ключевые слова"}}
 
-Правила:
-- ВСЕГДА включай CHATS и EMAIL как отдельные шаги — это равнозначные источники информации
-- Для аналитических вопросов (топ, основные, сколько всего, с цифрами) — 1С_ANALYTICS первым шагом, потом CHATS и EMAIL
-- Для конкретных поисков (найди заказ, цена на X) — 1С_SEARCH первым, потом CHATS и EMAIL
-- Для вопросов про обсуждения, согласования, решения — CHATS и EMAIL обязательны
-- Минимум 2-3 шага в плане, лучше больше чем меньше
-- keywords — существительные БЕЗ запятых
-- period из контекста: "за 2 недели" = "2weeks", "в январе" = "january"
+ПРАВИЛА:
+- target_chats: выбери 3-7 НАИБОЛЕЕ релевантных чатов из списка. Используй точные имена таблиц [tg_chat_...].
+- ВСЕГДА включай CHATS и EMAIL как отдельные шаги
+- Для бухгалтерских вопросов (НДС, налог, счёт, оплата) — обязательно чаты с "бухгалтерия", "априори", "отчеты по аутсорсингу"
+- Для вопросов про закупки — чаты с "закупки"
+- Для вопросов про производство — чаты с "производство"
+- Минимум 2-3 шага, keywords — существительные без запятых
+- period: "за 2 недели" = "2weeks", "в январе" = "january", "недавно"/"в последний раз" = "2weeks"
 """
         
         response = requests.post(
             f"{ROUTERAI_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "openai/gpt-4.1-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 500, "temperature": 0},
-            timeout=(5, 10)
+            json={"model": "openai/gpt-4.1-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 800, "temperature": 0},
+            timeout=(5, 15)
         )
         
         result = response.json()
@@ -1301,8 +1376,12 @@ def route_query(question, chat_context=""):
                 plan["steps"] = [{"source": "1С_SEARCH", "action": "поиск", "keywords": plan.get("keywords", question)}]
             if "keywords" not in plan:
                 plan["keywords"] = question
+            if "target_chats" not in plan:
+                plan["target_chats"] = []
             
-            logger.info(f"Router: type={plan.get('query_type')}, steps={len(plan['steps'])}, period={plan.get('period')}")
+            logger.info(f"Router: type={plan.get('query_type')}, steps={len(plan['steps'])}, "
+                       f"target_chats={len(plan.get('target_chats', []))}, period={plan.get('period')}, "
+                       f"reasoning={plan.get('reasoning', '')[:100]}")
             return plan
         
         return _default_plan(question)
@@ -1314,7 +1393,6 @@ def route_query(question, chat_context=""):
 
 def _default_plan(question):
     """План по умолчанию если Router недоступен."""
-    # Извлекаем только существительные/аббревиатуры — убираем стоп-слова
     stop_words = {
         'сколько', 'какой', 'какая', 'какие', 'каких', 'когда', 'где', 'кто', 'что',
         'как', 'почему', 'зачем', 'наши', 'наших', 'наша', 'наше', 'нашим',
@@ -1340,30 +1418,110 @@ def _default_plan(question):
         ],
         "entities": {"clients": [], "products": [], "suppliers": []},
         "period": None,
-        "keywords": keywords
+        "keywords": keywords,
+        "target_chats": [],  # fallback — искать везде
     }
 
+
+# =============================================================================
+# EVALUATOR (GPT-4.1-mini) — оценка достаточности результатов
+# =============================================================================
+
+def evaluate_results(question: str, results: list, plan: dict) -> dict:
+    """
+    Evaluator: оценивает достаточность найденных результатов.
+    Возвращает: {"sufficient": True/False, "missing": "...", "retry_keywords": "...", "retry_chats": [...]}
+    """
+    if not ROUTERAI_API_KEY or not results:
+        return {"sufficient": len(results) > 0, "missing": "", "retry_keywords": "", "retry_chats": []}
+    
+    # Краткое summary результатов для Evaluator
+    summary_parts = []
+    sources_found = set()
+    has_numbers = False
+    
+    for r in results[:20]:
+        source = r.get("source", "")
+        sources_found.add(source.split(":")[0].strip())
+        content = r.get("content", "")[:200]
+        if any(c.isdigit() for c in content):
+            has_numbers = True
+        summary_parts.append(f"[{source}] {r.get('date', '')} {content}")
+    
+    summary = "\n".join(summary_parts[:15])
+    chat_list = format_chat_list_for_llm()
+    
+    prompt = f"""Ты — оценщик качества поиска для бизнес-ассистента.
+
+ВОПРОС пользователя: {question}
+
+НАЙДЕННЫЕ РЕЗУЛЬТАТЫ ({len(results)} шт, источники: {', '.join(sources_found)}):
+{summary}
+
+ДОСТУПНЫЕ ЧАТЫ (для retry):
+{chat_list}
+
+ЗАДАЧА: Оцени, достаточно ли найденных данных для ПОЛНОГО ответа на вопрос.
+
+Критерии НЕДОСТАТОЧНОСТИ:
+- Вопрос про конкретные цифры/суммы, но цифр в результатах нет
+- Вопрос про согласование/решение, но найдены только общие упоминания без деталей
+- Вопрос про конкретный документ/событие, но найдены нерелевантные данные
+- Результаты из нерелевантных чатов (например, вопрос про бухгалтерию, а результаты из чата производства)
+
+Верни ТОЛЬКО JSON:
+{{"sufficient": true/false, "missing": "что не хватает (кратко)", "retry_keywords": "уточнённые ключевые слова для повторного поиска", "retry_chats": ["tg_chat_xxx"]}}
+
+Если sufficient=true, остальные поля пустые.
+Если sufficient=false, в retry_chats укажи чаты из списка где СТОИТ поискать дополнительно.
+"""
+
+    try:
+        response = requests.post(
+            f"{ROUTERAI_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "openai/gpt-4.1-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 300, "temperature": 0},
+            timeout=(5, 10)
+        )
+        
+        result = response.json()
+        if "choices" in result:
+            content = result["choices"][0]["message"]["content"].strip()
+            content = re.sub(r'^```(?:json)?\s*', '', content)
+            content = re.sub(r'\s*```$', '', content)
+            evaluation = json.loads(content)
+            
+            logger.info(f"Evaluator: sufficient={evaluation.get('sufficient')}, "
+                       f"missing={evaluation.get('missing', '')[:80]}")
+            return evaluation
+        
+        return {"sufficient": True, "missing": "", "retry_keywords": "", "retry_chats": []}
+    
+    except Exception as e:
+        logger.error(f"Evaluator error: {e}")
+        return {"sufficient": True, "missing": "", "retry_keywords": "", "retry_chats": []}
+
+
+# =============================================================================
+# RERANKING
+# =============================================================================
+
 def rerank_results(question: str, results: list, top_k: int = 10) -> list:
-    """
-    Переранжирование результатов через LLM.
-    Берёт до 60 кандидатов, просит GPT оценить релевантность, возвращает top_k лучших.
-    """
+    """Переранжирование результатов через LLM."""
     if not results or not ROUTERAI_API_KEY:
         return results[:top_k]
     
-    # Берём максимум 60 кандидатов для reranking
     candidates = results[:60]
     
     if len(candidates) <= top_k:
         return candidates
     
-    # Формируем список для оценки
     docs_text = []
     for i, r in enumerate(candidates):
         source = r.get('source', 'Unknown')
         content = r.get('content', '')[:300]
-        date = r.get('date', '')
-        docs_text.append(f"[{i}] ({source}, {date}) {content}")
+        date_str = r.get('date', '')
+        docs_text.append(f"[{i}] ({source}, {date_str}) {content}")
     
     docs_joined = "\n".join(docs_text)
     
@@ -1402,7 +1560,6 @@ def rerank_results(question: str, results: list, top_k: int = 10) -> list:
         
         answer = result["choices"][0]["message"]["content"].strip()
         
-        # Парсим номера
         indices = []
         for part in answer.replace(" ", "").split(","):
             try:
@@ -1416,10 +1573,8 @@ def rerank_results(question: str, results: list, top_k: int = 10) -> list:
             logger.warning(f"Rerank: не удалось распарсить ответ '{answer}'")
             return candidates[:top_k]
         
-        # Собираем результаты в новом порядке
         reranked = [candidates[i] for i in indices[:top_k]]
         
-        # Добавляем оставшиеся если не хватает
         if len(reranked) < top_k:
             for r in candidates:
                 if r not in reranked:
@@ -1434,20 +1589,34 @@ def rerank_results(question: str, results: list, top_k: int = 10) -> list:
         logger.error(f"Ошибка reranking: {e}")
         return candidates[:top_k]
 
+
+# =============================================================================
+# ОСНОВНОЙ ReAct ЦИКЛ
+# =============================================================================
+
 async def process_rag_query(question, chat_context=""):
-    """Основная функция обработки RAG-запроса с Router."""
+    """
+    ReAct цикл обработки RAG-запроса:
+    1. Smart Router (выбор чатов + план)
+    2. Поиск по источникам
+    3. Evaluator (достаточно ли?)
+    4. Если нет — повторный поиск (макс 2 итерации)
+    5. Reranking
+    6. Генерация ответа (GPT-4.1)
+    """
     logger.info(f"RAG запрос: {question}")
+    start_time = time.time()
     
-    # Шаг 1: Router определяет план выполнения
+    # === Шаг 1: Smart Router ===
     plan = route_query(question, chat_context)
-    logger.info(f"Query plan: {plan.get('query_type')}, steps: {len(plan.get('steps', []))}")
+    logger.info(f"Query plan: type={plan.get('query_type')}, steps={len(plan.get('steps', []))}, "
+               f"target_chats={plan.get('target_chats', [])}")
     
-    # Извлекаем параметры из плана
     period_date, period_end = _resolve_period(plan.get("period"))
     entities = plan.get("entities", {})
     keywords = plan.get("keywords", question)
+    target_chats = plan.get("target_chats", [])
     
-    # Временной контекст для векторного поиска
     time_context = extract_time_context(question)
     if time_context["has_time_filter"]:
         logger.info(f"Временной контекст: decay_days={time_context['decay_days']}")
@@ -1456,7 +1625,7 @@ async def process_rag_query(question, chat_context=""):
     web_results = ""
     web_citations = []
     
-    # Шаг 2: Выполняем шаги плана
+    # === Шаг 2: Выполняем шаги плана ===
     for step in plan.get("steps", []):
         source = step.get("source", "")
         step_keywords = step.get("keywords", keywords)
@@ -1486,9 +1655,13 @@ async def process_rag_query(question, chat_context=""):
             logger.info(f"Step [{source}]: {len(results)} результатов")
         
         elif source == "CHATS":
-            results = search_telegram_chats(step_keywords, limit=30, time_context=time_context)
+            # Используем target_chats из Router
+            results = search_telegram_chats(
+                step_keywords, limit=30, time_context=time_context,
+                target_tables=target_chats if target_chats else None
+            )
             db_results.extend(results)
-            logger.info(f"Step [{source}]: {len(results)} результатов")
+            logger.info(f"Step [{source}]: {len(results)} результатов (target={len(target_chats)} чатов)")
         
         elif source == "EMAIL":
             results = search_emails(step_keywords, limit=30, time_context=time_context)
@@ -1503,7 +1676,10 @@ async def process_rag_query(question, chat_context=""):
     executed_sources = [step.get("source") for step in plan.get("steps", [])]
     
     if "CHATS" not in executed_sources:
-        chat_results = search_telegram_chats(keywords, limit=30, time_context=time_context)
+        chat_results = search_telegram_chats(
+            keywords, limit=30, time_context=time_context,
+            target_tables=target_chats if target_chats else None
+        )
         db_results.extend(chat_results)
         logger.info(f"Step [CHATS/auto]: {len(chat_results)} результатов")
     
@@ -1512,14 +1688,49 @@ async def process_rag_query(question, chat_context=""):
         db_results.extend(email_results)
         logger.info(f"Step [EMAIL/auto]: {len(email_results)} результатов")
     
-    logger.info(f"Всего в БД: {len(db_results)}")
+    logger.info(f"Поиск завершён: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
     
-    # Шаг 3: Reranking
+    # === Шаг 3: Evaluator — проверяем достаточность (макс 2 итерации) ===
+    for retry_num in range(2):
+        evaluation = evaluate_results(question, db_results, plan)
+        
+        if evaluation.get("sufficient", True):
+            logger.info(f"Evaluator: данные достаточны (итерация {retry_num})")
+            break
+        
+        # Повторный поиск с уточнёнными параметрами
+        retry_keywords = evaluation.get("retry_keywords", "")
+        retry_chats = evaluation.get("retry_chats", [])
+        
+        if not retry_keywords and not retry_chats:
+            logger.info(f"Evaluator: insufficient но нет retry параметров, пропускаем")
+            break
+        
+        logger.info(f"Evaluator retry {retry_num + 1}: keywords='{retry_keywords}', chats={retry_chats}")
+        
+        # Дополнительный поиск
+        if retry_keywords:
+            if retry_chats:
+                extra_chat_results = search_telegram_chats(
+                    retry_keywords, limit=20, time_context=time_context,
+                    target_tables=retry_chats
+                )
+                db_results.extend(extra_chat_results)
+                logger.info(f"Retry CHATS: {len(extra_chat_results)} результатов из {len(retry_chats)} чатов")
+            
+            extra_email_results = search_emails(retry_keywords, limit=15, time_context=time_context)
+            db_results.extend(extra_email_results)
+            logger.info(f"Retry EMAIL: {len(extra_email_results)} результатов")
+    
+    logger.info(f"Итого после ReAct: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
+    
+    # === Шаг 4: Reranking ===
     if len(db_results) > 10:
         db_results = rerank_results(question, db_results, top_k=15)
     
-    # Шаг 4: Генерация ответа
+    # === Шаг 5: Генерация ответа (GPT-4.1) ===
     return generate_response(question, db_results, web_results, web_citations, chat_context)
+
 
 async def index_new_message(table_name: str, message_id: int, content: str):
     """Индексирует новое сообщение для векторного поиска."""
