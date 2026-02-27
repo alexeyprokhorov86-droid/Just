@@ -1291,7 +1291,7 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
                     score_info = f" [релевантность: {res['similarity']:.0%}]"
                 date_info = f" ({res['date']})" if res.get('date') else ""
                 author_info = f" [{res['author']}]" if res.get('author') else ""
-                context_parts.append(f"{i}.{score_info}{date_info}{author_info} {res['content'][:500]}")
+                context_parts.append(f"{i}.{score_info}{date_info}{author_info} {res['content'][:800]}")
         
         if emails:
             context_parts.append("\n=== ИЗ EMAIL ===")
@@ -1330,6 +1330,8 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
 6. Указывай конкретные цифры, даты, имена — если они есть в данных
 7. Если данных недостаточно — скажи об этом, не придумывай
 8. Отвечай по существу вопроса, кратко и структурированно
+9. ВАЖНО: сообщения одного автора за короткий период (минуты) — это ОДНА мысль. Если автор сначала написал суммы, а следом пояснение — это единое сообщение
+10. Если в чатах есть КОНКРЕТНЫЕ суммы рядом с обсуждением темы — используй именно их, они приоритетнее косвенных упоминаний
 
 Ответ:"""
 
