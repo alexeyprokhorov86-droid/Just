@@ -444,7 +444,7 @@ def search_emails_vector(query: str, limit: int = 30, time_context: dict = None)
     decay_days = time_context.get("decay_days", 90)
     freshness_weight = time_context.get("freshness_weight", 0.25)
 
-    pre_limit = max(limit * 6, 50)
+    pre_limit = max(limit * 3, 30)
     max_chunks_per_email = 2
 
     results = []
@@ -1690,8 +1690,8 @@ async def process_rag_query(question, chat_context=""):
     
     logger.info(f"Поиск завершён: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
     
-    # === Шаг 3: Evaluator — проверяем достаточность (макс 2 итерации) ===
-    for retry_num in range(2):
+    # === Шаг 3: Evaluator — проверяем достаточность (макс 1 итерация) ===
+    for retry_num in range(1):
         evaluation = evaluate_results(question, db_results, plan)
         
         if evaluation.get("sufficient", True):
