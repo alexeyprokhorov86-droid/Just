@@ -275,7 +275,6 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
     results = []
     conn = get_db_connection()
     keywords = clean_keywords(query)
-    # Запоминаем найденные сообщения для подгрузки контекста: {table: [(timestamp, author), ...]}
     found_anchors = {}
     try:
         with conn.cursor() as cur:
@@ -311,11 +310,12 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
                                 "author": row[1] or "",
                                 "content": content[:1500],
                                 "type": row[4] or "text",
-                                "_ts": row[0],  # для группировки
+                                "_ts": row[0],
+                                "similarity": 0.80,
+                                "final_score": 0.80,
                             }
                             if result not in results:
                                 results.append(result)
-                                # Запоминаем якорь для подгрузки контекста
                                 if row[0] and row[1]:
                                     if table_name not in found_anchors:
                                         found_anchors[table_name] = []
@@ -326,7 +326,6 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
             # === КОНТЕКСТНОЕ ОКНО: подгружаем соседние сообщения ±5 мин от того же автора ===
             seen_content = {hash(r['content'][:200]) for r in results}
             for table_name, anchors in found_anchors.items():
-                # Дедуплицируем якоря по автору+времени (округлённо)
                 unique_anchors = {}
                 for ts, author in anchors:
                     key = (author, ts.strftime("%Y-%m-%d %H:%M"))
@@ -361,6 +360,8 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
                                     "content": content[:1500],
                                     "type": row[4] or "text",
                                     "_ts": row[0],
+                                    "similarity": 0.85,
+                                    "final_score": 0.85,
                                 })
                     except:
                         continue
@@ -368,7 +369,6 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
     finally:
         conn.close()
 
-    # Группируем сообщения одного автора ±3 мин
     results = _group_messages(results, window_minutes=3)
     return results[:limit]
 
@@ -1283,7 +1283,7 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
         
         if chats:
             context_parts.append("\n=== ИЗ ЧАТОВ ===")
-            for i, res in enumerate(chats[:8], 1):
+            for i, res in enumerate(chats[:15], 1):
                 score_info = ""
                 if 'final_score' in res:
                     score_info = f" [релевантность: {res['final_score']:.0%}]"
