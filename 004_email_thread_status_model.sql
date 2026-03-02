@@ -27,7 +27,6 @@ UPDATE email_threads
 SET resolution_outcome = CASE
     WHEN status IN ('resolved', 'closed') THEN 'resolved'
     WHEN status = 'cancelled' THEN 'cancelled'
-    WHEN status = 'archived' THEN 'other'
     ELSE NULL
 END
 WHERE resolution_outcome IS NULL;

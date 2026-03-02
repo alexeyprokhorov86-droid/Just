@@ -781,7 +781,7 @@ def generate_thread_summary(thread_id: int, messages: list, closure_marker: str)
 def save_thread_summary(cur, thread_id: int, summary_data: dict, closure_marker: str):
     """Сохраняет сводку в БД."""
     if not summary_data:
-        return
+        return None
 
     outcome_map = {
         "closed_success": "resolved",
@@ -821,6 +821,7 @@ def save_thread_summary(cur, thread_id: int, summary_data: dict, closure_marker:
     logger.info(
         f"Thread {thread_id}: сводка сохранена, lifecycle=closed, outcome={resolution_outcome}"
     )
+    return resolution_outcome
 
 
 def notify_thread_closed(thread_id: int, subject: str, summary_short: str, resolution_outcome: str):
@@ -955,7 +956,7 @@ def process_thread_closure(cur, thread_id: int, body_text: str, subject: str, fr
         return
     
     # Сохраняем сводку
-    save_thread_summary(cur, thread_id, summary_data, marker)
+    resolution_outcome = save_thread_summary(cur, thread_id, summary_data, marker)
     
     # Автоизвлечение фактов из сводки
     try:
@@ -964,12 +965,6 @@ def process_thread_closure(cur, thread_id: int, body_text: str, subject: str, fr
         logger.debug(f"Fact extraction from thread error: {e}")
     
     # Отправляем уведомление
-    outcome_map = {
-        "closed_success": "resolved",
-        "closed_cancelled": "cancelled",
-        "closed_other": "other",
-    }
-    resolution_outcome = outcome_map.get(summary_data.get("status", ""), "other")
     notify_thread_closed(
         thread_id,
         subject,
