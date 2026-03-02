@@ -13,6 +13,7 @@ import os
 import sys
 import re
 import time
+import hashlib
 import imaplib
 import email
 from email.header import decode_header
@@ -23,7 +24,7 @@ import logging
 import argparse
 from datetime import datetime, timedelta
 from typing import Optional, List, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import pathlib
 from company_context import get_company_profile
 from fact_extractor import extract_facts_from_thread_summary_sync
@@ -35,6 +36,13 @@ import requests
 import json
 from embedding_service import index_email_chunk
 from email_text_processing import build_email_chunks
+
+try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+except Exception:
+    boto3 = None
+    BotoConfig = None
 
 # Загружаем переменные окружения
 env_path = pathlib.Path(__file__).parent / '.env'
@@ -65,6 +73,19 @@ SYNC_BATCH_SIZE = int(os.getenv("SYNC_BATCH_SIZE", "50"))
 INITIAL_LOAD_DAYS = int(os.getenv("INITIAL_LOAD_DAYS", "30"))
 
 ATTACHMENTS_PATH = os.getenv("ATTACHMENTS_PATH", "/var/email_logger/attachments")
+MAX_ATTACHMENT_SIZE_MB = int(os.getenv("MAX_ATTACHMENT_SIZE_MB", "25"))
+MAX_ATTACHMENT_SIZE_BYTES = MAX_ATTACHMENT_SIZE_MB * 1024 * 1024
+
+# S3-compatible Object Storage для вложений (Yandex/GCS S3/AWS)
+ATTACHMENTS_BUCKET_NAME = os.getenv("ATTACHMENTS_BUCKET_NAME", "").strip()
+ATTACHMENTS_BUCKET_ENDPOINT = os.getenv("ATTACHMENTS_BUCKET_ENDPOINT", "").strip()
+ATTACHMENTS_BUCKET_REGION = os.getenv("ATTACHMENTS_BUCKET_REGION", "ru-central1").strip()
+ATTACHMENTS_BUCKET_ACCESS_KEY = os.getenv("ATTACHMENTS_BUCKET_ACCESS_KEY", "").strip()
+ATTACHMENTS_BUCKET_SECRET_KEY = os.getenv("ATTACHMENTS_BUCKET_SECRET_KEY", "").strip()
+ATTACHMENTS_BUCKET_PREFIX = os.getenv("ATTACHMENTS_BUCKET_PREFIX", "email_attachments").strip("/")
+ATTACHMENTS_BUCKET_FORCE_PATH_STYLE = os.getenv(
+    "ATTACHMENTS_BUCKET_FORCE_PATH_STYLE", "true"
+).lower() in ("1", "true", "yes")
 
 # RouterAI для анализа цепочек
 ROUTERAI_API_KEY = os.getenv("ROUTERAI_API_KEY")
@@ -72,6 +93,8 @@ ROUTERAI_BASE_URL = os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1")
 
 # Telegram бот для уведомлений
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+_s3_client = None
 
 # ============================================================
 # РАБОТА С БД
@@ -101,6 +124,109 @@ def get_email_credentials() -> dict:
     return credentials
 
 
+def map_legacy_thread_status(lifecycle_status: str, resolution_outcome: Optional[str]) -> str:
+    """Сопоставляет 2-слойную модель в legacy status для совместимости."""
+    if lifecycle_status == "open":
+        return "open"
+    if lifecycle_status == "pending_resolution":
+        return "pending_resolution"
+    if lifecycle_status == "archived":
+        return "archived"
+    if lifecycle_status == "closed":
+        return "cancelled" if resolution_outcome == "cancelled" else "resolved"
+    return "open"
+
+
+def get_s3_client():
+    """Ленивая инициализация S3-compatible клиента."""
+    global _s3_client
+
+    if _s3_client is not None:
+        return _s3_client
+
+    if not ATTACHMENTS_BUCKET_NAME:
+        return None
+
+    if not (ATTACHMENTS_BUCKET_ACCESS_KEY and ATTACHMENTS_BUCKET_SECRET_KEY):
+        logger.warning("Bucket name задан, но не заданы ключи ATTACHMENTS_BUCKET_ACCESS_KEY/SECRET_KEY")
+        return None
+
+    if not boto3:
+        logger.warning("boto3 недоступен — загрузка email вложений в bucket отключена")
+        return None
+
+    client_kwargs = {
+        "service_name": "s3",
+        "aws_access_key_id": ATTACHMENTS_BUCKET_ACCESS_KEY,
+        "aws_secret_access_key": ATTACHMENTS_BUCKET_SECRET_KEY,
+        "region_name": ATTACHMENTS_BUCKET_REGION,
+    }
+    if ATTACHMENTS_BUCKET_ENDPOINT:
+        client_kwargs["endpoint_url"] = ATTACHMENTS_BUCKET_ENDPOINT
+    if BotoConfig:
+        client_kwargs["config"] = BotoConfig(
+            s3={"addressing_style": "path" if ATTACHMENTS_BUCKET_FORCE_PATH_STYLE else "auto"}
+        )
+
+    _s3_client = boto3.client(**client_kwargs)
+    return _s3_client
+
+
+def sanitize_filename(filename: str) -> str:
+    """Очищает имя файла для безопасного хранения."""
+    base = (filename or "").strip()
+    if not base:
+        return "attachment.bin"
+    base = base.replace("\x00", "")
+    base = re.sub(r"[^\w\-.() ]+", "_", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return base[:180] or "attachment.bin"
+
+
+def build_attachment_key(email_id: int, filename: str, received_at: Optional[datetime], payload: bytes) -> str:
+    """Формирует ключ объекта в bucket/local storage."""
+    dt = received_at or datetime.now()
+    safe_filename = sanitize_filename(filename)
+    digest = hashlib.sha256(payload).hexdigest()[:16]
+    prefix = ATTACHMENTS_BUCKET_PREFIX or "email_attachments"
+    return f"{prefix}/{dt.strftime('%Y/%m/%d')}/{email_id}/{digest}_{safe_filename}"
+
+
+def upload_attachment_to_bucket(email_id: int, filename: str, payload: bytes,
+                                content_type: str = "", received_at: Optional[datetime] = None) -> tuple[str, str]:
+    """Загружает вложение в bucket. Возвращает (storage_path, error)."""
+    client = get_s3_client()
+    if not client:
+        return "", "bucket_not_configured"
+
+    key = build_attachment_key(email_id=email_id, filename=filename, received_at=received_at, payload=payload)
+    try:
+        put_kwargs = {
+            "Bucket": ATTACHMENTS_BUCKET_NAME,
+            "Key": key,
+            "Body": payload,
+        }
+        if content_type:
+            put_kwargs["ContentType"] = content_type
+        client.put_object(**put_kwargs)
+        return f"s3://{ATTACHMENTS_BUCKET_NAME}/{key}", ""
+    except Exception as e:
+        return "", str(e)
+
+
+def save_attachment_locally(email_id: int, filename: str, payload: bytes,
+                            received_at: Optional[datetime] = None) -> tuple[str, str]:
+    """Fallback: сохраняет вложение на локальный диск."""
+    rel_key = build_attachment_key(email_id=email_id, filename=filename, received_at=received_at, payload=payload)
+    full_path = pathlib.Path(ATTACHMENTS_PATH) / rel_key
+    try:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_bytes(payload)
+        return str(full_path), ""
+    except Exception as e:
+        return "", str(e)
+
+
 # ============================================================
 # ПАРСИНГ EMAIL
 # ============================================================
@@ -120,6 +246,15 @@ class ParsedEmail:
     body_html: str
     received_at: datetime
     has_attachments: bool
+    attachments: List["EmailAttachment"] = field(default_factory=list)
+
+
+@dataclass
+class EmailAttachment:
+    filename: str
+    content_type: str
+    payload: bytes
+    size_bytes: int
 
 
 # Паттерн для нормализации темы
@@ -242,6 +377,49 @@ def has_attachments(msg) -> bool:
     return False
 
 
+def extract_attachments(msg) -> List[EmailAttachment]:
+    """Извлекает вложения из email сообщения."""
+    attachments: List[EmailAttachment] = []
+    if not msg.is_multipart():
+        return attachments
+
+    for part in msg.walk():
+        content_disposition = str(part.get("Content-Disposition", "")).lower()
+        raw_filename = part.get_filename()
+
+        # Обрабатываем явные attachment и части с именем файла
+        if "attachment" not in content_disposition and not raw_filename:
+            continue
+
+        try:
+            payload = part.get_payload(decode=True) or b""
+        except Exception:
+            payload = b""
+
+        if not payload:
+            continue
+
+        if len(payload) > MAX_ATTACHMENT_SIZE_BYTES:
+            logger.warning(
+                f"Пропуск вложения >{MAX_ATTACHMENT_SIZE_MB}MB: "
+                f"{decode_email_header(raw_filename or 'attachment.bin')}"
+            )
+            continue
+
+        filename = decode_email_header(raw_filename or "attachment.bin")
+        content_type = part.get_content_type() or "application/octet-stream"
+        attachments.append(
+            EmailAttachment(
+                filename=filename[:255],
+                content_type=content_type[:100],
+                payload=payload,
+                size_bytes=len(payload),
+            )
+        )
+
+    return attachments
+
+
 def parse_email_message(uid: int, raw_data: bytes) -> Optional[ParsedEmail]:
     """Парсит сырые данные письма."""
     try:
@@ -266,6 +444,7 @@ def parse_email_message(uid: int, raw_data: bytes) -> Optional[ParsedEmail]:
             received_at = datetime.now()
         
         body_text, body_html = extract_body(msg)
+        attachments = extract_attachments(msg)
         
         return ParsedEmail(
             uid=uid,
@@ -280,7 +459,8 @@ def parse_email_message(uid: int, raw_data: bytes) -> Optional[ParsedEmail]:
             body_text=body_text,
             body_html=body_html,
             received_at=received_at,
-            has_attachments=has_attachments(msg)
+            has_attachments=has_attachments(msg),
+            attachments=attachments,
         )
     except Exception as e:
         logger.error(f"Error parsing email UID {uid}: {e}")
@@ -430,9 +610,10 @@ def find_or_create_thread(cur, parsed: ParsedEmail) -> int:
     # 4. Создаём новую ветку
     cur.execute("""
         INSERT INTO email_threads (
-            thread_id, subject_normalized, started_at, last_message_at, message_count
+            thread_id, subject_normalized, started_at, last_message_at, message_count,
+            lifecycle_status, resolution_outcome, status
         )
-        VALUES (%s, %s, %s, %s, 1)
+        VALUES (%s, %s, %s, %s, 1, 'open', NULL, 'open')
         RETURNING id
     """, (parsed.message_id, parsed.subject_normalized, parsed.received_at, parsed.received_at))
     
@@ -601,18 +782,20 @@ def save_thread_summary(cur, thread_id: int, summary_data: dict, closure_marker:
     """Сохраняет сводку в БД."""
     if not summary_data:
         return
-    
-    status_map = {
-        "closed_success": "closed",
+
+    outcome_map = {
+        "closed_success": "resolved",
         "closed_cancelled": "cancelled",
-        "closed_other": "closed"
+        "closed_other": "other",
     }
-    
-    new_status = status_map.get(summary_data.get("status", ""), "closed")
+    resolution_outcome = outcome_map.get(summary_data.get("status", ""), "other")
+    legacy_status = map_legacy_thread_status("closed", resolution_outcome)
     
     cur.execute("""
         UPDATE email_threads
         SET 
+            lifecycle_status = 'closed',
+            resolution_outcome = %s,
             status = %s,
             resolution_detected_at = NOW(),
             summary_short = %s,
@@ -625,7 +808,8 @@ def save_thread_summary(cur, thread_id: int, summary_data: dict, closure_marker:
             updated_at = NOW()
         WHERE id = %s
     """, (
-        new_status,
+        resolution_outcome,
+        legacy_status,
         summary_data.get("summary_short", ""),
         summary_data.get("summary_detailed", ""),
         summary_data.get("key_decisions", []),
@@ -633,11 +817,13 @@ def save_thread_summary(cur, thread_id: int, summary_data: dict, closure_marker:
         summary_data.get("topic_tags", []),
         thread_id
     ))
-    
-    logger.info(f"Thread {thread_id}: сводка сохранена, статус={new_status}")
+
+    logger.info(
+        f"Thread {thread_id}: сводка сохранена, lifecycle=closed, outcome={resolution_outcome}"
+    )
 
 
-def notify_thread_closed(thread_id: int, subject: str, summary_short: str, status: str):
+def notify_thread_closed(thread_id: int, subject: str, summary_short: str, resolution_outcome: str):
     """Отправляет уведомление в Telegram о закрытии цепочки."""
     if not BOT_TOKEN:
         return
@@ -663,7 +849,7 @@ def notify_thread_closed(thread_id: int, subject: str, summary_short: str, statu
         return
     
     # Формируем сообщение
-    status_emoji = "✅" if status == "closed" else "❌" if status == "cancelled" else "📧"
+    status_emoji = "✅" if resolution_outcome == "resolved" else "❌" if resolution_outcome == "cancelled" else "📧"
     message = (
         f"{status_emoji} Цепочка писем закрыта\n\n"
         f"📌 {subject[:100]}\n\n"
@@ -714,17 +900,17 @@ def process_thread_closure(cur, thread_id: int, body_text: str, subject: str, fr
 
     # Проверяем, не обработана ли уже эта цепочка
     cur.execute("""
-        SELECT status, resolution_detected_at FROM email_threads WHERE id = %s
+        SELECT lifecycle_status, resolution_detected_at FROM email_threads WHERE id = %s
     """, (thread_id,))
     row = cur.fetchone()
     
     if not row:
         return
     
-    current_status, resolution_at = row
+    lifecycle_status, resolution_at = row
     
     # Если уже закрыта — пропускаем
-    if current_status in ('closed', 'cancelled') and resolution_at:
+    if lifecycle_status in ('closed', 'archived') and resolution_at:
         return
     
     # Проверяем маркеры закрытия
@@ -734,6 +920,16 @@ def process_thread_closure(cur, thread_id: int, body_text: str, subject: str, fr
         return
     
     logger.info(f"Thread {thread_id}: обнаружен маркер закрытия '{marker}'")
+
+    # Помечаем ветку как "нуждается в подтверждении" до генерации финального итога
+    cur.execute("""
+        UPDATE email_threads
+        SET lifecycle_status = 'pending_resolution',
+            status = 'pending_resolution',
+            resolution_detected_at = COALESCE(resolution_detected_at, NOW()),
+            updated_at = NOW()
+        WHERE id = %s
+    """, (thread_id,))
     
     # Получаем сообщения цепочки
     messages = get_thread_messages(cur, thread_id)
@@ -745,12 +941,17 @@ def process_thread_closure(cur, thread_id: int, body_text: str, subject: str, fr
     summary_data = generate_thread_summary(thread_id, messages, marker)
     
     if not summary_data:
-        # Если не удалось сгенерировать — просто помечаем как закрытую
+        # Если не удалось сгенерировать — закрываем с outcome=other
+        fallback_outcome = "other"
         cur.execute("""
             UPDATE email_threads
-            SET status = 'closed', resolution_detected_at = NOW(), updated_at = NOW()
+            SET lifecycle_status = 'closed',
+                resolution_outcome = %s,
+                status = %s,
+                resolution_detected_at = NOW(),
+                updated_at = NOW()
             WHERE id = %s
-        """, (thread_id,))
+        """, (fallback_outcome, map_legacy_thread_status("closed", fallback_outcome), thread_id))
         return
     
     # Сохраняем сводку
@@ -763,12 +964,17 @@ def process_thread_closure(cur, thread_id: int, body_text: str, subject: str, fr
         logger.debug(f"Fact extraction from thread error: {e}")
     
     # Отправляем уведомление
-    new_status = "closed" if summary_data.get("status") != "closed_cancelled" else "cancelled"
+    outcome_map = {
+        "closed_success": "resolved",
+        "closed_cancelled": "cancelled",
+        "closed_other": "other",
+    }
+    resolution_outcome = outcome_map.get(summary_data.get("status", ""), "other")
     notify_thread_closed(
         thread_id,
         subject,
         summary_data.get("summary_short", ""),
-        new_status
+        resolution_outcome
     )
 
 
@@ -858,6 +1064,83 @@ def sync_mailbox(mailbox_id: int, email_addr: str, password: str, last_uid_inbox
     return stats
 
 
+def store_email_attachments(cur, email_id: int, parsed: ParsedEmail) -> tuple[int, int]:
+    """Сохраняет вложения письма в bucket/local storage и пишет метаданные в БД."""
+    if not parsed.attachments:
+        return 0, 0
+
+    saved = 0
+    failed = 0
+
+    for attachment in parsed.attachments:
+        storage_path = ""
+        storage_error = ""
+
+        # 1) Пытаемся загрузить в bucket (при наличии конфигурации)
+        bucket_path, bucket_error = upload_attachment_to_bucket(
+            email_id=email_id,
+            filename=attachment.filename,
+            payload=attachment.payload,
+            content_type=attachment.content_type,
+            received_at=parsed.received_at,
+        )
+        if bucket_path:
+            storage_path = bucket_path
+        else:
+            storage_error = "" if bucket_error == "bucket_not_configured" else bucket_error
+
+        # 2) Fallback на локальное хранилище
+        if not storage_path:
+            local_path, local_error = save_attachment_locally(
+                email_id=email_id,
+                filename=attachment.filename,
+                payload=attachment.payload,
+                received_at=parsed.received_at,
+            )
+            if local_path:
+                storage_path = local_path
+                if storage_error:
+                    storage_error = f"bucket upload failed: {storage_error}"
+            else:
+                if storage_error and local_error:
+                    storage_error = f"bucket: {storage_error}; local: {local_error}"
+                elif local_error:
+                    storage_error = local_error
+
+        analysis_status = "pending" if storage_path else "failed"
+
+        cur.execute(
+            """
+            INSERT INTO email_attachments (
+                message_id, filename, content_type, size_bytes, storage_path,
+                analysis_status, analysis_error
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                email_id,
+                attachment.filename[:255],
+                attachment.content_type[:100],
+                attachment.size_bytes,
+                storage_path[:500] if storage_path else None,
+                analysis_status,
+                (storage_error or None),
+            ),
+        )
+
+        if storage_path:
+            saved += 1
+        else:
+            failed += 1
+            logger.warning(f"Attachment storage failed for email_id={email_id}: {attachment.filename} ({storage_error})")
+
+    cur.execute(
+        "UPDATE email_messages SET attachment_count = %s WHERE id = %s",
+        (saved + failed, email_id),
+    )
+
+    return saved, failed
+
+
 def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direction: str):
     """Обрабатывает и сохраняет одно письмо."""
     
@@ -898,7 +1181,14 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
     row = cur.fetchone()
     if row:
         email_id = row[0]
-        
+
+        # Сохраняем вложения (bucket/local)
+        if parsed.has_attachments and parsed.attachments:
+            saved, failed = store_email_attachments(cur, email_id, parsed)
+            logger.info(
+                f"Email {email_id}: attachments saved={saved}, failed={failed}"
+            )
+
         # Индексируем для векторного поиска
         chunks = build_email_chunks(
             subject=parsed.subject,
@@ -911,9 +1201,7 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
                 index_email_chunk(email_id=email_id, chunk_index=idx, content=chunk)
             except Exception as e:
                 logger.warning(f"Email chunk indexing failed for email_id={email_id}, chunk={idx}: {e}")
-                logger.debug(f"Indexed email {email_id}")
-            except Exception as e:
-                logger.warning(f"Email indexing failed for {email_id}: {e}")
+        logger.debug(f"Indexed email {email_id} into {len(chunks)} chunks")
     
     # Обновляем статистику ветки
     update_thread_stats(cur, thread_id, parsed)

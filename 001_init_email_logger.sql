@@ -77,7 +77,9 @@ CREATE TABLE IF NOT EXISTS email_threads (
     participant_employee_ids INTEGER[],     -- связанные сотрудники
     
     -- Статус и решение
-    status VARCHAR(50) DEFAULT 'open',      -- open/pending_resolution/resolved/archived
+    lifecycle_status VARCHAR(50) NOT NULL DEFAULT 'open', -- open/pending_resolution/closed/archived
+    resolution_outcome VARCHAR(50),                      -- resolved/cancelled/other (nullable пока не закрыто)
+    status VARCHAR(50) DEFAULT 'open',                   -- LEGACY: для совместимости старых скриптов
     resolution_detected_at TIMESTAMP,
     resolution_confirmed BOOLEAN DEFAULT false,
     
@@ -99,6 +101,8 @@ CREATE TABLE IF NOT EXISTS email_threads (
 );
 
 CREATE INDEX IF NOT EXISTS idx_threads_status ON email_threads(status);
+CREATE INDEX IF NOT EXISTS idx_threads_lifecycle_status ON email_threads(lifecycle_status);
+CREATE INDEX IF NOT EXISTS idx_threads_resolution_outcome ON email_threads(resolution_outcome);
 CREATE INDEX IF NOT EXISTS idx_threads_last_message ON email_threads(last_message_at DESC);
 CREATE INDEX IF NOT EXISTS idx_threads_subject ON email_threads(subject_normalized);
 

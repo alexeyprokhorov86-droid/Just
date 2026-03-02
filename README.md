@@ -112,7 +112,9 @@ sudo systemctl start email_logger
 ### Поля ветки (email_threads)
 
 - `subject_normalized` — тема без Re:/Fwd:
-- `status` — open/pending_resolution/resolved/archived
+- `lifecycle_status` — open/pending_resolution/closed/archived
+- `resolution_outcome` — resolved/cancelled/other (nullable)
+- `status` — legacy-поле для обратной совместимости
 - `summary_short/detailed` — AI-саммари
 - `key_decisions` — массив решений
 - `action_items` — задачи (JSON)

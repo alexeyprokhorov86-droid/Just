@@ -14,6 +14,18 @@ INITIAL_LOAD_DAYS=30
 
 # ----- Attachments Storage -----
 ATTACHMENTS_PATH=/var/email_logger/attachments
+MAX_ATTACHMENT_SIZE_MB=25
+
+# ----- Object Storage (S3-compatible, опционально) -----
+# Если заполнено — email вложения будут складываться в bucket.
+# Если не заполнено — fallback на ATTACHMENTS_PATH (локальный диск).
+ATTACHMENTS_BUCKET_NAME=your-bucket-name
+ATTACHMENTS_BUCKET_ENDPOINT=https://storage.yandexcloud.net
+ATTACHMENTS_BUCKET_REGION=ru-central1
+ATTACHMENTS_BUCKET_ACCESS_KEY=your_access_key
+ATTACHMENTS_BUCKET_SECRET_KEY=your_secret_key
+ATTACHMENTS_BUCKET_PREFIX=email_attachments
+ATTACHMENTS_BUCKET_FORCE_PATH_STYLE=true
 
 # ----- Email Credentials -----
 # Формат: EMAIL_N=address,password
