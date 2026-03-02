@@ -614,11 +614,6 @@ def find_or_create_thread(cur, parsed: ParsedEmail) -> int:
             lifecycle_status, resolution_outcome, status
         )
         VALUES (%s, %s, %s, %s, 1, 'open', NULL, 'open')
-        ON CONFLICT (thread_id) DO UPDATE SET
-            subject_normalized = COALESCE(email_threads.subject_normalized, EXCLUDED.subject_normalized),
-            started_at = COALESCE(email_threads.started_at, EXCLUDED.started_at),
-            last_message_at = GREATEST(email_threads.last_message_at, EXCLUDED.last_message_at),
-            updated_at = NOW()
         RETURNING id
     """, (parsed.message_id, parsed.subject_normalized, parsed.received_at, parsed.received_at))
 
