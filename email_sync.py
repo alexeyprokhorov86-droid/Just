@@ -607,7 +607,7 @@ def find_or_create_thread(cur, parsed: ParsedEmail) -> int:
         if row:
             return row[0]
     
-    # 4. Создаём новую ветку
+    # 4. Создаём новую ветку (или берём существующую при гонке/дубликате Message-ID)
     cur.execute("""
         INSERT INTO email_threads (
             thread_id, subject_normalized, started_at, last_message_at, message_count,
@@ -616,8 +616,18 @@ def find_or_create_thread(cur, parsed: ParsedEmail) -> int:
         VALUES (%s, %s, %s, %s, 1, 'open', NULL, 'open')
         RETURNING id
     """, (parsed.message_id, parsed.subject_normalized, parsed.received_at, parsed.received_at))
-    
-    return cur.fetchone()[0]
+
+    row = cur.fetchone()
+    if row and len(row) > 0:
+        return row[0]
+
+    # Очень редкий fallback
+    cur.execute("SELECT id FROM email_threads WHERE thread_id = %s", (parsed.message_id,))
+    row = cur.fetchone()
+    if row and len(row) > 0:
+        return row[0]
+
+    raise RuntimeError(f"Не удалось создать или получить thread для message_id={parsed.message_id}")
 
 
 def update_thread_stats(cur, thread_id: int, parsed: ParsedEmail):
@@ -891,8 +901,8 @@ def process_thread_closure(cur, thread_id: int, body_text: str, subject: str, fr
         cur.execute("""
             SELECT COUNT(*) FROM email_messages
             WHERE thread_id = %s
-            AND (from_address LIKE '%totsamiy.com' OR from_address LIKE '%lacannelle.ru')
-        """, (thread_id,))
+            AND (from_address ILIKE %s OR from_address ILIKE %s)
+        """, (thread_id, "%@totsamiy.com", "%@lacannelle.ru"))
         our_replies = cur.fetchone()[0]
         if our_replies == 0:
             logger.info(f"Thread {thread_id}: пропускаем — внешний отправитель, нет ответов от сотрудников")
