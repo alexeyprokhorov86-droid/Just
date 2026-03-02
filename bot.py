@@ -2313,6 +2313,23 @@ def truncate_text(text: str, max_len: int = 100) -> str:
     return text[:max_len-3] + "..."
 
 
+def format_thread_status(lifecycle_status: str, resolution_outcome: str | None) -> str:
+    """Форматирует 2-слойный статус ветки для отображения в боте."""
+    if lifecycle_status == "open":
+        return "📬 Открыта"
+    if lifecycle_status == "pending_resolution":
+        return "⏳ Ожидает подтверждения"
+    if lifecycle_status == "archived":
+        return "📦 В архиве"
+    if lifecycle_status == "closed":
+        if resolution_outcome == "cancelled":
+            return "❌ Закрыта (отменено)"
+        if resolution_outcome == "resolved":
+            return "✅ Закрыта (решено)"
+        return "📧 Закрыта"
+    return lifecycle_status or "unknown"
+
+
 # ============================================================
 # EMAIL LOGGER: КОМАНДЫ
 # ============================================================
@@ -2334,9 +2351,10 @@ async def open_threads_command(update: Update, context: ContextTypes.DEFAULT_TYP
                     t.message_count,
                     t.last_message_at,
                     t.priority,
-                    t.status
+                    t.lifecycle_status,
+                    t.resolution_outcome
                 FROM email_threads t
-                WHERE t.status IN ('open', 'pending_resolution')
+                WHERE t.lifecycle_status IN ('open', 'pending_resolution')
                 ORDER BY 
                     CASE t.priority 
                         WHEN 'high' THEN 1 
@@ -2351,8 +2369,9 @@ async def open_threads_command(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Ошибка получения веток: {e}")
         await update.message.reply_text(
             "❌ Таблицы email логгера не найдены.\n\n"
-            "Примените миграцию:\n"
-            "`psql -d knowledge_base -f 001_init_email_logger.sql`",
+            "Примените миграции:\n"
+            "`psql -d knowledge_base -f 001_init_email_logger.sql`\n"
+            "`psql -d knowledge_base -f 004_email_thread_status_model.sql`",
             parse_mode="Markdown"
         )
         return
@@ -2365,9 +2384,9 @@ async def open_threads_command(update: Update, context: ContextTypes.DEFAULT_TYP
     
     text = "📬 *Открытые ветки переписки:*\n\n"
     
-    for thread_id, subject, msg_count, last_msg_at, priority, status in threads:
+    for thread_id, subject, msg_count, last_msg_at, priority, lifecycle_status, resolution_outcome in threads:
         priority_icon = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}.get(priority or 'medium', '⚪')
-        status_icon = '⏳' if status == 'pending_resolution' else '📨'
+        status_icon = '⏳' if lifecycle_status == 'pending_resolution' else '📨'
         age = format_email_age(last_msg_at)
         subject_short = truncate_text(subject or "Без темы", 45)
         
@@ -2398,7 +2417,7 @@ async def show_email_thread_command(update: Update, context: ContextTypes.DEFAUL
             cur.execute("""
                 SELECT 
                     id, subject_normalized, message_count, last_message_at,
-                    priority, status, participant_emails, topic_tags,
+                    priority, lifecycle_status, resolution_outcome, participant_emails, topic_tags,
                     summary_short, key_decisions, action_items
                 FROM email_threads WHERE id = %s
             """, (thread_id,))
@@ -2408,7 +2427,7 @@ async def show_email_thread_command(update: Update, context: ContextTypes.DEFAUL
                 await update.message.reply_text("❌ Ветка не найдена")
                 return
             
-            (tid, subject, msg_count, last_msg_at, priority, status, 
+            (tid, subject, msg_count, last_msg_at, priority, lifecycle_status, resolution_outcome,
              participants, tags, summary, decisions, actions) = row
              
             # Получаем последние сообщения
@@ -2424,13 +2443,7 @@ async def show_email_thread_command(update: Update, context: ContextTypes.DEFAUL
         conn.close()
     
     # Статус
-    status_map = {
-        'open': '📬 Открыта',
-        'pending_resolution': '⏳ Ожидает подтверждения',
-        'resolved': '✅ Решена',
-        'archived': '📦 В архиве'
-    }
-    status_str = status_map.get(status, status or 'unknown')
+    status_str = format_thread_status(lifecycle_status, resolution_outcome)
     
     # Приоритет
     priority_map = {'high': '🔴 Высокий', 'medium': '🟡 Средний', 'low': '🟢 Низкий'}
@@ -2505,7 +2518,11 @@ async def email_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE email_threads
-                    SET status = 'resolved', resolution_confirmed = true, updated_at = NOW()
+                    SET lifecycle_status = 'closed',
+                        resolution_outcome = 'resolved',
+                        status = 'resolved',
+                        resolution_confirmed = true,
+                        updated_at = NOW()
                     WHERE id = %s
                 """, (thread_id,))
                 conn.commit()
@@ -2520,7 +2537,11 @@ async def email_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE email_threads SET status = 'archived', updated_at = NOW() WHERE id = %s
+                    UPDATE email_threads
+                    SET lifecycle_status = 'archived',
+                        status = 'archived',
+                        updated_at = NOW()
+                    WHERE id = %s
                 """, (thread_id,))
                 conn.commit()
         finally:
@@ -2560,7 +2581,7 @@ async def email_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
                     (SELECT COUNT(*) FROM monitored_mailboxes WHERE is_active = true),
                     (SELECT COUNT(*) FROM email_messages),
                     (SELECT COUNT(*) FROM email_threads),
-                    (SELECT COUNT(*) FROM email_threads WHERE status = 'open'),
+                    (SELECT COUNT(*) FROM email_threads WHERE lifecycle_status IN ('open', 'pending_resolution')),
                     (SELECT COUNT(*) FROM email_attachments),
                     (SELECT COUNT(*) FROM email_attachments WHERE analysis_status = 'pending')
             """)
