@@ -1199,6 +1199,9 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
                 f"Email {email_id}: attachments saved={saved}, failed={failed}"
             )
 
+        # Коммитим email перед индексацией, чтобы избежать сирот-embeddings
+        cur.connection.commit()
+
         # Индексируем для векторного поиска
         chunks = build_email_chunks(
             subject=parsed.subject,
