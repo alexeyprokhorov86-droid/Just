@@ -1808,6 +1808,7 @@ class Sync1C:
                         INSERT INTO c1_cost_allocation_materials (doc_key, line_number,
                             nomenclature_key, quantity, sum_total)
                         VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (doc_key, line_number) DO NOTHING
                     """, (
                         ref_key,
                         item.get('LineNumber'),
