@@ -4046,6 +4046,15 @@ class Sync1C:
             doc_number = doc.get('Number', '').strip()
             doc_id = doc.get('Ref_Key')
             
+            # Извлекаем ссылку на документ-основание (оригинальную реализацию)
+            base_doc_key = doc.get('ДокументОснование')
+            base_doc_date = None
+            if base_doc_key and base_doc_key != EMPTY_UUID:
+                for sdoc in sales_docs:
+                    if sdoc.get('Ref_Key') == base_doc_key:
+                        base_doc_date = sdoc.get('Date', '')[:10]
+                        break
+            
             client_key = doc.get('Партнер_Key') or doc.get('Контрагент_Key')
             client_name = self.get_name_by_key(
                 self.contractors_cache, "Catalog_Партнеры", client_key
@@ -4091,6 +4100,8 @@ class Sync1C:
                     'pallets_count': 0,
                     'logistics_cost_fact': 0,
                     'logistics_cost_plan': 0,
+                    'base_doc_id': base_doc_key if base_doc_key and base_doc_key != EMPTY_UUID else None,
+                    'base_doc_date': base_doc_date,
                 })
         
         print(f"  Всего записей о продажах: {len(records)}")
@@ -4115,7 +4126,8 @@ class Sync1C:
                 r['consignee_id'], r['consignee_name'],
                 r['nomenclature_id'], r['nomenclature_name'], r['nomenclature_type'],
                 r['quantity'], r['price'], r['sum_without_vat'], r['sum_with_vat'],
-                r['pallets_count'], r['logistics_cost_fact'], r['logistics_cost_plan']
+                r['pallets_count'], r['logistics_cost_fact'], r['logistics_cost_plan'],
+                r.get('base_doc_id'), r.get('base_doc_date')
             )
             for r in records
         ]
@@ -4127,7 +4139,8 @@ class Sync1C:
                 client_id, client_name, consignee_id, consignee_name,
                 nomenclature_id, nomenclature_name, nomenclature_type,
                 quantity, price, sum_without_vat, sum_with_vat,
-                pallets_count, logistics_cost_fact, logistics_cost_plan)
+                pallets_count, logistics_cost_fact, logistics_cost_plan,
+                base_doc_id, base_doc_date)
                VALUES %s""",
             values
         )
