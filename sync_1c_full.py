@@ -4000,7 +4000,11 @@ class Sync1C:
                 pallets = 0
             
             logistics_fact = doc.get('АгросервисИТ_ФактическаяСтоимостьТраспортныхРасходов', 0) or 0
-            logistics_plan = doc.get('АгросервисИТ_ПлановаяСтоимостьТраспортныхРасходов', 0) or 0
+            logistics_plan = doc.get('АгросервисИТ_ПлановаяСтоимостьТранспортныхРасходов', 0) or 0
+            
+            # Дата перехода права собственности
+            ownership_date_raw = doc.get('ДатаПереходаПраваСобственности', '')
+            ownership_date = ownership_date_raw[:10] if ownership_date_raw and ownership_date_raw[:4] != '0001' else doc_date
             
             for item in doc.get('Товары', []):
                 nom_key = item.get('Номенклатура_Key')
@@ -4038,6 +4042,7 @@ class Sync1C:
                     'pallets_count': pallets,
                     'logistics_cost_fact': logistics_fact,
                     'logistics_cost_plan': logistics_plan,
+                    'ownership_date': ownership_date,
                 })
         
         # Обрабатываем корректировки
@@ -4127,7 +4132,8 @@ class Sync1C:
                 r['nomenclature_id'], r['nomenclature_name'], r['nomenclature_type'],
                 r['quantity'], r['price'], r['sum_without_vat'], r['sum_with_vat'],
                 r['pallets_count'], r['logistics_cost_fact'], r['logistics_cost_plan'],
-                r.get('base_doc_id'), r.get('base_doc_date')
+                r.get('base_doc_id'), r.get('base_doc_date'),
+                r.get('ownership_date')
             )
             for r in records
         ]
@@ -4140,7 +4146,8 @@ class Sync1C:
                 nomenclature_id, nomenclature_name, nomenclature_type,
                 quantity, price, sum_without_vat, sum_with_vat,
                 pallets_count, logistics_cost_fact, logistics_cost_plan,
-                base_doc_id, base_doc_date)
+                base_doc_id, base_doc_date,
+                ownership_date)
                VALUES %s""",
             values
         )
