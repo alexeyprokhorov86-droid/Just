@@ -4368,7 +4368,26 @@ class Sync1C:
                 pallets_count, logistics_cost_fact, logistics_cost_plan,
                 base_doc_id, base_doc_date,
                 ownership_date)
-               VALUES %s""",
+               VALUES %s
+               ON CONFLICT (doc_id, nomenclature_id, doc_type) DO UPDATE SET
+                   doc_date = EXCLUDED.doc_date,
+                   doc_number = EXCLUDED.doc_number,
+                   client_id = EXCLUDED.client_id,
+                   client_name = EXCLUDED.client_name,
+                   consignee_id = EXCLUDED.consignee_id,
+                   consignee_name = EXCLUDED.consignee_name,
+                   nomenclature_name = EXCLUDED.nomenclature_name,
+                   nomenclature_type = EXCLUDED.nomenclature_type,
+                   quantity = EXCLUDED.quantity,
+                   price = EXCLUDED.price,
+                   sum_without_vat = EXCLUDED.sum_without_vat,
+                   sum_with_vat = EXCLUDED.sum_with_vat,
+                   pallets_count = EXCLUDED.pallets_count,
+                   logistics_cost_fact = EXCLUDED.logistics_cost_fact,
+                   logistics_cost_plan = EXCLUDED.logistics_cost_plan,
+                   base_doc_id = EXCLUDED.base_doc_id,
+                   base_doc_date = EXCLUDED.base_doc_date,
+                   ownership_date = EXCLUDED.ownership_date""",
             values
         )
         
