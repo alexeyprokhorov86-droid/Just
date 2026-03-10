@@ -485,6 +485,71 @@ def ensure_warehouse_tables(conn):
     except Exception as e:
         print(f"Ошибка создания таблиц складских документов: {e}")
 
+def ensure_goods_transfer_tables(conn):
+    """Создаёт таблицы для документа Передача товаров хранителю."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_goods_transfer (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    partner_key VARCHAR(50),
+                    contractor_key VARCHAR(50),
+                    warehouse_key VARCHAR(50),
+                    customer_order_key VARCHAR(50),
+                    agreement_key VARCHAR(50),
+                    manager_key VARCHAR(50),
+                    department_key VARCHAR(50),
+                    operation_type VARCHAR(100),
+                    delivery_method VARCHAR(100),
+                    delivery_address TEXT,
+                    doc_total NUMERIC(15,2),
+                    comment TEXT,
+                    is_correction BOOLEAN DEFAULT FALSE,
+                    reversed_doc_key VARCHAR(50),
+                    corrected_doc_key VARCHAR(50),
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_goods_transfer_items (
+                    id SERIAL PRIMARY KEY,
+                    doc_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_key VARCHAR(50),
+                    quantity NUMERIC(15,3),
+                    price NUMERIC(15,2),
+                    sum_total NUMERIC(15,2),
+                    warehouse_key VARCHAR(50),
+                    customer_order_key VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    CONSTRAINT c1_goods_transfer_items_uniq
+                        UNIQUE (doc_key, line_number)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_goods_transfer_date
+                    ON c1_goods_transfer(doc_date);
+                CREATE INDEX IF NOT EXISTS idx_goods_transfer_partner
+                    ON c1_goods_transfer(partner_key);
+                CREATE INDEX IF NOT EXISTS idx_goods_transfer_items_doc
+                    ON c1_goods_transfer_items(doc_key);
+                CREATE INDEX IF NOT EXISTS idx_goods_transfer_items_nom
+                    ON c1_goods_transfer_items(nomenclature_key);
+            """)
+            conn.commit()
+            print("  [OK] Таблицы c1_goods_transfer созданы")
+    except Exception as e:
+        print(f"  Ошибка создания таблиц goods_transfer: {e}")
+        conn.rollback()
+
 def ensure_finance_tables(conn):
     """Создаёт таблицы для финансовых документов и заказов."""
     try:
@@ -3573,7 +3638,159 @@ class Sync1C:
         
         print(f"  ✅ Сохранено: {len(all_docs)} планов продаж")
         return len(all_docs)
-  
+    
+    def sync_goods_transfer(self, conn, date_from, date_to):
+        """Синхронизация документов 'Передача товаров хранителю'."""
+        from urllib.parse import quote
+
+        print("\\n[Передача товаров хранителю]")
+
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+
+        encoded = quote("Document_ПередачаТоваровХранителю", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime\\'{date_from_str}\\'%20and%20Date%20le%20datetime\\'{date_to_str}\\'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+
+                if not docs:
+                    break
+
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+
+                if len(docs) < batch_size:
+                    break
+
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+
+        print(f"    Всего документов: {len(all_docs)}")
+
+        if not all_docs:
+            return 0
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_goods_transfer WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+
+                cur.execute("""
+                    INSERT INTO c1_goods_transfer (
+                        ref_key, doc_number, doc_date, posted,
+                        organization_key, partner_key, contractor_key,
+                        warehouse_key, customer_order_key, agreement_key,
+                        manager_key, department_key, operation_type,
+                        delivery_method, delivery_address, doc_total,
+                        comment, is_correction, reversed_doc_key,
+                        corrected_doc_key, is_deleted, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    )
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        posted = EXCLUDED.posted,
+                        organization_key = EXCLUDED.organization_key,
+                        partner_key = EXCLUDED.partner_key,
+                        contractor_key = EXCLUDED.contractor_key,
+                        warehouse_key = EXCLUDED.warehouse_key,
+                        customer_order_key = EXCLUDED.customer_order_key,
+                        agreement_key = EXCLUDED.agreement_key,
+                        manager_key = EXCLUDED.manager_key,
+                        department_key = EXCLUDED.department_key,
+                        operation_type = EXCLUDED.operation_type,
+                        delivery_method = EXCLUDED.delivery_method,
+                        delivery_address = EXCLUDED.delivery_address,
+                        doc_total = EXCLUDED.doc_total,
+                        comment = EXCLUDED.comment,
+                        is_correction = EXCLUDED.is_correction,
+                        reversed_doc_key = EXCLUDED.reversed_doc_key,
+                        corrected_doc_key = EXCLUDED.corrected_doc_key,
+                        is_deleted = EXCLUDED.is_deleted,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
+                    doc.get('Контрагент_Key') if doc.get('Контрагент_Key') != EMPTY_UUID else None,
+                    doc.get('Склад_Key') if doc.get('Склад_Key') != EMPTY_UUID else None,
+                    doc.get('ЗаказКлиента') if doc.get('ЗаказКлиента') != EMPTY_UUID else None,
+                    doc.get('Соглашение_Key') if doc.get('Соглашение_Key') != EMPTY_UUID else None,
+                    doc.get('Менеджер_Key') if doc.get('Менеджер_Key') != EMPTY_UUID else None,
+                    doc.get('Подразделение_Key') if doc.get('Подразделение_Key') != EMPTY_UUID else None,
+                    doc.get('ХозяйственнаяОперация', ''),
+                    doc.get('СпособДоставки', ''),
+                    doc.get('АдресДоставки', ''),
+                    doc.get('СуммаДокумента', 0),
+                    doc.get('Комментарий', ''),
+                    doc.get('Исправление', False),
+                    doc.get('СторнируемыйДокумент_Key') if doc.get('СторнируемыйДокумент_Key') != EMPTY_UUID else None,
+                    doc.get('ИсправляемыйДокумент_Key') if doc.get('ИсправляемыйДокумент_Key') != EMPTY_UUID else None,
+                    doc.get('DeletionMark', False),
+                ))
+
+                # Табличная часть "Товары"
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_goods_transfer_items (
+                            doc_key, line_number, nomenclature_key,
+                            quantity, price, sum_total,
+                            warehouse_key, customer_order_key
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (doc_key, line_number) DO UPDATE SET
+                            nomenclature_key = EXCLUDED.nomenclature_key,
+                            quantity = EXCLUDED.quantity,
+                            price = EXCLUDED.price,
+                            sum_total = EXCLUDED.sum_total,
+                            warehouse_key = EXCLUDED.warehouse_key,
+                            customer_order_key = EXCLUDED.customer_order_key,
+                            updated_at = NOW()
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0),
+                        item.get('Цена', 0),
+                        item.get('Сумма', 0),
+                        item.get('Склад_Key') if item.get('Склад_Key') != EMPTY_UUID else None,
+                        item.get('ЗаказКлиента') if item.get('ЗаказКлиента') != EMPTY_UUID else None,
+                    ))
+
+            conn.commit()
+
+        print(f"  ✓ Сохранено: {len(all_docs)} документов передачи товаров хранителю")
+        return len(all_docs)
+    
     def sync_all_finance(self, conn, date_from, date_to):
         """Синхронизация всех финансовых документов и заказов."""
         print("\n" + "=" * 60)
@@ -3590,6 +3807,9 @@ class Sync1C:
         self.sync_purchase_plan(conn, date_from, date_to)
         self.sync_internal_consumption(conn, date_from, date_to)
         self.sync_debt_offset(conn, date_from, date_to)
+        
+        ensure_goods_transfer_tables(conn)
+        self.sync_goods_transfer(conn, date_from, date_to)
   
     def get_catalog(self, catalog_name, batch_size=1000):
         """Загрузка справочника"""
@@ -4385,6 +4605,7 @@ def main_daily(sync, conn):
     sync.sync_supplier_orders(conn, date_from, date_to)
     sync.sync_internal_consumption(conn, date_from, date_to)
     sync.sync_debt_offset(conn, date_from, date_to)
+    sync.sync_goods_transfer(conn, date_from, date_to)
     
     # Тяжёлые планы — с маленьким batch_size
     sync.sync_sales_plan_light(conn, date_from, date_to)
