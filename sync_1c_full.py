@@ -3643,7 +3643,7 @@ class Sync1C:
         """Синхронизация документов 'Передача товаров хранителю'."""
         from urllib.parse import quote
 
-        print("\\n[Передача товаров хранителю]")
+        print("\n[Передача товаров хранителю]")
 
         date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
         date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
@@ -3659,7 +3659,7 @@ class Sync1C:
                 f"?$format=json"
                 f"&$top={batch_size}"
                 f"&$skip={skip}"
-                f"&$filter=Date%20ge%20datetime\\'{date_from_str}\\'%20and%20Date%20le%20datetime\\'{date_to_str}\\'%20and%20Posted%20eq%20true"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
                 f"&$orderby=Date%20desc"
             )
 
