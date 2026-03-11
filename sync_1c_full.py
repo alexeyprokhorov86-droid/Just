@@ -603,6 +603,8 @@ def ensure_finance_tables(conn):
                     quantity NUMERIC(15,3),
                     price NUMERIC(15,2),
                     sum_total NUMERIC(15,2),
+                    sum_with_vat NUMERIC(15,2),
+                    vat_sum NUMERIC(15,2),
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
@@ -2688,6 +2690,7 @@ class Sync1C:
                         is_deleted = EXCLUDED.is_deleted,
                         deletion_mark = EXCLUDED.deletion_mark,
                         shipment_date = EXCLUDED.shipment_date,
+                        doc.get('ЦенаВключаетНДС', False),
                         updated_at = NOW()
                 """, (
                     ref_key,
@@ -2711,16 +2714,20 @@ class Sync1C:
                 for item in doc.get('Товары', []):
                     cur.execute("""
                         INSERT INTO c1_customer_order_items (order_key, line_number,
-                            nomenclature_key, quantity, price, sum_total)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (order_key, line_number) DO NOTHING
+                            nomenclature_key, quantity, price, sum_total, sum_with_vat, vat_sum)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO UPDATE SET
+                            sum_with_vat = EXCLUDED.sum_with_vat,
+                            vat_sum = EXCLUDED.vat_sum
                     """, (
                         ref_key,
                         item.get('LineNumber'),
                         item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
                         item.get('Количество', 0),
                         item.get('Цена', 0),
-                        item.get('Сумма', 0)
+                        item.get('Сумма', 0),
+                        item.get('СуммаСНДС', 0),
+                        item.get('СуммаНДС', 0)
                     ))
             
             conn.commit()
@@ -2728,6 +2735,140 @@ class Sync1C:
         print(f"  ✅ Сохранено: {len(all_docs)} заказов клиентов")
         return len(all_docs)
 
+    def sync_dispatch_orders(self, conn, date_from, date_to):
+        """Синхронизация расходных ордеров на товары."""
+        from urllib.parse import quote
+        
+        print("\n[Расходные ордера]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_РасходныйОрдерНаТовары", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_dispatch_orders WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                dispatch_date_raw = doc.get('ДатаОтгрузки', '')
+                
+                cur.execute("""
+                    INSERT INTO c1_dispatch_orders (ref_key, doc_number, doc_date, posted,
+                        dispatch_date, warehouse_key, recipient_key, recipient_type,
+                        status, operation, total_places, comment, deletion_mark, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        status = EXCLUDED.status,
+                        dispatch_date = EXCLUDED.dispatch_date,
+                        total_places = EXCLUDED.total_places,
+                        deletion_mark = EXCLUDED.deletion_mark,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    dispatch_date_raw if dispatch_date_raw and dispatch_date_raw[:4] != '0001' else None,
+                    doc.get('Склад_Key') if doc.get('Склад_Key') != EMPTY_UUID else None,
+                    doc.get('Получатель') if doc.get('Получатель') != EMPTY_UUID else None,
+                    doc.get('Получатель_Type', ''),
+                    doc.get('Статус', ''),
+                    doc.get('СкладскаяОперация', ''),
+                    int(doc.get('ВсегоМест', 0) or 0),
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False)
+                ))
+                
+                # Загружаем табличную часть ТоварыПоРаспоряжениям
+                items_url = (
+                    f"{self.base_url}/{encoded}(guid'{ref_key}')"
+                    f"/ТоварыПоРаспоряжениям?$format=json"
+                )
+                try:
+                    r_items = self.session.get(items_url, timeout=60)
+                    if r_items.status_code == 200:
+                        items = r_items.json().get('value', [])
+                        items = [sanitize_dict(it) for it in items]
+                    else:
+                        items = []
+                except:
+                    items = []
+                
+                cur.execute("DELETE FROM c1_dispatch_order_items WHERE order_key = %s", (ref_key,))
+                
+                for item in items:
+                    cust_order_key = item.get('Распоряжение')
+                    if cust_order_key and cust_order_key == EMPTY_UUID:
+                        cust_order_key = None
+                    
+                    cur.execute("""
+                        INSERT INTO c1_dispatch_order_items (order_key, line_number,
+                            nomenclature_key, quantity, customer_order_key)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (order_key, line_number) DO NOTHING
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0),
+                        cust_order_key
+                    ))
+                
+                time.sleep(0.1)
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} расходных ордеров")
+        return len(all_docs)
+  
     def sync_sales_plan_light(self, conn, date_from, date_to):
         """Синхронизация планов продаж с маленьким batch_size."""
         from urllib.parse import quote
