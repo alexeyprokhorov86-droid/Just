@@ -4727,6 +4727,7 @@ def main_quick(sync, conn):
     
     sync.sync_sales(conn, date_from, date_to)
     sync.sync_customer_orders(conn, date_from, date_to)
+    sync.sync_dispatch_orders(conn, date_from, date_to)
 
 
 def main_hourly(sync, conn):
