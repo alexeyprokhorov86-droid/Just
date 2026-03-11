@@ -2680,8 +2680,8 @@ class Sync1C:
                 cur.execute("""
                     INSERT INTO c1_customer_orders (ref_key, doc_number, doc_date, posted,
                         organization_key, partner_key, warehouse_key, amount, status, 
-                        comment, is_deleted, deletion_mark, shipment_date, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        comment, is_deleted, deletion_mark, shipment_date, price_includes_vat, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ref_key) DO UPDATE SET
                         doc_number = EXCLUDED.doc_number,
                         doc_date = EXCLUDED.doc_date,
@@ -2690,7 +2690,7 @@ class Sync1C:
                         is_deleted = EXCLUDED.is_deleted,
                         deletion_mark = EXCLUDED.deletion_mark,
                         shipment_date = EXCLUDED.shipment_date,
-                        doc.get('ЦенаВключаетНДС', False),
+                        price_includes_vat = EXCLUDED.price_includes_vat,
                         updated_at = NOW()
                 """, (
                     ref_key,
@@ -2705,7 +2705,8 @@ class Sync1C:
                     doc.get('Комментарий', ''),
                     doc.get('DeletionMark', False),
                     doc.get('DeletionMark', False),
-                    shipment_date
+                    shipment_date,
+                    doc.get('ЦенаВключаетНДС', False)
                 ))
 
                 # Удаляем старые позиции
