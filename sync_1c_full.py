@@ -4343,7 +4343,27 @@ class Sync1C:
             "DELETE FROM sales WHERE doc_date BETWEEN %s AND %s",
             (date_from, date_to)
         )
+        seen = {}
+        deduped = []
+        for r in records:
+            key = (r['doc_id'], r['nomenclature_id'], r['doc_type'])
+            if key in seen:
+                # Суммируем количество и суммы
+                existing = seen[key]
+                existing['quantity'] = (existing['quantity'] or 0) + (r['quantity'] or 0)
+                existing['sum_without_vat'] = (existing['sum_without_vat'] or 0) + (r['sum_without_vat'] or 0)
+                existing['sum_with_vat'] = (existing['sum_with_vat'] or 0) + (r['sum_with_vat'] or 0)
+                existing['pallets_count'] = (existing['pallets_count'] or 0) + (r['pallets_count'] or 0)
+                existing['logistics_cost_fact'] = (existing['logistics_cost_fact'] or 0) + (r['logistics_cost_fact'] or 0)
+                existing['logistics_cost_plan'] = (existing['logistics_cost_plan'] or 0) + (r['logistics_cost_plan'] or 0)
+            else:
+                seen[key] = r.copy()
+                deduped.append(seen[key])
         
+        if len(deduped) < len(records):
+            print(f"  Дедупликация: {len(records)} -> {len(deduped)} (убрано {len(records) - len(deduped)} дублей)")
+        records = deduped
+
         values = [
             (
                 r['doc_type'], r['doc_date'], r['doc_number'], r['doc_id'],
