@@ -2745,10 +2745,11 @@ class Sync1C:
         date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
         date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
         
+        # --- Шаг 1: загружаем шапки ---
         encoded = quote("Document_РасходныйОрдерНаТовары", safe='_')
         all_docs = []
         skip = 0
-        batch_size = 100
+        batch_size = 500
         
         while True:
             url = (
@@ -2772,7 +2773,7 @@ class Sync1C:
                     break
                 
                 all_docs.extend(docs)
-                print(f"    Загружено: {len(all_docs)}...")
+                print(f"    Шапки загружено: {len(all_docs)}...")
                 
                 if len(docs) < batch_size:
                     break
@@ -2780,7 +2781,7 @@ class Sync1C:
                 skip += batch_size
                 time.sleep(0.2)
             except Exception as e:
-                print(f"    Ошибка: {e}")
+                print(f"    Ошибка загрузки шапок: {e}")
                 break
         
         print(f"    Всего документов: {len(all_docs)}")
@@ -2788,6 +2789,60 @@ class Sync1C:
         if not all_docs:
             return 0
         
+        # --- Шаг 2: загружаем ВСЕ строки табличной части пакетами ---
+        encoded_items = quote("Document_РасходныйОрдерНаТовары_ТоварыПоРаспоряжениям", safe='_')
+        all_items = []
+        skip = 0
+        batch_size = 5000
+        
+        date_filter = f"Ref_Key/Date%20ge%20datetime'{date_from_str}'%20and%20Ref_Key/Date%20le%20datetime'{date_to_str}'"
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded_items}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=180)
+                if r.status_code != 200:
+                    print(f"    Строки: HTTP {r.status_code}, пробуем без фильтра по дате")
+                    break
+                
+                items = r.json().get('value', [])
+                items = [sanitize_dict(it) for it in items]
+                
+                if not items:
+                    break
+                
+                all_items.extend(items)
+                print(f"    Строки загружено: {len(all_items)}...")
+                
+                if len(items) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.3)
+            except Exception as e:
+                print(f"    Ошибка загрузки строк: {e}")
+                break
+        
+        print(f"    Всего строк: {len(all_items)}")
+        
+        # Группируем строки по Ref_Key
+        items_by_ref = {}
+        for item in all_items:
+            ref = item.get('Ref_Key')
+            if ref not in items_by_ref:
+                items_by_ref[ref] = []
+            items_by_ref[ref].append(item)
+        
+        # Собираем ref_keys наших документов
+        doc_refs = set(doc.get('Ref_Key') for doc in all_docs)
+        
+        # --- Шаг 3: сохраняем ---
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM c1_dispatch_orders WHERE doc_date BETWEEN %s AND %s",
@@ -2796,7 +2851,6 @@ class Sync1C:
             
             for doc in all_docs:
                 ref_key = doc.get('Ref_Key')
-                
                 dispatch_date_raw = doc.get('ДатаОтгрузки', '')
                 
                 cur.execute("""
@@ -2828,25 +2882,16 @@ class Sync1C:
                     doc.get('DeletionMark', False)
                 ))
                 
-                # Загружаем табличную часть ТоварыПоРаспоряжениям
-                items_url = (
-                    f"{self.base_url}/{encoded}(guid'{ref_key}')"
-                    f"/ТоварыПоРаспоряжениям?$format=json"
-                )
-                try:
-                    r_items = self.session.get(items_url, timeout=60)
-                    if r_items.status_code == 200:
-                        items = r_items.json().get('value', [])
-                        items = [sanitize_dict(it) for it in items]
-                    else:
-                        items = []
-                except:
-                    items = []
-                
                 cur.execute("DELETE FROM c1_dispatch_order_items WHERE order_key = %s", (ref_key,))
                 
-                for item in items:
+                for item in items_by_ref.get(ref_key, []):
                     cust_order_key = item.get('Распоряжение')
+                    order_type = item.get('Распоряжение_Type', '')
+                    
+                    # Берём только строки по заказам клиентов
+                    if 'ЗаказКлиента' not in order_type:
+                        cust_order_key = None
+                    
                     if cust_order_key and cust_order_key == EMPTY_UUID:
                         cust_order_key = None
                     
@@ -2862,8 +2907,6 @@ class Sync1C:
                         item.get('Количество', 0),
                         cust_order_key
                     ))
-                
-                time.sleep(0.1)
             
             conn.commit()
         
