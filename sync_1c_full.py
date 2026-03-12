@@ -2789,58 +2789,35 @@ class Sync1C:
         if not all_docs:
             return 0
         
-        # --- Шаг 2: загружаем ВСЕ строки табличной части пакетами ---
+        # --- Шаг 2: загружаем строки только для наших документов ---
+        doc_refs = [doc.get('Ref_Key') for doc in all_docs]
+        items_by_ref = {}
+        
         encoded_items = quote("Document_РасходныйОрдерНаТовары_ТоварыПоРаспоряжениям", safe='_')
-        all_items = []
-        skip = 0
-        batch_size = 5000
         
-        date_filter = f"Ref_Key/Date%20ge%20datetime'{date_from_str}'%20and%20Ref_Key/Date%20le%20datetime'{date_to_str}'"
-        
-        while True:
+        for i, ref in enumerate(doc_refs):
             url = (
                 f"{self.base_url}/{encoded_items}"
                 f"?$format=json"
-                f"&$top={batch_size}"
-                f"&$skip={skip}"
+                f"&$filter=Ref_Key eq guid'{ref}'"
             )
             
             try:
-                r = self.session.get(url, timeout=180)
-                if r.status_code != 200:
-                    print(f"    Строки: HTTP {r.status_code}, пробуем без фильтра по дате")
-                    break
-                
-                items = r.json().get('value', [])
-                items = [sanitize_dict(it) for it in items]
-                
-                if not items:
-                    break
-                
-                all_items.extend(items)
-                print(f"    Строки загружено: {len(all_items)}...")
-                
-                if len(items) < batch_size:
-                    break
-                
-                skip += batch_size
-                time.sleep(0.3)
+                r = self.session.get(url, timeout=60)
+                if r.status_code == 200:
+                    items = r.json().get('value', [])
+                    items = [sanitize_dict(it) for it in items]
+                    if items:
+                        items_by_ref[ref] = items
             except Exception as e:
-                print(f"    Ошибка загрузки строк: {e}")
-                break
+                print(f"    Ошибка загрузки строк ордера {ref}: {e}")
+            
+            if (i + 1) % 50 == 0:
+                print(f"    Строки загружены для {i+1}/{len(doc_refs)} документов...")
+                time.sleep(0.5)
         
-        print(f"    Всего строк: {len(all_items)}")
-        
-        # Группируем строки по Ref_Key
-        items_by_ref = {}
-        for item in all_items:
-            ref = item.get('Ref_Key')
-            if ref not in items_by_ref:
-                items_by_ref[ref] = []
-            items_by_ref[ref].append(item)
-        
-        # Собираем ref_keys наших документов
-        doc_refs = set(doc.get('Ref_Key') for doc in all_docs)
+        total_items = sum(len(v) for v in items_by_ref.values())
+        print(f"    Всего строк: {total_items} для {len(items_by_ref)} документов")
         
         # --- Шаг 3: сохраняем ---
         with conn.cursor() as cur:
