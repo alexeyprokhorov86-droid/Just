@@ -862,7 +862,7 @@ async def analyze_image_with_gpt(image_data: bytes, media_type: str, context: st
 
 
 async def analyze_pdf_with_gpt(pdf_data: bytes, filename: str = "", context: str = "") -> str:
-    """Анализирует PDF через Claude."""
+    """Анализирует PDF — все страницы одним запросом."""
     if not gpt_client:
         return ""
     
@@ -878,7 +878,7 @@ async def analyze_pdf_with_gpt(pdf_data: bytes, filename: str = "", context: str
             
             response = gpt_client.chat.completions.create(
                 model="openai/gpt-4.1",
-                max_tokens=2500,
+                max_tokens=4500,
                 messages=[
                     {
                         "role": "user",
@@ -901,23 +901,44 @@ async def analyze_pdf_with_gpt(pdf_data: bytes, filename: str = "", context: str
             )
             return response.choices[0].message.content
         
-        # Анализируем каждую страницу
-        all_analysis = []
+        # Собираем все страницы в один запрос
+        import io
+        content_parts = []
+        
         for i, image in enumerate(images):
-            import io
             img_byte_arr = io.BytesIO()
             image.save(img_byte_arr, format='PNG')
             img_bytes = img_byte_arr.getvalue()
+            base64_image = base64.standard_b64encode(img_bytes).decode("utf-8")
             
-            page_context = f"Страница {i+1} документа {filename}"
-            if context:
-                page_context = context + f"\n\nТекущая страница: {i+1} из {len(images)}"
-            
-            analysis = await analyze_image_with_gpt(img_bytes, "image/png", page_context, filename)
-            if analysis:
-                all_analysis.append(f"[Страница {i+1}]\n{analysis}")
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{base64_image}"
+                }
+            })
         
-        return "\n\n".join(all_analysis)
+        prompt = build_analysis_prompt(
+            "PDF документ",
+            f"[PDF документ из {len(images)} страниц прикреплён]",
+            context,
+            filename
+        )
+        prompt += f"\n\nДокумент содержит {len(images)} страниц. Проанализируй весь документ целиком, учитывая содержимое всех страниц."
+        
+        content_parts.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        response = gpt_client.chat.completions.create(
+            model="openai/gpt-4.1",
+            max_tokens=4500,
+            messages=[{"role": "user", "content": content_parts}],
+        )
+        
+        logger.info(f"PDF проанализирован целиком ({len(images)} страниц)")
+        return response.choices[0].message.content
         
     except Exception as e:
         logger.error(f"Ошибка анализа PDF: {e}")
