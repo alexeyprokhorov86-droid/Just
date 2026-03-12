@@ -4675,7 +4675,8 @@ def main_full(sync, conn):
     """Полная синхронизация."""
     # Период синхронизации
     date_to = datetime.now().date()
-    date_from = date_to - timedelta(days=365)
+    date_from = date_to - timedelta(days=7)
+    date_from_sales = date_to - timedelta(days=60)
     print(f"\n[3] Период: {date_from} — {date_to}")
     
     # Синхронизация справочников (базовые)
@@ -4697,7 +4698,9 @@ def main_full(sync, conn):
     print("=" * 60)
     
     sync.sync_purchases(conn, date_from, date_to)
-    sync.sync_sales(conn, date_from, date_to)
+    sync.sync_sales(conn, date_from_sales, date_to)
+    sync.sync_customer_orders(conn, date_from_sales, date_to)
+    sync.sync_dispatch_orders(conn, date_from_sales, date_to)
     sync.sync_all_production(conn, date_from, date_to)
     sync.sync_all_warehouse(conn, date_from, date_to)
     sync.sync_all_finance(conn, date_from, date_to)
