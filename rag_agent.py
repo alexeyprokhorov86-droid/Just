@@ -44,6 +44,21 @@ except ImportError:
 # === Кэш списка чатов из metadata ===
 _chat_list_cache = {"data": None, "ts": 0}
 
+# Ограничители качества retrieval/generation
+TELEGRAM_VECTOR_MIN_SCORE = 0.72
+EMAIL_VECTOR_MIN_SCORE = 0.55
+TELEGRAM_SQL_MIN_SCORE = 0.78
+EMAIL_SQL_MIN_SCORE = 0.45
+
+EVIDENCE_MAX_ITEMS = 12
+EVIDENCE_QUOTAS = {
+    "analytics": 3,
+    "1c": 4,
+    "chat": 3,
+    "email": 3,
+    "other": 2,
+}
+
 
 def get_db_connection():
     return psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)
@@ -372,7 +387,8 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
     results = _group_messages(results, window_minutes=3)
     return results[:limit]
 
-def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict = None) -> list:
+def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict = None,
+                                 target_tables: list = None) -> list:
     """Векторный (семантический) поиск по чатам с учётом свежести."""
     if not VECTOR_SEARCH_ENABLED:
         return []
@@ -389,7 +405,8 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
             limit=limit, 
             source_type='telegram',
             freshness_weight=freshness_weight,
-            decay_days=decay_days
+            decay_days=decay_days,
+            source_tables=target_tables if target_tables else None
         )
         
         results = []
@@ -411,7 +428,10 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
             
             results.append(result)
         
-        logger.info(f"Векторный поиск (decay={decay_days}d, fw={freshness_weight}): {len(results)} результатов")
+        logger.info(
+            f"Векторный поиск (decay={decay_days}d, fw={freshness_weight}, "
+            f"targets={len(target_tables) if target_tables else 'all'}): {len(results)} результатов"
+        )
         return results
         
     except Exception as e:
@@ -583,7 +603,9 @@ def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None
     seen_content = set()
     
     # Векторный поиск (пока по всем чатам, фильтрация по source_table)
-    vector_results = search_telegram_chats_vector(query, limit=limit, time_context=time_context)
+    vector_results = search_telegram_chats_vector(
+        query, limit=limit, time_context=time_context, target_tables=target_tables
+    )
     for r in vector_results:
         content_hash = hash(r['content'][:200])
         if content_hash not in seen_content:
@@ -1219,137 +1241,242 @@ def search_internet(query: str) -> tuple:
 
 
 # =============================================================================
+# QUALITY GATES + EVIDENCE PACK
+# =============================================================================
+
+def _source_bucket(result: dict) -> str:
+    source = result.get("source", "")
+    item_type = result.get("type", "")
+
+    if isinstance(item_type, str) and item_type.startswith("analytics_"):
+        return "analytics"
+    if isinstance(source, str) and source.startswith("Email"):
+        return "email"
+    if isinstance(source, str) and source.startswith("Чат"):
+        return "chat"
+    if isinstance(source, str) and source.startswith("1С"):
+        return "1c"
+    return "other"
+
+
+def _result_score(result: dict) -> float:
+    raw = result.get("final_score", result.get("similarity", 0))
+    try:
+        score = float(raw)
+    except Exception:
+        score = 0.0
+
+    if score <= 0:
+        bucket = _source_bucket(result)
+        if bucket == "analytics":
+            return 0.70
+        if bucket == "1c":
+            return 0.62
+    return score
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def deduplicate_results(results: list) -> list:
+    """Дедупликация по source_id и по близкому контенту."""
+    out = []
+    seen_source_ids = set()
+    seen_signatures = set()
+
+    for r in results:
+        source_id = r.get("source_id")
+        source = r.get("source", "")
+        content = _normalize_text(r.get("content", ""))
+        signature = f"{source}|{content[:220]}"
+
+        if source_id is not None:
+            sid_key = f"{source}|{source_id}"
+            if sid_key in seen_source_ids:
+                continue
+            seen_source_ids.add(sid_key)
+
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        out.append(r)
+
+    return out
+
+
+def apply_relevance_filters(results: list) -> list:
+    """Отсеивает слабые результаты для chat/email и сортирует по score."""
+    filtered = []
+
+    for r in results:
+        bucket = _source_bucket(r)
+        search_type = r.get("search_type", "")
+        score = _result_score(r)
+
+        if bucket == "chat":
+            min_score = TELEGRAM_VECTOR_MIN_SCORE if search_type == "vector" else TELEGRAM_SQL_MIN_SCORE
+            if score < min_score:
+                continue
+        elif bucket == "email":
+            min_score = EMAIL_VECTOR_MIN_SCORE if search_type == "email_vector" else EMAIL_SQL_MIN_SCORE
+            if score < min_score:
+                continue
+
+        rr = dict(r)
+        rr["_bucket"] = bucket
+        rr["_score"] = score
+        filtered.append(rr)
+
+    filtered.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    return filtered
+
+
+def _make_citation(result: dict) -> str:
+    source = result.get("source", "Источник")
+    date_value = result.get("date", "")
+    author = result.get("author", "")
+    subject = result.get("subject", "")
+    from_address = result.get("from_address", "")
+
+    parts = [source]
+    if date_value:
+        parts.append(str(date_value))
+    if author:
+        parts.append(f"автор: {author}")
+    if subject:
+        parts.append(f"тема: {subject[:80]}")
+    if from_address:
+        parts.append(f"от: {from_address}")
+    return " | ".join(parts)
+
+
+def select_evidence_for_generation(results: list, max_items: int = EVIDENCE_MAX_ITEMS) -> list:
+    """Финальный отбор evidence: квоты по источникам + заполнение до max_items."""
+    ranked = sorted(results, key=lambda x: x.get("_score", _result_score(x)), reverse=True)
+    quotas = dict(EVIDENCE_QUOTAS)
+    counts = {}
+    selected = []
+    deferred = []
+
+    for r in ranked:
+        bucket = r.get("_bucket", _source_bucket(r))
+        quota = quotas.get(bucket, quotas.get("other", 2))
+        used = counts.get(bucket, 0)
+        if used < quota:
+            counts[bucket] = used + 1
+            selected.append(r)
+            if len(selected) >= max_items:
+                break
+        else:
+            deferred.append(r)
+
+    if len(selected) < max_items:
+        for r in deferred:
+            selected.append(r)
+            if len(selected) >= max_items:
+                break
+
+    final = []
+    for idx, r in enumerate(selected[:max_items], 1):
+        rr = dict(r)
+        rr["evidence_id"] = idx
+        rr["citation"] = _make_citation(rr)
+        rr["evidence_snippet"] = _normalize_text(rr.get("content", ""))[:360]
+        final.append(rr)
+    return final
+
+
+def build_evidence_context(evidence_items: list) -> str:
+    """Компактный контекст для генератора (8-12 доказательств)."""
+    lines = []
+    for item in evidence_items:
+        score = item.get("_score", _result_score(item))
+        lines.append(
+            f"[{item['evidence_id']}] {item.get('citation', '')} | score={score:.2f}\n"
+            f"{item.get('evidence_snippet', '')}"
+        )
+    return "\n\n".join(lines)
+
+
+# =============================================================================
 # ГЕНЕРАЦИЯ ОТВЕТА (GPT-4.1)
 # =============================================================================
 
 def generate_response(question, db_results, web_results, web_citations=None, chat_context=""):
-    """Генерация ответа на основе найденных данных через GPT-4.1."""
+    """Генерация grounded-ответа с обязательными ссылками на evidence."""
     if not ROUTERAI_API_KEY:
         return "API ключ не настроен"
     try:
-        context_parts = []
-        
-        # Группируем результаты по типу
-        analytics = [r for r in db_results if r.get('type', '').startswith('analytics_')]
-        prices = [r for r in db_results if r.get('type') == 'price']
-        sales = [r for r in db_results if r.get('type') == 'sales']
-        orders = [r for r in db_results if r.get('type') in ('customer_order', 'supplier_order')]
-        production = [r for r in db_results if r.get('type') in ('production', 'consumption')]
-        finance = [r for r in db_results if r.get('type') == 'bank_expense']
-        inventory = [r for r in db_results if r.get('type') == 'inventory']
-        refs = [r for r in db_results if r.get('type') in ('nomenclature', 'client')]
-        chats = [r for r in db_results if r.get('source', '').startswith('Чат')]
-        emails = [r for r in db_results if r.get('source', '').startswith('Email')]
-        
-        if analytics:
-            context_parts.append("=== АНАЛИТИКА (агрегированные данные) ===")
-            for i, res in enumerate(analytics, 1):
-                context_parts.append(f"{i}. [{res['source']}] {res['content']}")
-        
-        if prices:
-            context_parts.append("\n=== ЗАКУПОЧНЫЕ ЦЕНЫ ===")
-            for i, res in enumerate(prices[:10], 1):
-                context_parts.append(f"{i}. {res.get('date', '')} {res['content']}")
-        
-        if sales:
-            context_parts.append("\n=== ПРОДАЖИ (документы) ===")
-            for i, res in enumerate(sales[:10], 1):
-                context_parts.append(f"{i}. {res.get('date', '')} {res['content']}")
-        
-        if orders:
-            context_parts.append("\n=== ЗАКАЗЫ ===")
-            for i, res in enumerate(orders[:10], 1):
-                context_parts.append(f"{i}. [{res['source']}] {res.get('date', '')} {res['content']}")
-        
-        if production:
-            context_parts.append("\n=== ПРОИЗВОДСТВО ===")
-            for i, res in enumerate(production[:10], 1):
-                context_parts.append(f"{i}. [{res['source']}] {res.get('date', '')} {res['content']}")
-        
-        if finance:
-            context_parts.append("\n=== ФИНАНСЫ ===")
-            for i, res in enumerate(finance[:10], 1):
-                context_parts.append(f"{i}. {res.get('date', '')} {res['content']}")
-        
-        if inventory:
-            context_parts.append("\n=== ИНВЕНТАРИЗАЦИЯ ===")
-            for i, res in enumerate(inventory[:5], 1):
-                context_parts.append(f"{i}. {res.get('date', '')} {res['content']}")
-        
-        if refs:
-            context_parts.append("\n=== СПРАВОЧНИКИ ===")
-            for i, res in enumerate(refs[:5], 1):
-                context_parts.append(f"{i}. [{res['source']}] {res['content']}")
-        
-        if chats:
-            context_parts.append("\n=== ИЗ ЧАТОВ ===")
-            for i, res in enumerate(chats[:15], 1):
-                score_info = ""
-                if 'final_score' in res:
-                    score_info = f" [релевантность: {res['final_score']:.0%}]"
-                elif 'similarity' in res:
-                    score_info = f" [релевантность: {res['similarity']:.0%}]"
-                date_info = f" ({res['date']})" if res.get('date') else ""
-                author_info = f" [{res['author']}]" if res.get('author') else ""
-                context_parts.append(f"{i}.{score_info}{date_info}{author_info} {res['content'][:800]}")
-        
-        if emails:
-            context_parts.append("\n=== ИЗ EMAIL ===")
-            for i, res in enumerate(emails[:5], 1):
-                score_info = f" [релевантность: {res.get('final_score', res.get('similarity', 0)):.0%}]"
-                date_info = f" ({res['date']})" if res.get('date') else ""
-                subj = (res.get("subject") or "").strip()
-                frm = (res.get("from_address") or "").strip()
-                header = ""
-                if subj or frm:
-                    header = f"{subj} | {frm}".strip(" |")
-                context_parts.append(f"{i}.{score_info}{date_info} {header}\n{res['content'][:400]}")
-        
-        if web_results:
-            context_parts.append("\n=== ИНТЕРНЕТ ===")
-            context_parts.append(web_results[:2000])
-        
-        context = "\n".join(context_parts)
+        evidence_items = db_results or []
+        if evidence_items and "evidence_id" not in evidence_items[0]:
+            prepared = apply_relevance_filters(deduplicate_results(evidence_items))
+            evidence_items = select_evidence_for_generation(prepared, max_items=EVIDENCE_MAX_ITEMS)
+
+        evidence_context = build_evidence_context(evidence_items)
+        sources_map = "\n".join(
+            f"[{item['evidence_id']}] {item.get('citation', '')}"
+            for item in evidence_items
+        )
         company_profile = get_company_profile()
-        
+
         prompt = f"""{company_profile}
 
 Ты — RAG-агент компании Фрумелад. Отвечай на русском.
 
 ВОПРОС: {question}
 
-НАЙДЕННЫЕ ДАННЫЕ:
-{context if context else "Ничего не найдено."}
+ДОКАЗАТЕЛЬСТВА (evidence):
+{evidence_context if evidence_context else "Нет релевантных доказательств."}
 
-ИНСТРУКЦИИ:
-1. Используй знания из профиля компании и найденные данные для ответа
-2. Секция АНАЛИТИКА содержит агрегированные итоги — используй их для ответов про "топ", "основные", "сколько всего"
-3. Данные из 1С (закупки, продажи, заказы, производство) — это реальные данные компании
-4. Данные из ЧАТОВ и EMAIL — внутренняя переписка сотрудников
-5. Если в чатах несколько сообщений от одного автора подряд — это одна мысль, читай их вместе
-6. Указывай конкретные цифры, даты, имена — если они есть в данных
-7. Если данных недостаточно — скажи об этом, не придумывай
-8. Отвечай по существу вопроса, кратко и структурированно
-9. ВАЖНО: сообщения одного автора за короткий период (минуты) — это ОДНА мысль. Если автор сначала написал суммы, а следом пояснение — это единое сообщение
-10. Если в чатах есть КОНКРЕТНЫЕ суммы рядом с обсуждением темы — используй именно их, они приоритетнее косвенных упоминаний
+ДОП. ДАННЫЕ ИЗ ИНТЕРНЕТА:
+{(web_results or "")[:1500]}
+
+ПРАВИЛА:
+1) Используй только факты из evidence. Не придумывай.
+2) Каждый утверждаемый тезис обязан иметь ссылку в формате [n], где n — номер evidence.
+3) Если данных недостаточно — явно напиши "Недостаточно данных" и что именно нужно уточнить.
+4) Предпочитай конкретику: суммы, даты, документы, имена.
+5) Не делай тезисов без ссылки [n].
+
+ФОРМАТ ОТВЕТА:
+- Краткий вывод (1-2 предложения)
+- Ключевые факты (маркированный список, каждый пункт с [n])
+- Что не найдено/риски (если есть)
+- Источники (список [n] -> краткое описание)
+
+СПИСОК ИСТОЧНИКОВ:
+{sources_map if sources_map else "Нет"}
 
 Ответ:"""
 
         response = requests.post(
             f"{ROUTERAI_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "openai/gpt-4.1", "messages": [{"role": "user", "content": prompt}], "max_tokens": 2000, "temperature": 0},
+            json={
+                "model": "openai/gpt-4.1",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1800,
+                "temperature": 0
+            },
             timeout=60
         )
         result = response.json()
-        if "choices" in result:
-            response_text = result["choices"][0]["message"]["content"]
-            if web_citations:
-                response_text += "\n\n📎 **Источники:**"
-                for i, url in enumerate(web_citations[:5], 1):
-                    response_text += f"\n{i}. {url}"
-            return response_text
-        return "Ошибка генерации"
+        if "choices" not in result:
+            return "Ошибка генерации"
+
+        response_text = result["choices"][0]["message"]["content"]
+
+        # Гарантированно добавляем карту источников внизу, даже если LLM её не вывел
+        if sources_map:
+            response_text += "\n\n📎 Источники (карта evidence):\n" + sources_map
+
+        if web_citations:
+            response_text += "\n\n🌐 Внешние ссылки:"
+            for i, url in enumerate(web_citations[:5], 1):
+                response_text += f"\n{i}. {url}"
+
+        return response_text
     except Exception as e:
         return f"Ошибка: {e}"
 
@@ -1402,7 +1529,10 @@ top_clients, top_products, sales_summary, top_suppliers, production_summary, pur
 
 ПРАВИЛА:
 - target_chats: выбери 3-7 НАИБОЛЕЕ релевантных чатов из списка. Используй точные имена таблиц [tg_chat_...].
-- ВСЕГДА включай CHATS и EMAIL как отдельные шаги
+- НЕ включай источники "на всякий случай": добавляй CHATS/EMAIL только когда это действительно нужно по вопросу
+- Если вопрос про обсуждения/согласования/переписку — добавляй CHATS и/или EMAIL
+- Если вопрос про агрегированные итоги/выручку/топы — приоритет 1С_ANALYTICS
+- Если вопрос про конкретные документы/операции — приоритет 1С_SEARCH
 - Для бухгалтерских вопросов (НДС, налог, счёт, оплата) — обязательно чаты с "бухгалтерия", "априори", "отчеты по аутсорсингу"
 - Для вопросов про закупки — чаты с "закупки"
 - Для вопросов про производство — чаты с "производство"
@@ -1443,6 +1573,33 @@ top_clients, top_products, sales_summary, top_suppliers, production_summary, pur
         return _default_plan(question)
 
 
+def _infer_default_sources(question: str) -> list:
+    """Heuristic fallback: выбирает источники без обязательного CHATS+EMAIL."""
+    q = (question or "").lower()
+
+    chat_signals = ("чат", "telegram", "телеграм", "обсуж", "соглас", "кто писал", "переписк")
+    email_signals = ("email", "емейл", "почт", "письм", "в переписке")
+    web_signals = ("интернет", "рынок", "новости", "внешн", "курсы валют", "конкурент")
+    one_c_signals = (
+        "1с", "выручк", "продаж", "закуп", "постав", "клиент", "номенклатур",
+        "документ", "заказ", "производ", "банк", "сумм", "сколько"
+    )
+
+    sources = []
+    if any(sig in q for sig in web_signals):
+        sources.append("WEB")
+    if any(sig in q for sig in one_c_signals):
+        sources.append("1С_SEARCH")
+    if any(sig in q for sig in chat_signals):
+        sources.append("CHATS")
+    if any(sig in q for sig in email_signals):
+        sources.append("EMAIL")
+
+    if not sources:
+        sources.append("1С_SEARCH")
+    return sources
+
+
 def _default_plan(question):
     """План по умолчанию если Router недоступен."""
     stop_words = {
@@ -1461,13 +1618,23 @@ def _default_plan(question):
     words = [w.strip() for w in clean_query.split() if len(w.strip()) > 2 and w.strip() not in stop_words]
     keywords = " ".join(words[:5]) if words else question
     
+    inferred_sources = _infer_default_sources(question)
+    steps = []
+    for src in inferred_sources:
+        steps.append({"source": src, "action": "поиск", "keywords": keywords})
+
+    if len(inferred_sources) > 1:
+        query_type = "mixed"
+    elif inferred_sources[0] == "WEB":
+        query_type = "web"
+    elif inferred_sources[0] == "CHATS":
+        query_type = "chat_search"
+    else:
+        query_type = "search"
+
     return {
-        "query_type": "mixed",
-        "steps": [
-            {"source": "1С_SEARCH", "action": "поиск", "keywords": keywords},
-            {"source": "CHATS", "action": "поиск", "keywords": keywords},
-            {"source": "EMAIL", "action": "поиск", "keywords": keywords}
-        ],
+        "query_type": query_type,
+        "steps": steps,
         "entities": {"clients": [], "products": [], "suppliers": []},
         "period": None,
         "keywords": keywords,
@@ -1724,23 +1891,14 @@ async def process_rag_query(question, chat_context=""):
             web_results, web_citations = search_internet(step_keywords)
             logger.info(f"Step [{source}]: получен ответ")
     
-    # Принудительно ищем в CHATS и EMAIL если Router их не включил
     executed_sources = [step.get("source") for step in plan.get("steps", [])]
-    
-    if "CHATS" not in executed_sources:
-        chat_results = search_telegram_chats(
-            keywords, limit=30, time_context=time_context,
-            target_tables=target_chats if target_chats else None
-        )
-        db_results.extend(chat_results)
-        logger.info(f"Step [CHATS/auto]: {len(chat_results)} результатов")
-    
-    if "EMAIL" not in executed_sources:
-        email_results = search_emails(keywords, limit=30, time_context=time_context)
-        db_results.extend(email_results)
-        logger.info(f"Step [EMAIL/auto]: {len(email_results)} результатов")
-    
-    logger.info(f"Поиск завершён: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
+    db_results = deduplicate_results(db_results)
+    db_results = apply_relevance_filters(db_results)
+
+    logger.info(
+        f"Поиск завершён: {len(db_results)} релевантных результатов "
+        f"за {time.time() - start_time:.1f}с"
+    )
     
     # === Шаг 3: Evaluator — проверяем достаточность (макс 1 итерация) ===
     for retry_num in range(1):
@@ -1769,19 +1927,39 @@ async def process_rag_query(question, chat_context=""):
                 )
                 db_results.extend(extra_chat_results)
                 logger.info(f"Retry CHATS: {len(extra_chat_results)} результатов из {len(retry_chats)} чатов")
-            
-            extra_email_results = search_emails(retry_keywords, limit=15, time_context=time_context)
-            db_results.extend(extra_email_results)
-            logger.info(f"Retry EMAIL: {len(extra_email_results)} результатов")
-    
+
+            # EMAIL retry только если email участвует в intent
+            q_low = (question or "").lower()
+            need_email_retry = (
+                "EMAIL" in executed_sources
+                or "почт" in q_low
+                or "email" in q_low
+                or "письм" in q_low
+            )
+            if need_email_retry:
+                extra_email_results = search_emails(retry_keywords, limit=15, time_context=time_context)
+                db_results.extend(extra_email_results)
+                logger.info(f"Retry EMAIL: {len(extra_email_results)} результатов")
+
+        db_results = apply_relevance_filters(deduplicate_results(db_results))
+
     logger.info(f"Итого после ReAct: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
-    
+
     # === Шаг 4: Reranking ===
-    if len(db_results) > 10:
-        db_results = rerank_results(question, db_results, top_k=15)
-    
+    if len(db_results) > 12:
+        db_results = rerank_results(question, db_results, top_k=24)
+
+    db_results = apply_relevance_filters(deduplicate_results(db_results))
+    evidence_results = select_evidence_for_generation(db_results, max_items=EVIDENCE_MAX_ITEMS)
+
+    source_counts = {}
+    for r in evidence_results:
+        b = r.get("_bucket", _source_bucket(r))
+        source_counts[b] = source_counts.get(b, 0) + 1
+    logger.info(f"Evidence pack: {len(evidence_results)} шт, квоты={source_counts}")
+
     # === Шаг 5: Генерация ответа (GPT-4.1) ===
-    return generate_response(question, db_results, web_results, web_citations, chat_context)
+    return generate_response(question, evidence_results, web_results, web_citations, chat_context)
 
 
 async def index_new_message(table_name: str, message_id: int, content: str):
