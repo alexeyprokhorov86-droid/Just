@@ -161,6 +161,30 @@ TERM_ALIASES = {
     "hr": "кадры",
 }
 
+INTENT_CONTENT_MARKERS = {
+    "staffing": [
+        "оффер", "offer", "job offer", "кандидат", "должност", "прием", "приём", "принят",
+        "найм", "hiring", "hire", "уволен", "увольн", "резюме", "hr", "кадр", "персонал",
+        "подбор", "согласование оффера", "выход на работу",
+    ],
+    "finance": [
+        "ндс", "налог", "tax", "vat", "счет", "счёт", "invoice", "оплат", "payment",
+        "платеж", "платёж", "фнс", "договор", "акт", "реестр", "факторинг",
+    ],
+    "production": [
+        "производ", "production", "технолог", "technolog", "брак", "выпуск",
+        "смен", "рецепт", "качест", "haccp",
+    ],
+    "procurement": [
+        "закуп", "procure", "постав", "supplier", "сырь", "материал",
+        "цена", "прайс", "price", "заказ поставщику",
+    ],
+    "documents": [
+        "документ", "document", "pdf", "excel", "word", "ppt", "приложен",
+        "вложен", "файл", "накладн", "акт", "договор",
+    ],
+}
+
 
 def swap_en_to_ru_layout(text: str) -> str:
     """Преобразует текст, набранный в EN-раскладке, в RU-раскладку."""
@@ -321,19 +345,21 @@ def select_search_keywords(query: str, max_keywords: int = 8) -> list:
 def detect_query_intents(question: str) -> set:
     """Лёгкая intent-классификация для страховки роутинга."""
     q = (question or "").lower()
+    q_exp = expand_query_for_retrieval(question).lower()
+    merged_q = f"{q} {q_exp}"
     intents = set()
 
-    if re.search(r"принят|приняли|нанял|наняли|взяли|уволен|оффер|offer|hire|hiring|dismiss|должност|position|кто отвечает|ответствен", q):
+    if re.search(r"принят|приняли|нанял|наняли|взяли|уволен|оффер|offer|hire|hiring|dismiss|должност|position|кто отвечает|ответствен", merged_q):
         intents.add("staffing")
-    if re.search(r"ндс|налог|tax|vat|invoice|счет|сч[её]т|оплат|payment|плат[её]ж|фнс|договор|акт", q):
+    if re.search(r"ндс|налог|tax|vat|invoice|счет|сч[её]т|оплат|payment|плат[её]ж|фнс|договор|акт", merged_q):
         intents.add("finance")
-    if re.search(r"производ|production|технолог|technolog|брак|выпуск|смен", q):
+    if re.search(r"производ|production|технолог|technolog|брак|выпуск|смен", merged_q):
         intents.add("production")
-    if re.search(r"закуп|procure|supplier|постав|сырь|материал|цена|прайс", q):
+    if re.search(r"закуп|procure|supplier|постав|сырь|материал|цена|прайс", merged_q):
         intents.add("procurement")
-    if re.search(r"документ|document|pdf|excel|word|вложен|приложен|накладн", q):
+    if re.search(r"документ|document|pdf|excel|word|вложен|приложен|накладн", merged_q):
         intents.add("documents")
-    if re.search(r"кто|кого|какие|какой|когда|были ли", q):
+    if re.search(r"кто|кого|какие|какой|когда|были ли|what|which|who|when", merged_q):
         intents.add("lookup")
 
     return intents
@@ -1932,6 +1958,51 @@ def apply_intent_source_boost(results: list, question: str) -> list:
     return boosted
 
 
+def apply_intent_content_relevance(results: list, question: str) -> list:
+    """
+    Дополнительный контентный prior по интенту:
+    - усиливает документы с терминологией нужного домена;
+    - ослабляет документы без доменных маркеров.
+    """
+    if not results:
+        return []
+
+    primary = get_primary_intent(question)
+    markers = INTENT_CONTENT_MARKERS.get(primary)
+    if not markers:
+        return results
+
+    boosted = []
+    for r in results:
+        rr = dict(r)
+        base = rr.get("_score", _result_score(rr))
+        bucket = rr.get("_bucket", _source_bucket(rr))
+
+        haystack = " ".join([
+            str(rr.get("source", "")),
+            str(rr.get("subject", "")),
+            str(rr.get("from_address", "")),
+            str(rr.get("content", ""))[:1200],
+        ]).lower()
+        hits = sum(1 for m in markers if m in haystack)
+
+        # Бонус за тематические попадания
+        bonus = min(hits * 0.06, 0.30)
+
+        # Штраф за отсутствие signal в chat/email (где шума больше)
+        penalty = 1.0
+        if hits == 0 and bucket in ("chat", "email"):
+            penalty = 0.60 if primary in ("staffing", "documents") else 0.72
+
+        rr["_score"] = base * penalty + bonus
+        rr["_intent_hits"] = hits
+        rr["_bucket"] = bucket
+        boosted.append(rr)
+
+    boosted.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    return boosted
+
+
 def get_effective_evidence_quotas(question: str) -> tuple[dict, bool]:
     """Возвращает квоты evidence и режим строгих caps по primary intent."""
     primary = get_primary_intent(question)
@@ -2463,6 +2534,8 @@ async def process_rag_query(question, chat_context=""):
             seen_targets.add(t)
             merged_targets.append(t)
         target_chats = merged_targets[:10]
+
+    primary_intent = get_primary_intent(question)
     
     time_context = extract_time_context(question)
     if time_context["has_time_filter"]:
@@ -2524,6 +2597,7 @@ async def process_rag_query(question, chat_context=""):
     db_results = apply_relevance_filters(db_results)
     db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
     db_results = apply_intent_source_boost(db_results, question)
+    db_results = apply_intent_content_relevance(db_results, question)
 
     logger.info(
         f"Поиск завершён: {len(db_results)} релевантных результатов "
@@ -2545,6 +2619,7 @@ async def process_rag_query(question, chat_context=""):
         db_results = apply_relevance_filters(deduplicate_results(db_results))
         db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
         db_results = apply_intent_source_boost(db_results, question)
+        db_results = apply_intent_content_relevance(db_results, question)
         logger.info(f"Global fallback done: now {len(db_results)} results")
 
     # Intent fallback: если для кадров/документных вопросов мало чатовых подтверждений
@@ -2563,6 +2638,7 @@ async def process_rag_query(question, chat_context=""):
         db_results = apply_relevance_filters(deduplicate_results(db_results))
         db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
         db_results = apply_intent_source_boost(db_results, question)
+        db_results = apply_intent_content_relevance(db_results, question)
         logger.info(f"Intent fallback done: total={len(db_results)} chat_hits={sum(1 for r in db_results if _source_bucket(r) == 'chat')}")
     
     # === Шаг 3: Evaluator — проверяем достаточность (макс 1 итерация) ===
@@ -2609,6 +2685,7 @@ async def process_rag_query(question, chat_context=""):
         db_results = apply_relevance_filters(deduplicate_results(db_results))
         db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
         db_results = apply_intent_source_boost(db_results, question)
+        db_results = apply_intent_content_relevance(db_results, question)
 
     logger.info(f"Итого после ReAct: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
 
@@ -2619,6 +2696,7 @@ async def process_rag_query(question, chat_context=""):
     db_results = apply_relevance_filters(deduplicate_results(db_results))
     db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
     db_results = apply_intent_source_boost(db_results, question)
+    db_results = apply_intent_content_relevance(db_results, question)
 
     evidence_quotas, strict_caps = get_effective_evidence_quotas(question)
     evidence_results = select_evidence_for_generation(
@@ -2632,7 +2710,10 @@ async def process_rag_query(question, chat_context=""):
     for r in evidence_results:
         b = r.get("_bucket", _source_bucket(r))
         source_counts[b] = source_counts.get(b, 0) + 1
-    logger.info(f"Evidence pack: {len(evidence_results)} шт, квоты={source_counts}")
+    logger.info(
+        f"Evidence pack: {len(evidence_results)} шт, intent={primary_intent}, "
+        f"quotas={source_counts}"
+    )
 
     # === Шаг 5: Генерация ответа (GPT-4.1) ===
     return generate_response(question, evidence_results, web_results, web_citations, chat_context)
