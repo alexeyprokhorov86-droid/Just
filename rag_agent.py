@@ -443,6 +443,51 @@ def extract_time_context(question: str) -> dict:
     return result
 
 
+def has_recent_intent(question: str) -> bool:
+    """Определяет, хочет ли пользователь максимально свежие данные."""
+    q = (question or "").lower()
+    patterns = (
+        r"\bнедавно\b",
+        r"\bпоследн(?:ий|яя|ее|ие|их)\b",
+        r"\bсейчас\b",
+        r"\bновый\b",
+        r"\bпринял[иаои]?\b",
+        r"\bнанял[иаои]?\b",
+        r"\bустроил[асьсяо]?\b",
+        r"\bвышел\b",
+        r"\bвышла\b",
+    )
+    return any(re.search(p, q) for p in patterns)
+
+
+def parse_result_datetime(result: dict):
+    """Пытается извлечь datetime из результата поиска."""
+    dt_raw = result.get("timestamp") or result.get("received_at")
+    if isinstance(dt_raw, datetime):
+        return dt_raw
+
+    date_str = (result.get("date") or "").strip()
+    if not date_str:
+        return None
+
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def freshness_by_time(dt_value, decay_days: int) -> float:
+    """Экспоненциальная свежесть в диапазоне 0..1."""
+    if not dt_value:
+        return 0.5
+    if not isinstance(dt_value, datetime):
+        return 0.5
+    age_seconds = max((datetime.now() - dt_value).total_seconds(), 0)
+    return float(math.exp(-age_seconds / max(decay_days * 86400, 1)))
+
+
 def diversify_by_source_id(
     items: list,
     total_limit: int,
