@@ -92,8 +92,15 @@ KEYWORD_PRIORITY_PATTERNS = (
 INTENT_EXPANSIONS = [
     {
         "name": "staffing_events",
-        "triggers": ("принят", "приняли", "наняли", "новый", "вышел", "вышла", "оффер", "должност"),
-        "terms": ("назначен", "принят на работу", "выход на работу", "фио сотрудника"),
+        "triggers": (
+            "принят", "приняли", "наняли", "новый", "вышел", "вышла", "оффер", "должност",
+            "взяли", "взят", "взята", "устро", "уволен", "уволили", "кро", "кандидат",
+            "кто отвечает", "ответственный",
+        ),
+        "terms": (
+            "назначен", "принят на работу", "выход на работу", "фио сотрудника",
+            "ответственный", "руководитель", "начальник отдела", "согласование оффера",
+        ),
     },
     {
         "name": "finance_tax",
@@ -132,6 +139,35 @@ def has_recent_intent(question: str) -> bool:
 def tokenize_query(query: str) -> list:
     """Токенизация запроса для retrieval-пайплайна."""
     return re.findall(r"[A-Za-zА-Яа-яЁё0-9_]{2,}", (query or "").lower())
+
+
+def keyword_variants(token: str) -> list:
+    """
+    Простая нормализация словоформ для SQL ILIKE.
+    Нужна для случаев: "офферы" -> "оффер", "приняли" -> "приня".
+    """
+    t = (token or "").strip().lower()
+    if not t:
+        return []
+
+    variants = {t}
+    # Базовые русские окончания (без жёсткого стемминга)
+    endings = ("ами", "ями", "ого", "ему", "ыми", "ими", "ая", "яя", "ое", "ее",
+               "ые", "ие", "ов", "ев", "ей", "ам", "ям", "ах", "ях", "ой", "ий",
+               "ый", "ую", "юю", "а", "я", "ы", "и", "е", "у", "ю", "о")
+    for end in endings:
+        if len(t) > len(end) + 3 and t.endswith(end):
+            variants.add(t[:-len(end)])
+
+    # Частый кейс с англицизмами/рус-транслитом
+    if t.endswith("ы") or t.endswith("и"):
+        variants.add(t[:-1])
+
+    # Убираем слишком короткие обрезки
+    cleaned = [v for v in variants if len(v) >= 3]
+    # Длинные/более конкретные сначала
+    cleaned.sort(key=len, reverse=True)
+    return cleaned[:4]
 
 
 def expand_query_for_retrieval(query: str) -> str:
@@ -199,6 +235,64 @@ def select_search_keywords(query: str, max_keywords: int = 8) -> list:
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [token for _, token in scored[:max_keywords]]
+
+
+def detect_query_intents(question: str) -> set:
+    """Лёгкая intent-классификация для страховки роутинга."""
+    q = (question or "").lower()
+    intents = set()
+
+    if re.search(r"принят|приняли|нанял|наняли|взяли|уволен|оффер|должност|кто отвечает|ответствен", q):
+        intents.add("staffing")
+    if re.search(r"ндс|налог|счет|сч[её]т|оплат|плат[её]ж|фнс|договор|акт", q):
+        intents.add("finance")
+    if re.search(r"производ|технолог|брак|выпуск|смен", q):
+        intents.add("production")
+    if re.search(r"закуп|постав|сырь|материал|цена|прайс", q):
+        intents.add("procurement")
+    if re.search(r"документ|pdf|excel|word|вложен|приложен|накладн", q):
+        intents.add("documents")
+    if re.search(r"кто|кого|какие|какой|когда|были ли", q):
+        intents.add("lookup")
+
+    return intents
+
+
+def ensure_plan_sources(plan: dict, question: str) -> dict:
+    """
+    Подстраховка: если router выбрал нерелевантные источники,
+    добавляем необходимые шаги по типу вопроса.
+    """
+    if not isinstance(plan, dict):
+        return plan
+
+    intents = detect_query_intents(question)
+    steps = list(plan.get("steps") or [])
+    existing = {s.get("source") for s in steps if isinstance(s, dict)}
+    keywords = plan.get("keywords") or question
+
+    def _add_step(src: str):
+        if src in existing:
+            return
+        steps.append({"source": src, "action": "поиск", "keywords": keywords})
+        existing.add(src)
+
+    if "staffing" in intents:
+        _add_step("CHATS")
+        _add_step("EMAIL")
+    if "finance" in intents:
+        _add_step("1С_SEARCH")
+        _add_step("CHATS")
+    if "production" in intents or "procurement" in intents:
+        _add_step("1С_SEARCH")
+        _add_step("CHATS")
+    if "documents" in intents:
+        _add_step("CHATS")
+    if "lookup" in intents and "CHATS" not in existing:
+        _add_step("CHATS")
+
+    plan["steps"] = steps
+    return plan
 
 
 def parse_result_datetime(result: dict):
@@ -450,6 +544,26 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
 
     retrieval_query = expand_query_for_retrieval(query)
     keywords = select_search_keywords(retrieval_query, max_keywords=8)
+    keyword_terms = []
+    seen_kw = set()
+    for kw in keywords:
+        for variant in keyword_variants(kw):
+            if variant in seen_kw:
+                continue
+            seen_kw.add(variant)
+            keyword_terms.append(variant)
+    if not keyword_terms:
+        keyword_terms = keywords
+    keyword_terms = []
+    seen_kw = set()
+    for kw in keywords:
+        for variant in keyword_variants(kw):
+            if variant in seen_kw:
+                continue
+            seen_kw.add(variant)
+            keyword_terms.append(variant)
+    if not keyword_terms:
+        keyword_terms = keywords
 
     results = []
     conn = get_db_connection()
@@ -465,7 +579,7 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
                 chat_tables = [row[0] for row in cur.fetchall()]
 
             for table_name in chat_tables:
-                for keyword in keywords:
+                for keyword in keyword_terms:
                     try:
                         query_sql = (
                             "SELECT id, timestamp, first_name, message_text, media_analysis, "
@@ -655,7 +769,7 @@ def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) ->
 
     try:
         with conn.cursor() as cur:
-            fts_query = ' | '.join(keywords[:6]) if keywords else retrieval_query
+            fts_query = ' | '.join(keyword_terms[:8]) if keyword_terms else retrieval_query
             fts_sql = """
                 SELECT id, subject, body_text, from_address, received_at
                 FROM email_messages
@@ -677,7 +791,7 @@ def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) ->
 
             # Fallback по ILIKE если FTS ничего не дал
             if not fts_results:
-                for keyword in keywords[:6]:
+                for keyword in keyword_terms[:8]:
                     kw_sql = """
                         SELECT id, subject, body_text, from_address, received_at
                         FROM email_messages
@@ -855,8 +969,38 @@ def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None
             results.append(r)
     
     results.sort(key=lambda x: x.get('final_score', x.get('similarity', 0)), reverse=True)
-    
-    logger.info(f"Поиск в чатах: {len(results)} результатов (vector + sql, target={len(target_tables) if target_tables else 'all'})")
+
+    # Fallback: если target_chats были заданы, но recall низкий — доищем по всем чатам
+    min_target_hits = max(4, min(8, limit // 3))
+    if target_tables and len(results) < min_target_hits:
+        logger.info(
+            f"CHATS fallback: low recall in target chats ({len(results)} < {min_target_hits}), "
+            "searching across all chats"
+        )
+        extra_results = []
+        extra_vector = search_telegram_chats_vector(
+            query, limit=max(limit // 2, 12), time_context=time_context, target_tables=None
+        )
+        extra_sql = search_telegram_chats_sql(
+            query, limit=max(limit // 2, 12), target_tables=None, time_context=time_context
+        )
+        extra_results.extend(extra_vector)
+        extra_results.extend(extra_sql)
+
+        seen_content = {hash((r.get("content") or "")[:200]) for r in results}
+        for r in extra_results:
+            h = hash((r.get("content") or "")[:200])
+            if h in seen_content:
+                continue
+            seen_content.add(h)
+            results.append(r)
+
+        results.sort(key=lambda x: x.get('final_score', x.get('similarity', 0)), reverse=True)
+
+    logger.info(
+        f"Поиск в чатах: {len(results)} результатов "
+        f"(vector + sql, target={len(target_tables) if target_tables else 'all'})"
+    )
     return results[:limit]
 
 
@@ -2088,6 +2232,7 @@ async def process_rag_query(question, chat_context=""):
     
     # === Шаг 1: Smart Router ===
     plan = route_query(question, chat_context)
+    plan = ensure_plan_sources(plan, question)
     logger.info(f"Query plan: type={plan.get('query_type')}, steps={len(plan.get('steps', []))}, "
                f"target_chats={plan.get('target_chats', [])}")
     
@@ -2160,6 +2305,22 @@ async def process_rag_query(question, chat_context=""):
         f"Поиск завершён: {len(db_results)} релевантных результатов "
         f"за {time.time() - start_time:.1f}с"
     )
+
+    # Global fallback: если мало релевантных данных, делаем широкое доизвлечение
+    if len(db_results) < 4:
+        logger.info("Global fallback retrieval: too few results, running broad chats+email search")
+        fallback_query = expand_query_for_retrieval(question)
+        fallback_chat_results = search_telegram_chats(
+            fallback_query, limit=24, time_context=time_context, target_tables=None
+        )
+        fallback_email_results = search_emails(
+            fallback_query, limit=18, time_context=time_context
+        )
+        db_results.extend(fallback_chat_results)
+        db_results.extend(fallback_email_results)
+        db_results = apply_relevance_filters(deduplicate_results(db_results))
+        db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
+        logger.info(f"Global fallback done: now {len(db_results)} results")
     
     # === Шаг 3: Evaluator — проверяем достаточность (макс 1 итерация) ===
     for retry_num in range(1):
