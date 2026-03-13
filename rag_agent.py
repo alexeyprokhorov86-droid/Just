@@ -60,6 +60,14 @@ EVIDENCE_QUOTAS = {
     "other": 2,
 }
 
+INTENT_EVIDENCE_QUOTAS = {
+    "staffing": {"chat": 6, "email": 2, "1c": 1, "analytics": 0, "other": 1},
+    "documents": {"chat": 6, "email": 2, "1c": 1, "analytics": 0, "other": 1},
+    "finance": {"chat": 3, "email": 4, "1c": 4, "analytics": 2, "other": 1},
+    "production": {"chat": 4, "email": 2, "1c": 4, "analytics": 2, "other": 1},
+    "procurement": {"chat": 4, "email": 2, "1c": 4, "analytics": 2, "other": 1},
+}
+
 
 def get_db_connection():
     return psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)
@@ -329,6 +337,74 @@ def detect_query_intents(question: str) -> set:
         intents.add("lookup")
 
     return intents
+
+
+def get_primary_intent(question: str) -> str:
+    """Возвращает приоритетный intent для настройки retrieval/quotas."""
+    intents = detect_query_intents(question)
+    for name in ("staffing", "finance", "production", "procurement", "documents", "lookup"):
+        if name in intents:
+            return name
+    return "lookup"
+
+
+def suggest_target_chats_by_intent(question: str, max_items: int = 8) -> list:
+    """
+    Локальная подстраховка выбора чатов по названию.
+    Универсально: опирается на intent и ключевые маркеры.
+    """
+    chats = get_chat_list()
+    if not chats:
+        return []
+
+    q = (question or "").lower()
+    intents = detect_query_intents(question)
+
+    markers = []
+    if "staffing" in intents:
+        markers += ["hr", "кадр", "подбор", "персонал", "оффер", "кро", "рекрут"]
+    if "finance" in intents:
+        markers += ["бухгалтер", "налог", "ндс", "финанс", "априори", "аутсорсинг"]
+    if "production" in intents:
+        markers += ["производ", "технолог", "качест", "цех", "выпуск"]
+    if "procurement" in intents:
+        markers += ["закуп", "постав", "сырье", "снабжен"]
+    if "documents" in intents:
+        markers += ["документ", "бз", "отгруз", "скан", "торты отгрузки"]
+
+    # если intent слабый — добавим токены запроса
+    if not markers:
+        markers += select_search_keywords(expand_query_for_retrieval(q), max_keywords=4)
+
+    scored = []
+    for chat in chats:
+        title = (chat.get("title") or "").lower()
+        table = chat.get("table")
+        if not table:
+            continue
+
+        score = 0
+        for m in markers:
+            if m and m in title:
+                score += 2
+        for t in tokenize_query(q):
+            if t in title:
+                score += 1
+
+        if score > 0:
+            scored.append((score, table))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = []
+    seen = set()
+    for _, table in scored:
+        if table in seen:
+            continue
+        seen.add(table)
+        out.append(table)
+        if len(out) >= max_items:
+            break
+    return out
 
 
 def ensure_plan_sources(plan: dict, question: str) -> dict:
@@ -1807,6 +1883,63 @@ def apply_recent_intent_boost(results: list, question: str, time_context: dict =
     return boosted
 
 
+def apply_intent_source_boost(results: list, question: str) -> list:
+    """
+    Универсальный prior по источникам в зависимости от intent.
+    Нужен, чтобы системные email-уведомления не перебивали профильные чаты.
+    """
+    if not results:
+        return []
+
+    primary = get_primary_intent(question)
+    priors_by_intent = {
+        "staffing": {"chat": 1.22, "email": 0.92, "1c": 0.78, "analytics": 0.75, "other": 0.9},
+        "documents": {"chat": 1.16, "email": 0.96, "1c": 0.85, "analytics": 0.8, "other": 0.9},
+        "finance": {"chat": 1.00, "email": 1.06, "1c": 1.14, "analytics": 1.10, "other": 0.9},
+        "production": {"chat": 1.05, "email": 0.95, "1c": 1.12, "analytics": 1.06, "other": 0.9},
+        "procurement": {"chat": 1.05, "email": 0.96, "1c": 1.12, "analytics": 1.06, "other": 0.9},
+        "lookup": {"chat": 1.03, "email": 1.00, "1c": 1.00, "analytics": 1.00, "other": 0.95},
+    }
+    priors = priors_by_intent.get(primary, priors_by_intent["lookup"])
+
+    boosted = []
+    for r in results:
+        rr = dict(r)
+        bucket = rr.get("_bucket", _source_bucket(rr))
+        base = rr.get("_score", _result_score(rr))
+        prior = priors.get(bucket, 1.0)
+
+        # Системные уведомления по staffing часто создают шум
+        if primary == "staffing" and bucket == "email":
+            sender = (rr.get("from_address") or "").lower()
+            subject = (rr.get("subject") or "").lower()
+            if (
+                sender.startswith("no-reply@")
+                or sender.startswith("noreply@")
+                or sender.startswith("reply@")
+                or "gosuslugi" in sender
+                or "factorin" in sender
+            ):
+                if not re.search(r"оффер|offer|должност|кандидат|принят|прием|найм|hiring", subject):
+                    prior *= 0.72
+
+        rr["_score"] = base * prior
+        rr["_intent_prior"] = prior
+        rr["_bucket"] = bucket
+        boosted.append(rr)
+
+    boosted.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    return boosted
+
+
+def get_effective_evidence_quotas(question: str) -> tuple[dict, bool]:
+    """Возвращает квоты evidence и режим строгих caps по primary intent."""
+    primary = get_primary_intent(question)
+    if primary in INTENT_EVIDENCE_QUOTAS:
+        return dict(INTENT_EVIDENCE_QUOTAS[primary]), True
+    return dict(EVIDENCE_QUOTAS), False
+
+
 def _make_citation(result: dict) -> str:
     source = result.get("source", "Источник")
     date_value = result.get("date", "")
@@ -1826,10 +1959,11 @@ def _make_citation(result: dict) -> str:
     return " | ".join(parts)
 
 
-def select_evidence_for_generation(results: list, max_items: int = EVIDENCE_MAX_ITEMS) -> list:
+def select_evidence_for_generation(results: list, max_items: int = EVIDENCE_MAX_ITEMS,
+                                   quotas: dict = None, strict_caps: bool = False) -> list:
     """Финальный отбор evidence: квоты по источникам + заполнение до max_items."""
     ranked = sorted(results, key=lambda x: x.get("_score", _result_score(x)), reverse=True)
-    quotas = dict(EVIDENCE_QUOTAS)
+    quotas = dict(quotas or EVIDENCE_QUOTAS)
     counts = {}
     selected = []
     deferred = []
@@ -1848,6 +1982,13 @@ def select_evidence_for_generation(results: list, max_items: int = EVIDENCE_MAX_
 
     if len(selected) < max_items:
         for r in deferred:
+            if strict_caps:
+                bucket = r.get("_bucket", _source_bucket(r))
+                quota = quotas.get(bucket, quotas.get("other", 2))
+                used = counts.get(bucket, 0)
+                if used >= quota:
+                    continue
+                counts[bucket] = used + 1
             selected.append(r)
             if len(selected) >= max_items:
                 break
@@ -2312,6 +2453,16 @@ async def process_rag_query(question, chat_context=""):
     entities = plan.get("entities", {})
     keywords = plan.get("keywords", question)
     target_chats = plan.get("target_chats", [])
+    suggested_chats = suggest_target_chats_by_intent(question, max_items=8)
+    if suggested_chats:
+        merged_targets = []
+        seen_targets = set()
+        for t in (target_chats or []) + suggested_chats:
+            if not t or t in seen_targets:
+                continue
+            seen_targets.add(t)
+            merged_targets.append(t)
+        target_chats = merged_targets[:10]
     
     time_context = extract_time_context(question)
     if time_context["has_time_filter"]:
@@ -2372,6 +2523,7 @@ async def process_rag_query(question, chat_context=""):
     db_results = deduplicate_results(db_results)
     db_results = apply_relevance_filters(db_results)
     db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
+    db_results = apply_intent_source_boost(db_results, question)
 
     logger.info(
         f"Поиск завершён: {len(db_results)} релевантных результатов "
@@ -2392,7 +2544,26 @@ async def process_rag_query(question, chat_context=""):
         db_results.extend(fallback_email_results)
         db_results = apply_relevance_filters(deduplicate_results(db_results))
         db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
+        db_results = apply_intent_source_boost(db_results, question)
         logger.info(f"Global fallback done: now {len(db_results)} results")
+
+    # Intent fallback: если для кадров/документных вопросов мало чатовых подтверждений
+    intents = detect_query_intents(question)
+    chat_hits = sum(1 for r in db_results if _source_bucket(r) == "chat")
+    if (("staffing" in intents) or ("documents" in intents)) and chat_hits < 2:
+        logger.info(
+            f"Intent fallback: low chat hits ({chat_hits}) for intents={sorted(list(intents))}, "
+            "running wide chat retrieval"
+        )
+        wide_query = expand_query_for_retrieval(question)
+        wide_chat = search_telegram_chats(
+            wide_query, limit=30, time_context=time_context, target_tables=None
+        )
+        db_results.extend(wide_chat)
+        db_results = apply_relevance_filters(deduplicate_results(db_results))
+        db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
+        db_results = apply_intent_source_boost(db_results, question)
+        logger.info(f"Intent fallback done: total={len(db_results)} chat_hits={sum(1 for r in db_results if _source_bucket(r) == 'chat')}")
     
     # === Шаг 3: Evaluator — проверяем достаточность (макс 1 итерация) ===
     for retry_num in range(1):
@@ -2437,6 +2608,7 @@ async def process_rag_query(question, chat_context=""):
 
         db_results = apply_relevance_filters(deduplicate_results(db_results))
         db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
+        db_results = apply_intent_source_boost(db_results, question)
 
     logger.info(f"Итого после ReAct: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
 
@@ -2446,7 +2618,15 @@ async def process_rag_query(question, chat_context=""):
 
     db_results = apply_relevance_filters(deduplicate_results(db_results))
     db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
-    evidence_results = select_evidence_for_generation(db_results, max_items=EVIDENCE_MAX_ITEMS)
+    db_results = apply_intent_source_boost(db_results, question)
+
+    evidence_quotas, strict_caps = get_effective_evidence_quotas(question)
+    evidence_results = select_evidence_for_generation(
+        db_results,
+        max_items=EVIDENCE_MAX_ITEMS,
+        quotas=evidence_quotas,
+        strict_caps=strict_caps,
+    )
 
     source_counts = {}
     for r in evidence_results:
