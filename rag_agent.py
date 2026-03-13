@@ -19,6 +19,7 @@ import requests
 import psycopg2
 from psycopg2 import sql
 import re
+import math
 from datetime import datetime, timedelta, date
 
 logger = logging.getLogger(__name__)
@@ -47,8 +48,8 @@ _chat_list_cache = {"data": None, "ts": 0}
 # Ограничители качества retrieval/generation
 TELEGRAM_VECTOR_MIN_SCORE = 0.72
 EMAIL_VECTOR_MIN_SCORE = 0.55
-TELEGRAM_SQL_MIN_SCORE = 0.78
-EMAIL_SQL_MIN_SCORE = 0.45
+TELEGRAM_SQL_MIN_SCORE = 0.55
+EMAIL_SQL_MIN_SCORE = 0.42
 
 EVIDENCE_MAX_ITEMS = 12
 EVIDENCE_QUOTAS = {
@@ -69,6 +70,161 @@ def clean_keywords(query: str) -> list:
     clean_query = re.sub(r'[,.:;!?()"\']', ' ', query)
     keywords = [w.strip() for w in clean_query.split() if len(w.strip()) > 2]
     return keywords if keywords else [query]
+
+
+SEARCH_STOP_WORDS = {
+    "и", "или", "а", "но", "в", "во", "на", "по", "из", "с", "со", "за", "для", "к", "ко", "у",
+    "о", "об", "от", "до", "про", "над", "под", "при", "между", "что", "кто", "где", "когда",
+    "как", "какой", "какая", "какие", "каких", "который", "которого", "которых", "это", "этот",
+    "эта", "эти", "меня", "мне", "нас", "нам", "наши", "ваши", "нужно", "надо", "можно",
+    "покажи", "скажи", "расскажи", "дай", "есть", "был", "была", "были", "будет", "вопрос",
+}
+
+KEYWORD_PRIORITY_PATTERNS = (
+    (r"ндс|налог|фнс|счет|сч[её]т|оплат|плат[её]ж|договор|акт|инн|кпп", 1.3),
+    (r"производ|технолог|рецепт|брак|выпуск|смен|себесто", 1.3),
+    (r"закуп|постав|сыр[ья]|материал|цена|прайс", 1.2),
+    (r"выруч|марж|продаж|клиент|контрагент|банк|касс", 1.1),
+    (r"кадр|персонал|сотруд|оффер|должност|назнач|принят|нанят|уволен", 1.1),
+    (r"документ|накладн|счет[-_ ]?фактур|приложен|вложен", 0.8),
+)
+
+INTENT_EXPANSIONS = [
+    {
+        "name": "staffing_events",
+        "triggers": ("принят", "приняли", "наняли", "новый", "вышел", "вышла", "оффер", "должност"),
+        "terms": ("назначен", "принят на работу", "выход на работу", "фио сотрудника"),
+    },
+    {
+        "name": "finance_tax",
+        "triggers": ("ндс", "налог", "фнс", "счет", "оплата", "платеж", "договор", "акт"),
+        "terms": ("налоговый учет", "оплата счета", "договорные условия", "бухгалтерия"),
+    },
+    {
+        "name": "production",
+        "triggers": ("производ", "технолог", "рецепт", "брак", "выпуск", "смена"),
+        "terms": ("производственный процесс", "технологические требования", "контроль качества"),
+    },
+    {
+        "name": "procurement_supply",
+        "triggers": ("закуп", "постав", "сырье", "материал", "цена", "прайс"),
+        "terms": ("условия поставки", "закупочные цены", "поставщик"),
+    },
+]
+
+
+def has_recent_intent(question: str) -> bool:
+    """Определяет, что пользователю важна свежесть данных."""
+    q = (question or "").lower()
+    return any(
+        re.search(p, q) for p in (
+            r"\bнедавно\b",
+            r"\bпоследн(?:ий|яя|ее|ие|их)\b",
+            r"\bсегодня\b",
+            r"\bвчера\b",
+            r"\bнов(?:ый|ая|ое|ые)\b",
+            r"\bтекущ(?:ий|ая|ее|ие)\b",
+            r"\bсвеж(?:ий|ая|ие)\b",
+        )
+    )
+
+
+def tokenize_query(query: str) -> list:
+    """Токенизация запроса для retrieval-пайплайна."""
+    return re.findall(r"[A-Za-zА-Яа-яЁё0-9_]{2,}", (query or "").lower())
+
+
+def expand_query_for_retrieval(query: str) -> str:
+    """Расширяет запрос синонимичными формулировками по интенту."""
+    q = (query or "").strip()
+    if not q:
+        return q
+
+    q_lower = q.lower()
+    extras = []
+    for rule in INTENT_EXPANSIONS:
+        if any(trigger in q_lower for trigger in rule["triggers"]):
+            extras.extend(rule["terms"])
+
+    # Сохраняем аббревиатуры (КРО, НДС, ФНС) как отдельные важные термины
+    abbreviations = re.findall(r"\b[A-ZА-ЯЁ]{2,8}\b", q)
+    extras.extend(abbreviations)
+
+    uniq = []
+    seen = set()
+    for term in extras:
+        t = term.strip()
+        if not t:
+            continue
+        key = t.lower()
+        if key in seen:
+            continue
+        if key in q_lower:
+            continue
+        seen.add(key)
+        uniq.append(t)
+
+    return f"{q} {' '.join(uniq)}".strip() if uniq else q
+
+
+def select_search_keywords(query: str, max_keywords: int = 8) -> list:
+    """Умный выбор keywords: убираем шум и поднимаем доменные сущности."""
+    tokens = tokenize_query(query)
+    if not tokens:
+        return clean_keywords(query)[:max_keywords]
+
+    scored = []
+    seen = set()
+    for token in tokens:
+        if token in seen:
+            continue
+        seen.add(token)
+
+        if token in SEARCH_STOP_WORDS:
+            continue
+        if len(token) < 2:
+            continue
+
+        score = 0.25 + min(len(token) * 0.06, 0.9)
+        if any(ch.isdigit() for ch in token):
+            score += 0.4
+        for pattern, bonus in KEYWORD_PRIORITY_PATTERNS:
+            if re.search(pattern, token):
+                score += bonus
+
+        scored.append((score, token))
+
+    if not scored:
+        return clean_keywords(query)[:max_keywords]
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [token for _, token in scored[:max_keywords]]
+
+
+def parse_result_datetime(result: dict):
+    """Извлекает datetime из результата retrieval."""
+    dt_raw = result.get("timestamp") or result.get("received_at")
+    if isinstance(dt_raw, datetime):
+        return dt_raw
+
+    date_str = (result.get("date") or "").strip()
+    if not date_str:
+        return None
+
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def freshness_by_time(dt_value, decay_days: int) -> float:
+    """Экспоненциальная свежесть 0..1."""
+    if not dt_value or not isinstance(dt_value, datetime):
+        return 0.5
+    age_seconds = max((datetime.now() - dt_value).total_seconds(), 0)
+    return float(math.exp(-age_seconds / max(decay_days * 86400, 1)))
 
 
 def get_chat_list() -> list:
@@ -281,64 +437,90 @@ def _group_messages(messages: list, window_minutes: int = 3) -> list:
     return groups
 
 
-def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list = None) -> list:
-    """SQL-поиск по чатам (точное совпадение слов).
-    
-    target_tables: если задан — ищем ТОЛЬКО в этих таблицах (приоритетные чаты).
-    После нахождения сообщений подгружает соседние сообщения того же автора ±5 мин (контекстное окно).
-    """
+def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list = None,
+                              time_context: dict = None) -> list:
+    """SQL-поиск по Telegram чатам с time-aware scoring и keyword expansion."""
+    if time_context is None:
+        time_context = extract_time_context(query)
+
+    decay_days = time_context.get("decay_days", 90)
+    freshness_weight = time_context.get("freshness_weight", 0.25)
+    date_from = time_context.get("date_from")
+    date_to = time_context.get("date_to")
+
+    retrieval_query = expand_query_for_retrieval(query)
+    keywords = select_search_keywords(retrieval_query, max_keywords=8)
+
     results = []
     conn = get_db_connection()
-    keywords = clean_keywords(query)
     found_anchors = {}
     try:
         with conn.cursor() as cur:
             if target_tables:
                 chat_tables = target_tables
             else:
-                cur.execute("""SELECT table_name FROM information_schema.tables 
-                              WHERE table_schema = 'public' AND table_name LIKE 'tg_chat_%' 
+                cur.execute("""SELECT table_name FROM information_schema.tables
+                              WHERE table_schema = 'public' AND table_name LIKE 'tg_chat_%'
                               AND table_name != 'tg_chats_metadata' AND table_name != 'tg_user_roles'""")
                 chat_tables = [row[0] for row in cur.fetchall()]
 
             for table_name in chat_tables:
-                for keyword in keywords[:3]:
+                for keyword in keywords:
                     try:
-                        cur.execute(sql.SQL(
-                            "SELECT timestamp, first_name, message_text, media_analysis, "
+                        query_sql = (
+                            "SELECT id, timestamp, first_name, message_text, media_analysis, "
                             "message_type, content_text FROM {} "
-                            "WHERE message_text ILIKE %s OR media_analysis ILIKE %s "
-                            "OR content_text ILIKE %s "
-                            "ORDER BY timestamp DESC LIMIT %s"
-                        ).format(sql.Identifier(table_name)),
-                            (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
+                            "WHERE (message_text ILIKE %s OR media_analysis ILIKE %s OR content_text ILIKE %s) "
+                        )
+                        params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+                        if date_from:
+                            query_sql += "AND timestamp >= %s "
+                            params.append(date_from)
+                        if date_to:
+                            query_sql += "AND timestamp <= %s "
+                            params.append(date_to)
+                        query_sql += "ORDER BY timestamp DESC LIMIT %s"
+                        params.append(limit)
+
+                        cur.execute(sql.SQL(query_sql).format(sql.Identifier(table_name)), params)
                         for row in cur.fetchall():
                             chat_name = table_name.replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
-                            content = row[2] or ""
-                            if row[5]:
-                                content += f"\n[Документ]: {row[5][:500]}"
-                            if row[3]:
-                                content += f"\n[Анализ]: {row[3][:500]}"
+                            row_id = row[0]
+                            ts = row[1]
+                            content = row[3] or ""
+                            if row[6]:
+                                content += f"\n[Документ]: {row[6][:500]}"
+                            if row[4]:
+                                content += f"\n[Анализ]: {row[4][:500]}"
+
+                            lexical_score = 0.75
+                            freshness = freshness_by_time(ts, decay_days)
+                            final_score = lexical_score * (1 - freshness_weight) + freshness * freshness_weight
+
                             result = {
                                 "source": f"Чат: {chat_name}",
-                                "date": row[0].strftime("%d.%m.%Y %H:%M") if row[0] else "",
-                                "author": row[1] or "",
+                                "date": ts.strftime("%d.%m.%Y %H:%M") if ts else "",
+                                "author": row[2] or "",
                                 "content": content[:1500],
-                                "type": row[4] or "text",
-                                "_ts": row[0],
-                                "similarity": 0.80,
-                                "final_score": 0.80,
+                                "type": row[5] or "text",
+                                "_ts": ts,
+                                "similarity": lexical_score,
+                                "freshness": freshness,
+                                "final_score": final_score,
+                                "search_type": "chat_sql",
+                                "source_id": f"{table_name}:{row_id}",
+                                "source_table": table_name,
                             }
                             if result not in results:
                                 results.append(result)
-                                if row[0] and row[1]:
+                                if ts and row[2]:
                                     if table_name not in found_anchors:
                                         found_anchors[table_name] = []
-                                    found_anchors[table_name].append((row[0], row[1]))
-                    except:
+                                    found_anchors[table_name].append((ts, row[2]))
+                    except Exception:
                         continue
 
-            # === КОНТЕКСТНОЕ ОКНО: подгружаем соседние сообщения ±5 мин от того же автора ===
+            # Контекстное окно: соседние сообщения ±5 минут того же автора
             seen_content = {hash(r['content'][:200]) for r in results}
             for table_name, anchors in found_anchors.items():
                 unique_anchors = {}
@@ -346,39 +528,51 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
                     key = (author, ts.strftime("%Y-%m-%d %H:%M"))
                     if key not in unique_anchors:
                         unique_anchors[key] = (ts, author)
-                
+
                 for ts, author in list(unique_anchors.values())[:10]:
                     try:
                         cur.execute(sql.SQL(
-                            "SELECT timestamp, first_name, message_text, media_analysis, "
+                            "SELECT id, timestamp, first_name, message_text, media_analysis, "
                             "message_type, content_text FROM {} "
                             "WHERE first_name = %s "
                             "AND timestamp BETWEEN %s AND %s "
                             "ORDER BY timestamp"
                         ).format(sql.Identifier(table_name)),
                             (author, ts - timedelta(minutes=5), ts + timedelta(minutes=5)))
-                        
+
                         chat_name = table_name.replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
                         for row in cur.fetchall():
-                            content = row[2] or ""
-                            if row[5]:
-                                content += f"\n[Документ]: {row[5][:500]}"
-                            if row[3]:
-                                content += f"\n[Анализ]: {row[3][:500]}"
+                            row_id = row[0]
+                            row_ts = row[1]
+                            content = row[3] or ""
+                            if row[6]:
+                                content += f"\n[Документ]: {row[6][:500]}"
+                            if row[4]:
+                                content += f"\n[Анализ]: {row[4][:500]}"
                             content_hash = hash(content[:200])
-                            if content_hash not in seen_content:
-                                seen_content.add(content_hash)
-                                results.append({
-                                    "source": f"Чат: {chat_name}",
-                                    "date": row[0].strftime("%d.%m.%Y %H:%M") if row[0] else "",
-                                    "author": row[1] or "",
-                                    "content": content[:1500],
-                                    "type": row[4] or "text",
-                                    "_ts": row[0],
-                                    "similarity": 0.85,
-                                    "final_score": 0.85,
-                                })
-                    except:
+                            if content_hash in seen_content:
+                                continue
+
+                            seen_content.add(content_hash)
+                            lexical_score = 0.68
+                            freshness = freshness_by_time(row_ts, decay_days)
+                            final_score = lexical_score * (1 - freshness_weight) + freshness * freshness_weight
+
+                            results.append({
+                                "source": f"Чат: {chat_name}",
+                                "date": row_ts.strftime("%d.%m.%Y %H:%M") if row_ts else "",
+                                "author": row[2] or "",
+                                "content": content[:1500],
+                                "type": row[5] or "text",
+                                "_ts": row_ts,
+                                "similarity": lexical_score,
+                                "freshness": freshness,
+                                "final_score": final_score,
+                                "search_type": "chat_sql",
+                                "source_id": f"{table_name}:{row_id}",
+                                "source_table": table_name,
+                            })
+                    except Exception:
                         continue
 
     finally:
@@ -399,9 +593,11 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
     decay_days = time_context.get("decay_days", 90)
     freshness_weight = time_context.get("freshness_weight", 0.25)
     
+    retrieval_query = expand_query_for_retrieval(query)
+
     try:
         vector_results = vector_search_weighted(
-            query, 
+            retrieval_query,
             limit=limit, 
             source_type='telegram',
             freshness_weight=freshness_weight,
@@ -420,7 +616,9 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
                 "similarity": r.get('similarity', 0),
                 "freshness": r.get('freshness', 0),
                 "final_score": r.get('final_score', r.get('similarity', 0)),
-                "search_type": "vector"
+                "search_type": "vector",
+                "source_id": f"{r.get('source_table')}:{r.get('source_id')}",
+                "source_table": r.get('source_table'),
             }
             
             if r.get('timestamp'):
@@ -439,66 +637,99 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
         return []
 
 
-def search_emails_sql(query: str, limit: int = 30) -> list:
-    """SQL/keyword поиск по email."""
+def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) -> list:
+    """SQL/keyword поиск по email с query expansion и time-aware scoring."""
+    if time_context is None:
+        time_context = extract_time_context(query)
+
+    decay_days = time_context.get("decay_days", 90)
+    freshness_weight = time_context.get("freshness_weight", 0.25)
+    date_from = time_context.get("date_from")
+    date_to = time_context.get("date_to")
+
+    retrieval_query = expand_query_for_retrieval(query)
+    keywords = select_search_keywords(retrieval_query, max_keywords=8)
+
     results = []
     conn = get_db_connection()
-    keywords = clean_keywords(query)
-    
+
     try:
         with conn.cursor() as cur:
-            fts_query = ' | '.join(keywords[:3])
-            cur.execute("""
+            fts_query = ' | '.join(keywords[:6]) if keywords else retrieval_query
+            fts_sql = """
                 SELECT id, subject, body_text, from_address, received_at
                 FROM email_messages
                 WHERE to_tsvector('russian', COALESCE(subject, '') || ' ' || COALESCE(body_text, ''))
                       @@ to_tsquery('russian', %s)
-                ORDER BY received_at DESC
-                LIMIT %s
-            """, (fts_query, limit * 2))
-            
+            """
+            fts_params = [fts_query]
+            if date_from:
+                fts_sql += " AND received_at >= %s"
+                fts_params.append(date_from)
+            if date_to:
+                fts_sql += " AND received_at <= %s"
+                fts_params.append(date_to)
+            fts_sql += " ORDER BY received_at DESC LIMIT %s"
+            fts_params.append(limit * 3)
+            cur.execute(fts_sql, fts_params)
+
             fts_results = cur.fetchall()
-            
+
+            # Fallback по ILIKE если FTS ничего не дал
             if not fts_results:
-                for keyword in keywords[:2]:
-                    cur.execute("""
+                for keyword in keywords[:6]:
+                    kw_sql = """
                         SELECT id, subject, body_text, from_address, received_at
                         FROM email_messages
-                        WHERE subject ILIKE %s OR body_text ILIKE %s
-                        ORDER BY received_at DESC
-                        LIMIT %s
-                    """, (f"%{keyword}%", f"%{keyword}%", limit))
+                        WHERE (subject ILIKE %s OR body_text ILIKE %s)
+                    """
+                    kw_params = [f"%{keyword}%", f"%{keyword}%"]
+                    if date_from:
+                        kw_sql += " AND received_at >= %s"
+                        kw_params.append(date_from)
+                    if date_to:
+                        kw_sql += " AND received_at <= %s"
+                        kw_params.append(date_to)
+                    kw_sql += " ORDER BY received_at DESC LIMIT %s"
+                    kw_params.append(limit)
+                    cur.execute(kw_sql, kw_params)
                     fts_results.extend(cur.fetchall())
-            
+
             seen_ids = set()
             for row in fts_results:
                 if row[0] in seen_ids:
                     continue
                 seen_ids.add(row[0])
-                
+
                 content = f"Тема: {row[1] or ''}\n{(row[2] or '')[:800]}"
                 received_str = row[4].strftime("%d.%m.%Y") if row[4] else ""
-                
+
+                lexical_score = 0.62
+                freshness = freshness_by_time(row[4], decay_days)
+                final_score = lexical_score * (1 - freshness_weight) + freshness * freshness_weight
+
                 results.append({
                     "source": "Email",
                     "content": content,
                     "subject": row[1] or "",
                     "from_address": row[3] or "",
                     "date": received_str,
-                    "similarity": 0.5,
-                    "final_score": 0.5,
+                    "similarity": lexical_score,
+                    "freshness": freshness,
+                    "final_score": final_score,
                     "search_type": "email_sql",
                     "source_id": row[0],
+                    "received_at": row[4],
                 })
-                
+
                 if len(results) >= limit:
                     break
-                    
+
     except Exception as e:
         logger.error(f"Ошибка SQL поиска email: {e}")
     finally:
         conn.close()
-    
+
     logger.info(f"Email SQL поиск: {len(results)} результатов")
     return results
 
@@ -519,8 +750,9 @@ def search_emails_vector(query: str, limit: int = 30, time_context: dict = None)
 
     results = []
     try:
+        retrieval_query = expand_query_for_retrieval(query)
         email_candidates = vector_search_weighted(
-            query,
+            retrieval_query,
             limit=pre_limit,
             source_type='email',
             freshness_weight=freshness_weight,
@@ -578,7 +810,7 @@ def search_emails(query: str, limit: int = 30, time_context: dict = None) -> lis
             seen_ids.add(source_id)
         results.append(r)
     
-    sql_results = search_emails_sql(query, limit=limit)
+    sql_results = search_emails_sql(query, limit=limit, time_context=time_context)
     for r in sql_results:
         source_id = r.get('source_id')
         if source_id and source_id in seen_ids:
@@ -613,7 +845,9 @@ def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None
             results.append(r)
     
     # SQL поиск — в target_tables если заданы
-    sql_results = search_telegram_chats_sql(query, limit=limit, target_tables=target_tables)
+    sql_results = search_telegram_chats_sql(
+        query, limit=limit, target_tables=target_tables, time_context=time_context
+    )
     for r in sql_results:
         content_hash = hash(r['content'][:200])
         if content_hash not in seen_content:
@@ -1332,6 +1566,31 @@ def apply_relevance_filters(results: list) -> list:
     return filtered
 
 
+def apply_recent_intent_boost(results: list, question: str, time_context: dict = None) -> list:
+    """Для запросов о свежих событиях поднимает более новые документы."""
+    if not results:
+        return []
+    if not has_recent_intent(question):
+        return results
+
+    if time_context is None:
+        time_context = extract_time_context(question)
+    decay_days = time_context.get("decay_days", 30)
+
+    boosted = []
+    for r in results:
+        rr = dict(r)
+        base_score = rr.get("_score", _result_score(rr))
+        dt_value = parse_result_datetime(rr)
+        recency = freshness_by_time(dt_value, decay_days)
+        rr["_score"] = base_score * 0.75 + recency * 0.25
+        rr["_recentness"] = recency
+        boosted.append(rr)
+
+    boosted.sort(key=lambda x: x.get("_score", 0), reverse=True)
+    return boosted
+
+
 def _make_citation(result: dict) -> str:
     source = result.get("source", "Источник")
     date_value = result.get("date", "")
@@ -1438,6 +1697,7 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
 3) Если данных недостаточно — явно напиши "Недостаточно данных" и что именно нужно уточнить.
 4) Предпочитай конкретику: суммы, даты, документы, имена.
 5) Не делай тезисов без ссылки [n].
+6) Если вопрос про свежие события — делай приоритет на самых новых доказательствах.
 
 ФОРМАТ ОТВЕТА:
 - Краткий вывод (1-2 предложения)
@@ -1894,6 +2154,7 @@ async def process_rag_query(question, chat_context=""):
     executed_sources = [step.get("source") for step in plan.get("steps", [])]
     db_results = deduplicate_results(db_results)
     db_results = apply_relevance_filters(db_results)
+    db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
 
     logger.info(
         f"Поиск завершён: {len(db_results)} релевантных результатов "
@@ -1942,6 +2203,7 @@ async def process_rag_query(question, chat_context=""):
                 logger.info(f"Retry EMAIL: {len(extra_email_results)} результатов")
 
         db_results = apply_relevance_filters(deduplicate_results(db_results))
+        db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
 
     logger.info(f"Итого после ReAct: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
 
@@ -1950,6 +2212,7 @@ async def process_rag_query(question, chat_context=""):
         db_results = rerank_results(question, db_results, top_k=24)
 
     db_results = apply_relevance_filters(deduplicate_results(db_results))
+    db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
     evidence_results = select_evidence_for_generation(db_results, max_items=EVIDENCE_MAX_ITEMS)
 
     source_counts = {}
