@@ -95,7 +95,7 @@ INTENT_EXPANSIONS = [
         "triggers": (
             "принят", "приняли", "наняли", "новый", "вышел", "вышла", "оффер", "должност",
             "взяли", "взят", "взята", "устро", "уволен", "уволили", "кро", "кандидат",
-            "кто отвечает", "ответственный",
+            "кто отвечает", "ответственный", "offer", "hiring", "hire", "fired", "candidate", "position",
         ),
         "terms": (
             "назначен", "принят на работу", "выход на работу", "фио сотрудника",
@@ -104,20 +104,87 @@ INTENT_EXPANSIONS = [
     },
     {
         "name": "finance_tax",
-        "triggers": ("ндс", "налог", "фнс", "счет", "оплата", "платеж", "договор", "акт"),
+        "triggers": ("ндс", "налог", "фнс", "счет", "оплата", "платеж", "договор", "акт", "vat", "tax", "invoice", "payment"),
         "terms": ("налоговый учет", "оплата счета", "договорные условия", "бухгалтерия"),
     },
     {
         "name": "production",
-        "triggers": ("производ", "технолог", "рецепт", "брак", "выпуск", "смена"),
+        "triggers": ("производ", "технолог", "рецепт", "брак", "выпуск", "смена", "production", "technolog"),
         "terms": ("производственный процесс", "технологические требования", "контроль качества"),
     },
     {
         "name": "procurement_supply",
-        "triggers": ("закуп", "постав", "сырье", "материал", "цена", "прайс"),
+        "triggers": ("закуп", "постав", "сырье", "материал", "цена", "прайс", "procure", "supplier", "price"),
         "terms": ("условия поставки", "закупочные цены", "поставщик"),
     },
 ]
+
+EN_TO_RU_LAYOUT = str.maketrans(
+    "`qwertyuiop[]asdfghjkl;'zxcvbnm,./QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?",
+    "ёйцукенгшщзхъфывапролджэячсмитьбю.ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,"
+)
+
+TERM_ALIASES = {
+    "offer": "оффер",
+    "offers": "офферы",
+    "offer letter": "оффер",
+    "hiring": "найм",
+    "hire": "найм",
+    "hired": "принят",
+    "fired": "уволен",
+    "dismissal": "увольнение",
+    "candidate": "кандидат",
+    "position": "должность",
+    "chief technologist": "главный технолог",
+    "technologist": "технолог",
+    "resume": "резюме",
+    "production": "производство",
+    "procurement": "закупки",
+    "supplier": "поставщик",
+    "suppliers": "поставщики",
+    "invoice": "счет",
+    "invoices": "счета",
+    "payment": "оплата",
+    "payments": "платежи",
+    "vat": "ндс",
+    "tax": "налог",
+    "taxes": "налоги",
+    "kro": "кро",
+    "hr": "кадры",
+}
+
+
+def swap_en_to_ru_layout(text: str) -> str:
+    """Преобразует текст, набранный в EN-раскладке, в RU-раскладку."""
+    return (text or "").translate(EN_TO_RU_LAYOUT)
+
+
+def maybe_add_layout_variant(query: str) -> list:
+    """
+    Если запрос целиком набран латиницей, добавляет EN->RU вариант.
+    Это ловит кейсы типа 'jaaths' вместо 'офферы'.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    en_letters = len(re.findall(r"[A-Za-z]", q))
+    ru_letters = len(re.findall(r"[А-Яа-яЁё]", q))
+    if en_letters > 0 and ru_letters == 0:
+        swapped = swap_en_to_ru_layout(q)
+        if swapped and swapped.lower() != q.lower():
+            return [swapped]
+    return []
+
+
+def extract_alias_terms(query: str) -> list:
+    """Добавляет языковые alias-термы для смешанных RU/EN запросов."""
+    q_low = (query or "").lower()
+    extras = []
+    for src, dst in TERM_ALIASES.items():
+        if src in q_low:
+            extras.append(dst)
+    return extras
 
 
 def has_recent_intent(question: str) -> bool:
@@ -182,6 +249,12 @@ def expand_query_for_retrieval(query: str) -> str:
         if any(trigger in q_lower for trigger in rule["triggers"]):
             extras.extend(rule["terms"])
 
+    # Поддержка английских терминов/смешанной лексики
+    extras.extend(extract_alias_terms(q))
+
+    # Автокоррекция EN->RU раскладки
+    extras.extend(maybe_add_layout_variant(q))
+
     # Сохраняем аббревиатуры (КРО, НДС, ФНС) как отдельные важные термины
     abbreviations = re.findall(r"\b[A-ZА-ЯЁ]{2,8}\b", q)
     extras.extend(abbreviations)
@@ -242,15 +315,15 @@ def detect_query_intents(question: str) -> set:
     q = (question or "").lower()
     intents = set()
 
-    if re.search(r"принят|приняли|нанял|наняли|взяли|уволен|оффер|должност|кто отвечает|ответствен", q):
+    if re.search(r"принят|приняли|нанял|наняли|взяли|уволен|оффер|offer|hire|hiring|dismiss|должност|position|кто отвечает|ответствен", q):
         intents.add("staffing")
-    if re.search(r"ндс|налог|счет|сч[её]т|оплат|плат[её]ж|фнс|договор|акт", q):
+    if re.search(r"ндс|налог|tax|vat|invoice|счет|сч[её]т|оплат|payment|плат[её]ж|фнс|договор|акт", q):
         intents.add("finance")
-    if re.search(r"производ|технолог|брак|выпуск|смен", q):
+    if re.search(r"производ|production|технолог|technolog|брак|выпуск|смен", q):
         intents.add("production")
-    if re.search(r"закуп|постав|сырь|материал|цена|прайс", q):
+    if re.search(r"закуп|procure|supplier|постав|сырь|материал|цена|прайс", q):
         intents.add("procurement")
-    if re.search(r"документ|pdf|excel|word|вложен|приложен|накладн", q):
+    if re.search(r"документ|document|pdf|excel|word|вложен|приложен|накладн", q):
         intents.add("documents")
     if re.search(r"кто|кого|какие|какой|когда|были ли", q):
         intents.add("lookup")
@@ -442,52 +515,6 @@ def extract_time_context(question: str) -> dict:
     
     return result
 
-
-def has_recent_intent(question: str) -> bool:
-    """Определяет, хочет ли пользователь максимально свежие данные."""
-    q = (question or "").lower()
-    patterns = (
-        r"\bнедавно\b",
-        r"\bпоследн(?:ий|яя|ее|ие|их)\b",
-        r"\bсейчас\b",
-        r"\bновый\b",
-        r"\bпринял[иаои]?\b",
-        r"\bнанял[иаои]?\b",
-        r"\bустроил[асьсяо]?\b",
-        r"\bвышел\b",
-        r"\bвышла\b",
-    )
-    return any(re.search(p, q) for p in patterns)
-
-
-def parse_result_datetime(result: dict):
-    """Пытается извлечь datetime из результата поиска."""
-    dt_raw = result.get("timestamp") or result.get("received_at")
-    if isinstance(dt_raw, datetime):
-        return dt_raw
-
-    date_str = (result.get("date") or "").strip()
-    if not date_str:
-        return None
-
-    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def freshness_by_time(dt_value, decay_days: int) -> float:
-    """Экспоненциальная свежесть в диапазоне 0..1."""
-    if not dt_value:
-        return 0.5
-    if not isinstance(dt_value, datetime):
-        return 0.5
-    age_seconds = max((datetime.now() - dt_value).total_seconds(), 0)
-    return float(math.exp(-age_seconds / max(decay_days * 86400, 1)))
-
-
 def diversify_by_source_id(
     items: list,
     total_limit: int,
@@ -589,16 +616,6 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
 
     retrieval_query = expand_query_for_retrieval(query)
     keywords = select_search_keywords(retrieval_query, max_keywords=8)
-    keyword_terms = []
-    seen_kw = set()
-    for kw in keywords:
-        for variant in keyword_variants(kw):
-            if variant in seen_kw:
-                continue
-            seen_kw.add(variant)
-            keyword_terms.append(variant)
-    if not keyword_terms:
-        keyword_terms = keywords
     keyword_terms = []
     seen_kw = set()
     for kw in keywords:
@@ -808,6 +825,16 @@ def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) ->
 
     retrieval_query = expand_query_for_retrieval(query)
     keywords = select_search_keywords(retrieval_query, max_keywords=8)
+    keyword_terms = []
+    seen_kw = set()
+    for kw in keywords:
+        for variant in keyword_variants(kw):
+            if variant in seen_kw:
+                continue
+            seen_kw.add(variant)
+            keyword_terms.append(variant)
+    if not keyword_terms:
+        keyword_terms = keywords
 
     results = []
     conn = get_db_connection()
