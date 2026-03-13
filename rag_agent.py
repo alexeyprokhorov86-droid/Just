@@ -19,7 +19,6 @@ import requests
 import psycopg2
 from psycopg2 import sql
 import re
-import math
 from datetime import datetime, timedelta, date
 
 logger = logging.getLogger(__name__)
@@ -48,8 +47,8 @@ _chat_list_cache = {"data": None, "ts": 0}
 # Ограничители качества retrieval/generation
 TELEGRAM_VECTOR_MIN_SCORE = 0.72
 EMAIL_VECTOR_MIN_SCORE = 0.55
-TELEGRAM_SQL_MIN_SCORE = 0.55
-EMAIL_SQL_MIN_SCORE = 0.42
+TELEGRAM_SQL_MIN_SCORE = 0.78
+EMAIL_SQL_MIN_SCORE = 0.45
 
 EVIDENCE_MAX_ITEMS = 12
 EVIDENCE_QUOTAS = {
@@ -194,51 +193,6 @@ def extract_time_context(question: str) -> dict:
     return result
 
 
-def has_recent_intent(question: str) -> bool:
-    """Определяет, хочет ли пользователь максимально свежие данные."""
-    q = (question or "").lower()
-    patterns = (
-        r"\bнедавно\b",
-        r"\bпоследн(?:ий|яя|ее|ие|их)\b",
-        r"\bсейчас\b",
-        r"\bновый\b",
-        r"\bпринял[иаои]?\b",
-        r"\bнанял[иаои]?\b",
-        r"\bустроил[асьсяо]?\b",
-        r"\bвышел\b",
-        r"\bвышла\b",
-    )
-    return any(re.search(p, q) for p in patterns)
-
-
-def parse_result_datetime(result: dict):
-    """Пытается извлечь datetime из результата поиска."""
-    dt_raw = result.get("timestamp") or result.get("received_at")
-    if isinstance(dt_raw, datetime):
-        return dt_raw
-
-    date_str = (result.get("date") or "").strip()
-    if not date_str:
-        return None
-
-    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(date_str, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def freshness_by_time(dt_value, decay_days: int) -> float:
-    """Экспоненциальная свежесть в диапазоне 0..1."""
-    if not dt_value:
-        return 0.5
-    if not isinstance(dt_value, datetime):
-        return 0.5
-    age_seconds = max((datetime.now() - dt_value).total_seconds(), 0)
-    return float(math.exp(-age_seconds / max(decay_days * 86400, 1)))
-
-
 def diversify_by_source_id(
     items: list,
     total_limit: int,
@@ -327,21 +281,12 @@ def _group_messages(messages: list, window_minutes: int = 3) -> list:
     return groups
 
 
-def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list = None,
-                              time_context: dict = None) -> list:
+def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list = None) -> list:
     """SQL-поиск по чатам (точное совпадение слов).
     
     target_tables: если задан — ищем ТОЛЬКО в этих таблицах (приоритетные чаты).
     После нахождения сообщений подгружает соседние сообщения того же автора ±5 мин (контекстное окно).
     """
-    if time_context is None:
-        time_context = extract_time_context(query)
-
-    decay_days = time_context.get("decay_days", 90)
-    freshness_weight = time_context.get("freshness_weight", 0.25)
-    date_from = time_context.get("date_from")
-    date_to = time_context.get("date_to")
-
     results = []
     conn = get_db_connection()
     keywords = clean_keywords(query)
@@ -359,56 +304,37 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
             for table_name in chat_tables:
                 for keyword in keywords[:3]:
                     try:
-                        query_sql = (
-                            "SELECT id, timestamp, first_name, message_text, media_analysis, "
+                        cur.execute(sql.SQL(
+                            "SELECT timestamp, first_name, message_text, media_analysis, "
                             "message_type, content_text FROM {} "
-                            "WHERE (message_text ILIKE %s OR media_analysis ILIKE %s OR content_text ILIKE %s) "
-                        )
-                        params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
-                        if date_from:
-                            query_sql += "AND timestamp >= %s "
-                            params.append(date_from)
-                        if date_to:
-                            query_sql += "AND timestamp <= %s "
-                            params.append(date_to)
-                        query_sql += "ORDER BY timestamp DESC LIMIT %s"
-                        params.append(limit)
-
-                        cur.execute(sql.SQL(query_sql).format(sql.Identifier(table_name)), params)
+                            "WHERE message_text ILIKE %s OR media_analysis ILIKE %s "
+                            "OR content_text ILIKE %s "
+                            "ORDER BY timestamp DESC LIMIT %s"
+                        ).format(sql.Identifier(table_name)),
+                            (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit))
                         for row in cur.fetchall():
                             chat_name = table_name.replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
-                            row_id = row[0]
-                            ts = row[1]
-                            content = row[3] or ""
-                            if row[6]:
-                                content += f"\n[Документ]: {row[6][:500]}"
-                            if row[4]:
-                                content += f"\n[Анализ]: {row[4][:500]}"
-
-                            lexical_score = 0.76
-                            freshness = freshness_by_time(ts, decay_days)
-                            final_score = lexical_score * (1 - freshness_weight) + freshness * freshness_weight
-
+                            content = row[2] or ""
+                            if row[5]:
+                                content += f"\n[Документ]: {row[5][:500]}"
+                            if row[3]:
+                                content += f"\n[Анализ]: {row[3][:500]}"
                             result = {
                                 "source": f"Чат: {chat_name}",
-                                "date": ts.strftime("%d.%m.%Y %H:%M") if ts else "",
-                                "author": row[2] or "",
+                                "date": row[0].strftime("%d.%m.%Y %H:%M") if row[0] else "",
+                                "author": row[1] or "",
                                 "content": content[:1500],
-                                "type": row[5] or "text",
-                                "_ts": ts,
-                                "similarity": lexical_score,
-                                "freshness": freshness,
-                                "final_score": final_score,
-                                "search_type": "chat_sql",
-                                "source_id": f"{table_name}:{row_id}",
-                                "source_table": table_name,
+                                "type": row[4] or "text",
+                                "_ts": row[0],
+                                "similarity": 0.80,
+                                "final_score": 0.80,
                             }
                             if result not in results:
                                 results.append(result)
-                                if ts and row[2]:
+                                if row[0] and row[1]:
                                     if table_name not in found_anchors:
                                         found_anchors[table_name] = []
-                                    found_anchors[table_name].append((ts, row[2]))
+                                    found_anchors[table_name].append((row[0], row[1]))
                     except:
                         continue
 
@@ -424,7 +350,7 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
                 for ts, author in list(unique_anchors.values())[:10]:
                     try:
                         cur.execute(sql.SQL(
-                            "SELECT id, timestamp, first_name, message_text, media_analysis, "
+                            "SELECT timestamp, first_name, message_text, media_analysis, "
                             "message_type, content_text FROM {} "
                             "WHERE first_name = %s "
                             "AND timestamp BETWEEN %s AND %s "
@@ -434,32 +360,23 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
                         
                         chat_name = table_name.replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
                         for row in cur.fetchall():
-                            row_id = row[0]
-                            row_ts = row[1]
-                            content = row[3] or ""
-                            if row[6]:
-                                content += f"\n[Документ]: {row[6][:500]}"
-                            if row[4]:
-                                content += f"\n[Анализ]: {row[4][:500]}"
+                            content = row[2] or ""
+                            if row[5]:
+                                content += f"\n[Документ]: {row[5][:500]}"
+                            if row[3]:
+                                content += f"\n[Анализ]: {row[3][:500]}"
                             content_hash = hash(content[:200])
                             if content_hash not in seen_content:
                                 seen_content.add(content_hash)
-                                lexical_score = 0.70
-                                freshness = freshness_by_time(row_ts, decay_days)
-                                final_score = lexical_score * (1 - freshness_weight) + freshness * freshness_weight
                                 results.append({
                                     "source": f"Чат: {chat_name}",
-                                    "date": row_ts.strftime("%d.%m.%Y %H:%M") if row_ts else "",
-                                    "author": row[2] or "",
+                                    "date": row[0].strftime("%d.%m.%Y %H:%M") if row[0] else "",
+                                    "author": row[1] or "",
                                     "content": content[:1500],
-                                    "type": row[5] or "text",
-                                    "_ts": row_ts,
-                                    "similarity": lexical_score,
-                                    "freshness": freshness,
-                                    "final_score": final_score,
-                                    "search_type": "chat_sql",
-                                    "source_id": f"{table_name}:{row_id}",
-                                    "source_table": table_name,
+                                    "type": row[4] or "text",
+                                    "_ts": row[0],
+                                    "similarity": 0.85,
+                                    "final_score": 0.85,
                                 })
                     except:
                         continue
@@ -522,16 +439,8 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
         return []
 
 
-def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) -> list:
+def search_emails_sql(query: str, limit: int = 30) -> list:
     """SQL/keyword поиск по email."""
-    if time_context is None:
-        time_context = extract_time_context(query)
-
-    decay_days = time_context.get("decay_days", 90)
-    freshness_weight = time_context.get("freshness_weight", 0.25)
-    date_from = time_context.get("date_from")
-    date_to = time_context.get("date_to")
-
     results = []
     conn = get_db_connection()
     keywords = clean_keywords(query)
@@ -539,42 +448,26 @@ def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) ->
     try:
         with conn.cursor() as cur:
             fts_query = ' | '.join(keywords[:3])
-            fts_sql = """
+            cur.execute("""
                 SELECT id, subject, body_text, from_address, received_at
                 FROM email_messages
                 WHERE to_tsvector('russian', COALESCE(subject, '') || ' ' || COALESCE(body_text, ''))
                       @@ to_tsquery('russian', %s)
-            """
-            fts_params = [fts_query]
-            if date_from:
-                fts_sql += " AND received_at >= %s"
-                fts_params.append(date_from)
-            if date_to:
-                fts_sql += " AND received_at <= %s"
-                fts_params.append(date_to)
-            fts_sql += " ORDER BY received_at DESC LIMIT %s"
-            fts_params.append(limit * 2)
-            cur.execute(fts_sql, fts_params)
+                ORDER BY received_at DESC
+                LIMIT %s
+            """, (fts_query, limit * 2))
             
             fts_results = cur.fetchall()
             
             if not fts_results:
                 for keyword in keywords[:2]:
-                    kw_sql = """
+                    cur.execute("""
                         SELECT id, subject, body_text, from_address, received_at
                         FROM email_messages
-                        WHERE (subject ILIKE %s OR body_text ILIKE %s)
-                    """
-                    kw_params = [f"%{keyword}%", f"%{keyword}%"]
-                    if date_from:
-                        kw_sql += " AND received_at >= %s"
-                        kw_params.append(date_from)
-                    if date_to:
-                        kw_sql += " AND received_at <= %s"
-                        kw_params.append(date_to)
-                    kw_sql += " ORDER BY received_at DESC LIMIT %s"
-                    kw_params.append(limit)
-                    cur.execute(kw_sql, kw_params)
+                        WHERE subject ILIKE %s OR body_text ILIKE %s
+                        ORDER BY received_at DESC
+                        LIMIT %s
+                    """, (f"%{keyword}%", f"%{keyword}%", limit))
                     fts_results.extend(cur.fetchall())
             
             seen_ids = set()
@@ -586,19 +479,14 @@ def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) ->
                 content = f"Тема: {row[1] or ''}\n{(row[2] or '')[:800]}"
                 received_str = row[4].strftime("%d.%m.%Y") if row[4] else ""
                 
-                lexical_score = 0.68
-                freshness = freshness_by_time(row[4], decay_days)
-                final_score = lexical_score * (1 - freshness_weight) + freshness * freshness_weight
-
                 results.append({
                     "source": "Email",
                     "content": content,
                     "subject": row[1] or "",
                     "from_address": row[3] or "",
                     "date": received_str,
-                    "similarity": lexical_score,
-                    "freshness": freshness,
-                    "final_score": final_score,
+                    "similarity": 0.5,
+                    "final_score": 0.5,
                     "search_type": "email_sql",
                     "source_id": row[0],
                 })
@@ -690,7 +578,7 @@ def search_emails(query: str, limit: int = 30, time_context: dict = None) -> lis
             seen_ids.add(source_id)
         results.append(r)
     
-    sql_results = search_emails_sql(query, limit=limit, time_context=time_context)
+    sql_results = search_emails_sql(query, limit=limit)
     for r in sql_results:
         source_id = r.get('source_id')
         if source_id and source_id in seen_ids:
@@ -725,9 +613,7 @@ def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None
             results.append(r)
     
     # SQL поиск — в target_tables если заданы
-    sql_results = search_telegram_chats_sql(
-        query, limit=limit, target_tables=target_tables, time_context=time_context
-    )
+    sql_results = search_telegram_chats_sql(query, limit=limit, target_tables=target_tables)
     for r in sql_results:
         content_hash = hash(r['content'][:200])
         if content_hash not in seen_content:
@@ -1446,34 +1332,6 @@ def apply_relevance_filters(results: list) -> list:
     return filtered
 
 
-def apply_recent_intent_boost(results: list, question: str, time_context: dict = None) -> list:
-    """
-    Для запросов типа "недавно/последний" усиливает более свежие документы.
-    Не заменяет релевантность, а мягко корректирует порядок.
-    """
-    if not results:
-        return []
-    if not has_recent_intent(question):
-        return results
-
-    if time_context is None:
-        time_context = extract_time_context(question)
-    decay_days = time_context.get("decay_days", 30)
-
-    boosted = []
-    for r in results:
-        rr = dict(r)
-        base = rr.get("_score", _result_score(rr))
-        dt_value = parse_result_datetime(rr)
-        recency = freshness_by_time(dt_value, decay_days)
-        rr["_score"] = base * 0.78 + recency * 0.22
-        rr["_recent_boost"] = recency
-        boosted.append(rr)
-
-    boosted.sort(key=lambda x: x.get("_score", 0), reverse=True)
-    return boosted
-
-
 def _make_citation(result: dict) -> str:
     source = result.get("source", "Источник")
     date_value = result.get("date", "")
@@ -1580,7 +1438,6 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
 3) Если данных недостаточно — явно напиши "Недостаточно данных" и что именно нужно уточнить.
 4) Предпочитай конкретику: суммы, даты, документы, имена.
 5) Не делай тезисов без ссылки [n].
-6) Если вопрос про "недавно/последний" — выбирай самые свежие по дате доказательства; старые используй только как фон.
 
 ФОРМАТ ОТВЕТА:
 - Краткий вывод (1-2 предложения)
@@ -2037,7 +1894,6 @@ async def process_rag_query(question, chat_context=""):
     executed_sources = [step.get("source") for step in plan.get("steps", [])]
     db_results = deduplicate_results(db_results)
     db_results = apply_relevance_filters(db_results)
-    db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
 
     logger.info(
         f"Поиск завершён: {len(db_results)} релевантных результатов "
@@ -2086,7 +1942,6 @@ async def process_rag_query(question, chat_context=""):
                 logger.info(f"Retry EMAIL: {len(extra_email_results)} результатов")
 
         db_results = apply_relevance_filters(deduplicate_results(db_results))
-        db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
 
     logger.info(f"Итого после ReAct: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
 
@@ -2095,7 +1950,6 @@ async def process_rag_query(question, chat_context=""):
         db_results = rerank_results(question, db_results, top_k=24)
 
     db_results = apply_relevance_filters(deduplicate_results(db_results))
-    db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
     evidence_results = select_evidence_for_generation(db_results, max_items=EVIDENCE_MAX_ITEMS)
 
     source_counts = {}
