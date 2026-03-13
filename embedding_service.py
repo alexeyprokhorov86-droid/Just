@@ -234,8 +234,9 @@ def vector_search(query: str, limit: int = 10, source_type: Optional[str] = None
         conn.close()
 
 
-def vector_search_weighted(query: str, limit: int = 10, source_type: Optional[str] = None, 
-                           freshness_weight: float = 0.25, decay_days: int = 90) -> List[Dict]:
+def vector_search_weighted(query: str, limit: int = 10, source_type: Optional[str] = None,
+                           freshness_weight: float = 0.25, decay_days: int = 90,
+                           source_tables: Optional[List[str]] = None) -> List[Dict]:
     """
     Семантический поиск с учётом свежести.
     
@@ -245,6 +246,7 @@ def vector_search_weighted(query: str, limit: int = 10, source_type: Optional[st
         source_type: Фильтр по типу источника ('telegram' или 'email')
         freshness_weight: Вес свежести (0.0-1.0), остальное - similarity
         decay_days: За сколько дней freshness падает до ~0.37
+        source_tables: Доп. фильтр по таблицам для telegram (например target_chats)
     
     Returns:
         Список результатов с полями: source_type, source_table, source_id, content, 
@@ -298,19 +300,35 @@ def vector_search_weighted(query: str, limit: int = 10, source_type: Optional[st
             elif source_type == 'telegram':
                 # Для telegram — JOIN с таблицами чатов через source_table
                 # Сначала получаем кандидатов по similarity
-                cur.execute("""
-                    SELECT 
-                        e.source_type, 
-                        e.source_table, 
-                        e.source_id, 
-                        e.content,
-                        1 - (e.embedding <=> %s::vector) as similarity,
-                        e.created_at
-                    FROM embeddings e
-                    WHERE e.source_type = 'telegram'
-                    ORDER BY e.embedding <=> %s::vector
-                    LIMIT %s
-                """, (query_embedding, query_embedding, limit * 3))
+                if source_tables:
+                    cur.execute("""
+                        SELECT
+                            e.source_type,
+                            e.source_table,
+                            e.source_id,
+                            e.content,
+                            1 - (e.embedding <=> %s::vector) as similarity,
+                            e.created_at
+                        FROM embeddings e
+                        WHERE e.source_type = 'telegram'
+                          AND e.source_table = ANY(%s)
+                        ORDER BY e.embedding <=> %s::vector
+                        LIMIT %s
+                    """, (query_embedding, source_tables, query_embedding, limit * 3))
+                else:
+                    cur.execute("""
+                        SELECT
+                            e.source_type,
+                            e.source_table,
+                            e.source_id,
+                            e.content,
+                            1 - (e.embedding <=> %s::vector) as similarity,
+                            e.created_at
+                        FROM embeddings e
+                        WHERE e.source_type = 'telegram'
+                        ORDER BY e.embedding <=> %s::vector
+                        LIMIT %s
+                    """, (query_embedding, query_embedding, limit * 3))
                 
                 candidates = cur.fetchall()
                 results = []
