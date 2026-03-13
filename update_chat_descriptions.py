@@ -118,7 +118,7 @@ def get_chat_tables(conn):
 
 
 def get_chat_participants(conn, table_name: str) -> list:
-    """Участники чата с количеством сообщений за N месяцев."""
+    """Участники чата с количеством сообщений (за всё время)."""
     try:
         with conn.cursor() as cur:
             cur.execute(f"""
@@ -128,8 +128,7 @@ def get_chat_participants(conn, table_name: str) -> list:
                     COUNT(*) as msg_count,
                     MAX(timestamp) as last_msg
                 FROM {table_name}
-                WHERE timestamp >= NOW() - INTERVAL '{ANALYSIS_MONTHS} months'
-                AND first_name IS NOT NULL
+                WHERE first_name IS NOT NULL
                 AND first_name NOT IN ('Group', 'Bot', 'Telegram')
                 AND COALESCE(username, '') != 'GroupAnonymousBot'
                 GROUP BY first_name, last_name, username
@@ -151,7 +150,7 @@ def get_chat_participants(conn, table_name: str) -> list:
 
 
 def get_chat_sample(conn, table_name: str, limit: int = SAMPLE_SIZE) -> list:
-    """Последние N сообщений за 3 месяца включая media_analysis."""
+    """Последние N сообщений включая media_analysis и content_text (без фильтра по дате)."""
     try:
         with conn.cursor() as cur:
             # Проверяем наличие колонок
@@ -166,11 +165,12 @@ def get_chat_sample(conn, table_name: str, limit: int = SAMPLE_SIZE) -> list:
             if 'timestamp' not in cols:
                 return []
 
-            # Формируем SELECT
+            # Формируем SELECT — берём media_analysis и content_text полностью (до 1500 символов)
             select_parts = []
             select_parts.append("first_name" if 'first_name' in cols else "'' as first_name")
             select_parts.append("message_text" if 'message_text' in cols else "'' as message_text")
-            select_parts.append("LEFT(media_analysis, 600) as media_analysis" if 'media_analysis' in cols else "'' as media_analysis")
+            select_parts.append("LEFT(media_analysis, 1500) as media_analysis" if 'media_analysis' in cols else "'' as media_analysis")
+            select_parts.append("LEFT(content_text, 1000) as content_text" if 'content_text' in cols else "'' as content_text")
             select_parts.append("message_type" if 'message_type' in cols else "'text' as message_type")
             select_parts.append("timestamp")
 
@@ -180,17 +180,19 @@ def get_chat_sample(conn, table_name: str, limit: int = SAMPLE_SIZE) -> list:
                 where_parts.append("(message_text IS NOT NULL AND message_text != '')")
             if 'media_analysis' in cols:
                 where_parts.append("(media_analysis IS NOT NULL AND media_analysis != '')")
+            if 'content_text' in cols:
+                where_parts.append("(content_text IS NOT NULL AND content_text != '')")
 
             if not where_parts:
                 return []
 
             where_clause = " OR ".join(where_parts)
 
+            # Берём последние N сообщений БЕЗ фильтра по дате
             cur.execute(f"""
                 SELECT {', '.join(select_parts)}
                 FROM {table_name}
-                WHERE timestamp >= NOW() - INTERVAL '{ANALYSIS_MONTHS} months'
-                AND ({where_clause})
+                WHERE ({where_clause})
                 ORDER BY timestamp DESC
                 LIMIT {limit}
             """)
@@ -201,8 +203,9 @@ def get_chat_sample(conn, table_name: str, limit: int = SAMPLE_SIZE) -> list:
                     "from": r[0] or "?",
                     "text": (r[1] or "").strip(),
                     "analysis": (r[2] or "").strip(),
-                    "type": r[3] or "text",
-                    "date": r[4].strftime("%d.%m.%Y %H:%M") if r[4] else ""
+                    "content_text": (r[3] or "").strip(),
+                    "type": r[4] or "text",
+                    "date": r[5].strftime("%d.%m.%Y %H:%M") if r[5] else ""
                 }
                 results.append(msg)
 
@@ -221,12 +224,15 @@ def format_messages_for_prompt(messages: list) -> str:
         date = m["date"]
         text = m["text"]
         analysis = m["analysis"]
+        content_text = m.get("content_text", "")
 
         parts = []
         if text:
-            parts.append(text[:300])
+            parts.append(text[:400])
         if analysis:
-            parts.append(f"[Вложение: {analysis[:300]}]")
+            parts.append(f"[Анализ вложения: {analysis[:800]}]")
+        if content_text and content_text != text:
+            parts.append(f"[Текст документа: {content_text[:500]}]")
 
         content = " | ".join(parts) if parts else "[пустое сообщение]"
         lines.append(f"[{date}] {sender}: {content}")
@@ -370,7 +376,7 @@ def update_all_descriptions(force: bool = False, single_chat: str = None):
         messages = get_chat_sample(conn, table_name)
 
         if not messages:
-            logger.warning(f"  Нет сообщений за {ANALYSIS_MONTHS} мес., пропускаем")
+            logger.warning(f"  Нет сообщений с текстом/вложениями, пропускаем")
             skipped += 1
             continue
 
