@@ -506,19 +506,20 @@ def get_chat_list() -> list:
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT chat_id, chat_title, table_name, last_message_at
-                FROM tg_chats_metadata
-                WHERE table_name IS NOT NULL
-                ORDER BY last_message_at DESC NULLS LAST
-            """)
-            chats = []
-            for row in cur.fetchall():
-                chats.append({
-                    "chat_id": row[0],
-                    "title": row[1] or "",
-                    "table": row[2],
-                    "last_msg": row[3].strftime("%d.%m.%Y") if row[3] else "нет сообщений"
-                })
+                 SELECT chat_id, chat_title, table_name, last_message_at, description
+                 FROM tg_chats_metadata
+                 WHERE table_name IS NOT NULL
+                 ORDER BY last_message_at DESC NULLS LAST
+             """)
+             chats = []
+             for row in cur.fetchall():
+                 chats.append({
+                     "chat_id": row[0],
+                     "title": row[1] or "",
+                     "table": row[2],
+                     "last_msg": row[3].strftime("%d.%m.%Y") if row[3] else "нет сообщений",
+                     "description": row[4] or ""
+                 })
         conn.close()
         _chat_list_cache["data"] = chats
         _chat_list_cache["ts"] = now
@@ -530,13 +531,19 @@ def get_chat_list() -> list:
 
 
 def format_chat_list_for_llm() -> str:
-    """Форматирует список чатов для передачи в LLM Router."""
-    chats = get_chat_list()
-    lines = []
-    for c in chats:
-        if c["last_msg"] != "нет сообщений":
-            lines.append(f"- {c['title']} [{c['table']}] (посл.: {c['last_msg']})")
-    return "\n".join(lines)
+     """Форматирует список чатов для передачи в LLM Router."""
+     chats = get_chat_list()
+     lines = []
+     for c in chats:
+         if c["last_msg"] != "нет сообщений":
+             desc = c.get("description", "")
+             # Берём только первую строку описания (основное описание без keywords/roles)
+             short_desc = desc.split("\n")[0].strip() if desc else ""
+             if short_desc:
+                 lines.append(f"- {c['title']} [{c['table']}] (посл.: {c['last_msg']}) — {short_desc}")
+             else:
+                 lines.append(f"- {c['title']} [{c['table']}] (посл.: {c['last_msg']})")
+     return "\n".join(lines)
 
 
 def extract_time_context(question: str) -> dict:
