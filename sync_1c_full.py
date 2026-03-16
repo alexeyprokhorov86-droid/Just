@@ -134,6 +134,22 @@ def ensure_catalog_tables(conn):
                 )
             """)
             
+            # Склады
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_warehouses (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    code VARCHAR(50),
+                    name VARCHAR(500),
+                    warehouse_type VARCHAR(100),
+                    is_folder BOOLEAN DEFAULT FALSE,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    is_workshop_pantry BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
             # Должности
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS c1_positions (
@@ -1413,6 +1429,48 @@ class Sync1C:
         print(f"  ✅ Сохранено: {count} подразделений")
         return count
 
+    def sync_warehouses(self, conn):
+        """Синхронизация складов."""
+        print("\n[Склады]")
+        items = self.get_catalog_items("Catalog_Склады")
+        
+        if not items:
+            return 0
+        
+        count = 0
+        with conn.cursor() as cur:
+            for item in items:
+                try:
+                    cur.execute("""
+                        INSERT INTO c1_warehouses (ref_key, code, name, warehouse_type,
+                            is_folder, is_deleted, is_workshop_pantry, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (ref_key) DO UPDATE SET
+                            code = EXCLUDED.code,
+                            name = EXCLUDED.name,
+                            warehouse_type = EXCLUDED.warehouse_type,
+                            is_folder = EXCLUDED.is_folder,
+                            is_deleted = EXCLUDED.is_deleted,
+                            is_workshop_pantry = EXCLUDED.is_workshop_pantry,
+                            updated_at = NOW()
+                    """, (
+                        item.get('Ref_Key'),
+                        item.get('Code', ''),
+                        item.get('Description', ''),
+                        item.get('ТипСклада', ''),
+                        item.get('IsFolder', False),
+                        item.get('DeletionMark', False),
+                        item.get('ЦеховаяКладовая', False)
+                    ))
+                    count += 1
+                except Exception as e:
+                    print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {count} складов")
+        return count
+  
     def sync_positions(self, conn):
         """Синхронизация должностей."""
         print("\n[Должности]")
@@ -1667,6 +1725,7 @@ class Sync1C:
         ensure_units_table(conn)  # <-- ДОБАВЛЕНО
         
         self.sync_departments(conn)
+        self.sync_warehouses(conn)
         self.sync_positions(conn)
         self.sync_employees(conn)
         self.sync_cash_flow_items(conn)
