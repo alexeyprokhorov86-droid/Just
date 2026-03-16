@@ -149,7 +149,29 @@ def ensure_catalog_tables(conn):
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
             """)
-            
+
+            # Остатки на складах
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_stock_balance (
+                    id SERIAL PRIMARY KEY,
+                    warehouse_key VARCHAR(50) NOT NULL,
+                    nomenclature_key VARCHAR(50) NOT NULL,
+                    characteristic_key VARCHAR(50) DEFAULT '',
+                    quantity NUMERIC(15,3) DEFAULT 0,
+                    in_shipment NUMERIC(15,3) DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(warehouse_key, nomenclature_key, characteristic_key)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_stock_balance_warehouse
+                ON c1_stock_balance(warehouse_key)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_stock_balance_nomenclature
+                ON c1_stock_balance(nomenclature_key)
+            """)
+          
             # Должности
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS c1_positions (
@@ -1470,6 +1492,89 @@ class Sync1C:
         
         print(f"  ✅ Сохранено: {count} складов")
         return count
+
+    def sync_stock_balance(self, conn):
+        """Синхронизация остатков на складах (полная перезагрузка)."""
+        from urllib.parse import quote
+        
+        print("\n[Остатки на складах]")
+        
+        encoded = quote("AccumulationRegister_ТоварыНаСкладах", safe='_')
+        all_items = []
+        skip = 0
+        batch_size = 500
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}/Balance"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    print(f"    Ошибка HTTP: {r.status_code}")
+                    break
+                
+                items = r.json().get('value', [])
+                if not items:
+                    break
+                
+                all_items.extend(items)
+                print(f"    Загружено: {len(all_items)}...")
+                
+                if len(items) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего записей: {len(all_items)}")
+        
+        if not all_items:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE c1_stock_balance")
+            
+            count = 0
+            for item in all_items:
+                try:
+                    quantity = item.get('ВНаличииBalance', 0)
+                    in_shipment = item.get('ВОтгрузкеBalance', 0)
+                    
+                    if quantity == 0 and in_shipment == 0:
+                        continue
+                    
+                    cur.execute("""
+                        INSERT INTO c1_stock_balance (warehouse_key, nomenclature_key,
+                            characteristic_key, quantity, in_shipment, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (warehouse_key, nomenclature_key, characteristic_key) 
+                        DO UPDATE SET
+                            quantity = EXCLUDED.quantity,
+                            in_shipment = EXCLUDED.in_shipment,
+                            updated_at = NOW()
+                    """, (
+                        item.get('Склад_Key'),
+                        item.get('Номенклатура_Key'),
+                        item.get('Характеристика_Key') if item.get('Характеристика_Key') != EMPTY_UUID else '',
+                        quantity,
+                        in_shipment
+                    ))
+                    count += 1
+                except Exception as e:
+                    print(f"    Ошибка записи: {e}")
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {count} позиций с остатками")
+        return count
   
     def sync_positions(self, conn):
         """Синхронизация должностей."""
@@ -1726,6 +1831,7 @@ class Sync1C:
         
         self.sync_departments(conn)
         self.sync_warehouses(conn)
+        self.sync_stock_balance(conn)
         self.sync_positions(conn)
         self.sync_employees(conn)
         self.sync_cash_flow_items(conn)
@@ -4817,6 +4923,7 @@ def main_quick(sync, conn):
     sync.sync_sales(conn, date_from, date_to)
     sync.sync_customer_orders(conn, date_from, date_to)
     sync.sync_dispatch_orders(conn, date_from, date_to)
+    sync.sync_stock_balance(conn)
 
 
 def main_hourly(sync, conn):
