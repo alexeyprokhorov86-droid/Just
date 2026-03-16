@@ -171,6 +171,56 @@ def ensure_catalog_tables(conn):
                 CREATE INDEX IF NOT EXISTS idx_stock_balance_nomenclature
                 ON c1_stock_balance(nomenclature_key)
             """)
+
+            # Приобретения товаров и услуг
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_purchases (
+                    id SERIAL PRIMARY KEY,
+                    ref_key VARCHAR(50) UNIQUE NOT NULL,
+                    doc_number VARCHAR(50),
+                    doc_date DATE,
+                    posted BOOLEAN DEFAULT FALSE,
+                    organization_key VARCHAR(50),
+                    partner_key VARCHAR(50),
+                    warehouse_key VARCHAR(50),
+                    amount NUMERIC(15,2) DEFAULT 0,
+                    comment TEXT,
+                    is_deleted BOOLEAN DEFAULT FALSE,
+                    incoming_number VARCHAR(100),
+                    incoming_date DATE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS c1_purchase_items (
+                    id SERIAL PRIMARY KEY,
+                    doc_key VARCHAR(50) NOT NULL,
+                    line_number INTEGER,
+                    nomenclature_key VARCHAR(50),
+                    quantity NUMERIC(15,3) DEFAULT 0,
+                    price NUMERIC(15,2) DEFAULT 0,
+                    sum_total NUMERIC(15,2) DEFAULT 0,
+                    sum_with_vat NUMERIC(15,2) DEFAULT 0,
+                    vat_sum NUMERIC(15,2) DEFAULT 0,
+                    supplier_order_key VARCHAR(50),
+                    warehouse_key VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(doc_key, line_number)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_purchase_items_doc
+                ON c1_purchase_items(doc_key)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_purchase_items_nomenclature
+                ON c1_purchase_items(nomenclature_key)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_purchase_items_supplier_order
+                ON c1_purchase_items(supplier_order_key)
+            """)
           
             # Должности
             cur.execute("""
@@ -1078,6 +1128,132 @@ class Sync1C:
         print(f"  ✅ Сохранено: {count} записей кадровой истории")
         return count
 
+    def sync_purchases(self, conn, date_from, date_to):
+        """Синхронизация документов 'Приобретение товаров и услуг'."""
+        from urllib.parse import quote
+        
+        print("\n[Приобретения товаров]")
+        
+        date_from_str = date_from.strftime("%Y-%m-%dT00:00:00")
+        date_to_str = date_to.strftime("%Y-%m-%dT23:59:59")
+        
+        encoded = quote("Document_ПриобретениеТоваровУслуг", safe='_')
+        all_docs = []
+        skip = 0
+        batch_size = 100
+        
+        while True:
+            url = (
+                f"{self.base_url}/{encoded}"
+                f"?$format=json"
+                f"&$top={batch_size}"
+                f"&$skip={skip}"
+                f"&$filter=Date%20ge%20datetime'{date_from_str}'%20and%20Date%20le%20datetime'{date_to_str}'%20and%20Posted%20eq%20true"
+                f"&$orderby=Date%20desc"
+            )
+            
+            try:
+                r = self.session.get(url, timeout=120)
+                if r.status_code != 200:
+                    break
+                
+                docs = r.json().get('value', [])
+                docs = [sanitize_dict(doc) for doc in docs]
+                
+                if not docs:
+                    break
+                
+                all_docs.extend(docs)
+                print(f"    Загружено: {len(all_docs)}...")
+                
+                if len(docs) < batch_size:
+                    break
+                
+                skip += batch_size
+                time.sleep(0.2)
+            except Exception as e:
+                print(f"    Ошибка: {e}")
+                break
+        
+        print(f"    Всего документов: {len(all_docs)}")
+        
+        if not all_docs:
+            return 0
+        
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM c1_purchases WHERE doc_date BETWEEN %s AND %s",
+                (date_from, date_to)
+            )
+            
+            for doc in all_docs:
+                ref_key = doc.get('Ref_Key')
+                
+                incoming_date_raw = doc.get('ДатаВходящегоДокумента', '')
+                incoming_date = incoming_date_raw[:10] if incoming_date_raw and incoming_date_raw[:4] != '0001' else None
+                
+                cur.execute("""
+                    INSERT INTO c1_purchases (ref_key, doc_number, doc_date, posted,
+                        organization_key, partner_key, warehouse_key, amount,
+                        comment, is_deleted, incoming_number, incoming_date, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        doc_number = EXCLUDED.doc_number,
+                        doc_date = EXCLUDED.doc_date,
+                        amount = EXCLUDED.amount,
+                        is_deleted = EXCLUDED.is_deleted,
+                        incoming_number = EXCLUDED.incoming_number,
+                        incoming_date = EXCLUDED.incoming_date,
+                        updated_at = NOW()
+                """, (
+                    ref_key,
+                    doc.get('Number', '').strip(),
+                    doc.get('Date', '')[:10],
+                    doc.get('Posted', False),
+                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
+                    doc.get('Склад_Key') if doc.get('Склад_Key') != EMPTY_UUID else None,
+                    doc.get('СуммаДокумента', 0),
+                    doc.get('Комментарий', ''),
+                    doc.get('DeletionMark', False),
+                    doc.get('НомерВходящегоДокумента', ''),
+                    incoming_date
+                ))
+                
+                # Удаляем старые позиции
+                cur.execute("DELETE FROM c1_purchase_items WHERE doc_key = %s", (ref_key,))
+                
+                for item in doc.get('Товары', []):
+                    cur.execute("""
+                        INSERT INTO c1_purchase_items (doc_key, line_number,
+                            nomenclature_key, quantity, price, sum_total,
+                            sum_with_vat, vat_sum, supplier_order_key, warehouse_key)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (doc_key, line_number) DO UPDATE SET
+                            quantity = EXCLUDED.quantity,
+                            price = EXCLUDED.price,
+                            sum_total = EXCLUDED.sum_total,
+                            sum_with_vat = EXCLUDED.sum_with_vat,
+                            vat_sum = EXCLUDED.vat_sum,
+                            supplier_order_key = EXCLUDED.supplier_order_key
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Номенклатура_Key') if item.get('Номенклатура_Key') != EMPTY_UUID else None,
+                        item.get('Количество', 0),
+                        item.get('Цена', 0),
+                        item.get('Сумма', 0),
+                        item.get('СуммаСНДС', 0),
+                        item.get('СуммаНДС', 0),
+                        item.get('ЗаказПоставщику_Key') if item.get('ЗаказПоставщику_Key') != EMPTY_UUID else None,
+                        item.get('Склад_Key') if item.get('Склад_Key') != EMPTY_UUID else None
+                    ))
+            
+            conn.commit()
+        
+        print(f"  ✅ Сохранено: {len(all_docs)} приобретений")
+        return len(all_docs)
+    
     def sync_planned_accruals(self, conn):
         """Синхронизация плановых начислений (оклад/тариф)."""
         from urllib.parse import quote
@@ -4943,6 +5119,7 @@ def main_hourly(sync, conn):
     sync.sync_cost_allocation(conn, date_from, date_to)
     sync.sync_material_orders(conn, date_from, date_to)
     sync.sync_material_transfers(conn, date_from, date_to)
+    sync.sync_purchases(conn, date_from, date_to)
 
 
 def main_daily(sync, conn):
