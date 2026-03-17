@@ -234,6 +234,23 @@ def save_message(table_name: str, message_data: dict):
                     content_text = EXCLUDED.content_text
             """).format(sql.Identifier(table_name)), message_data)
             conn.commit()
+            # Canonical zone
+            try:
+                from canonical_helper import insert_source_document_tg
+                chat_meta_cur = conn.cursor()
+                chat_meta_cur.execute(
+                    "SELECT chat_title FROM tg_chats_metadata WHERE table_name = %s",
+                    (table_name,)
+                )
+                row = chat_meta_cur.fetchone()
+                chat_title = row[0] if row else table_name
+                chat_meta_cur.close()
+                
+                with conn.cursor() as canon_cur:
+                    insert_source_document_tg(canon_cur, table_name, chat_title, message_data)
+                    conn.commit()
+            except Exception as e:
+                logger.warning(f"Canonical insert error: {e}")
     finally:
         conn.close()
 
