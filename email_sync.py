@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Email Sync Service - Синхронизация почтовых ящиков.
 Запускается отдельным процессом параллельно с ботом.
@@ -1191,6 +1190,16 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
     row = cur.fetchone()
     if row:
         email_id = row[0]
+        # Canonical zone
+        try:
+            from canonical_helper import insert_source_document_email
+            cur.execute("SELECT email FROM monitored_mailboxes WHERE id = %s", (mailbox_id,))
+            mb_row = cur.fetchone()
+            mb_email = mb_row[0] if mb_row else f'mailbox_{mailbox_id}'
+            insert_source_document_email(cur, email_id, parsed, mb_email, direction)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Canonical email insert error: {e}")
 
         # Сохраняем вложения (bucket/local)
         if parsed.has_attachments and parsed.attachments:
