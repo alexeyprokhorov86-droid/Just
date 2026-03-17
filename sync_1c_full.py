@@ -4924,96 +4924,6 @@ class Sync1C:
         cur.close()
         print(f"  Сохранено {len(records)} записей о продажах")
     
-    # ========== ЗАКУПКИ ==========
-    
-    def sync_purchases(self, conn, date_from, date_to):
-        """Синхронизация закупок (из старого скрипта)"""
-        print("\n[ЗАКУПКИ]")
-        
-        docs = self.get_all_documents("Document_ПриобретениеТоваровУслуг")
-        
-        # Фильтруем по дате
-        filtered = []
-        for doc in docs:
-            doc_date_str = doc.get('Date', '')[:10]
-            try:
-                doc_date = datetime.strptime(doc_date_str, "%Y-%m-%d").date()
-                if date_from <= doc_date <= date_to:
-                    filtered.append(doc)
-            except:
-                continue
-        
-        print(f"  После фильтрации: {len(filtered)} документов")
-        
-        records = []
-        for doc in filtered:
-            doc_date = doc.get('Date', '')[:10]
-            doc_number = doc.get('Number', '').strip()
-            
-            contractor_key = doc.get('Контрагент_Key', '')
-            contractor_name = self.get_name_by_key(
-                self.contractors_cache, "Catalog_Контрагенты", contractor_key
-            )
-            
-            for item in doc.get('Товары', []):
-                nom_key = item.get('Номенклатура_Key', '')
-                nom_name = self.get_name_by_key(
-                    self.nomenclature_cache, "Catalog_Номенклатура", nom_key
-                )
-                
-                quantity = float(item.get('Количество', 0) or 0)
-                price = float(item.get('Цена', 0) or 0)
-                summa = float(item.get('СуммаСНДС', 0) or item.get('Сумма', 0) or 0)
-                
-                if quantity > 0:
-                    records.append({
-                        'doc_date': doc_date,
-                        'doc_number': doc_number,
-                        'contractor_id': contractor_key if contractor_key != EMPTY_UUID else None,
-                        'contractor_name': contractor_name,
-                        'nomenclature_id': nom_key if nom_key != EMPTY_UUID else None,
-                        'nomenclature_name': nom_name,
-                        'quantity': round(quantity, 3),
-                        'price': round(price, 2),
-                        'sum_total': round(summa, 2),
-                    })
-        
-        print(f"  Извлечено {len(records)} записей о закупках")
-        
-        if records:
-            self._save_purchases(conn, records, date_from, date_to)
-    
-    def _save_purchases(self, conn, records, date_from, date_to):
-        """Сохранение закупок в PostgreSQL"""
-        cur = conn.cursor()
-        
-        cur.execute(
-            "DELETE FROM purchase_prices WHERE doc_date BETWEEN %s AND %s",
-            (date_from, date_to)
-        )
-        
-        values = [
-            (
-                r['doc_date'], r['doc_number'], r['contractor_id'], r['contractor_name'],
-                r['nomenclature_id'], r['nomenclature_name'], r['quantity'], r['price'], r['sum_total']
-            )
-            for r in records
-        ]
-        
-        execute_values(
-            cur,
-            """INSERT INTO purchase_prices 
-               (doc_date, doc_number, contractor_id, contractor_name, 
-                nomenclature_id, nomenclature_name, quantity, price, sum_total)
-               VALUES %s""",
-            values
-        )
-        
-        conn.commit()
-        cur.close()
-        print(f"  Сохранено {len(records)} записей о закупках")
-
-
 # ============================================================
 # ГЛАВНАЯ ФУНКЦИЯ
 # ============================================================
@@ -5119,9 +5029,7 @@ def main_hourly(sync, conn):
     sync.sync_cost_allocation(conn, date_from, date_to)
     sync.sync_material_orders(conn, date_from, date_to)
     sync.sync_material_transfers(conn, date_from, date_to)
-    sync.sync_purchases(conn, date_from, date_to)
-
-
+   
 def main_daily(sync, conn):
     """Ежедневная синхронизация — все документы за 7 дней."""
     print("\n" + "=" * 60)
