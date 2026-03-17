@@ -152,7 +152,7 @@ def migrate_email(conn, batch_size=2000):
         cur.close()
         return 0
     
-    cur.execute("SELECT id, email_address FROM monitored_mailboxes")
+    cur.execute("SELECT id, email FROM monitored_mailboxes")
     mailboxes = {r[0]: r[1] for r in cur.fetchall()}
     
     total_inserted = 0
