@@ -85,7 +85,7 @@ def call_llm(messages, temperature=0.1):
         'Authorization': f'Bearer {ROUTER_AI_KEY}'
     }
     payload = {
-        'model': 'gpt-4.1-mini',
+        'model': 'openai/gpt-4.1-mini',
         'messages': messages,
         'temperature': temperature,
         'max_tokens': 4000
