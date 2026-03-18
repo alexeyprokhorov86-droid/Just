@@ -1237,7 +1237,8 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
         thread_id, mailbox_id, folder, direction,
         parsed.from_address, parsed.to_addresses, parsed.cc_addresses,
         parsed.subject, parsed.subject_normalized, parsed.body_text, parsed.body_html,
-        parsed.has_attachments, parsed.received_at
+        parsed.has_attachments, parsed.received_at,
+        classify_email_category(parsed.from_address, str(parsed.to_addresses), '')
     ))
     
     # Получаем ID нового сообщения
