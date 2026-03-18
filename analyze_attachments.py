@@ -479,6 +479,15 @@ def update_attachment_status(conn, att_id, status, content_text=None, analysis_t
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
+    # Защита от одновременного запуска
+    import fcntl
+    lock_file = open('/tmp/analyze_attachments.lock', 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        logger.info("Already running, exiting")
+        return
+    
     parser = argparse.ArgumentParser(description='Analyze email attachments from S3')
     parser.add_argument('--batch', type=int, default=None, help='Number of files to process')
     parser.add_argument('--type', type=str, default=None, 
