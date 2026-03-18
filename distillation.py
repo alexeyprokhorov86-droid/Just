@@ -229,6 +229,11 @@ def resolve_entity(cur, name, entity_type=None):
         """, (entity_type, name[:255]))
         row = cur.fetchone()
         if row:
+            try:
+                emb = create_embedding(name)
+                cur.execute("UPDATE km_entities SET embedding = %s WHERE id = %s", (str(emb), row[0]))
+            except Exception:
+                pass
             return row[0]
     except Exception:
         pass
