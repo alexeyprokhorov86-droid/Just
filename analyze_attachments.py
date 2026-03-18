@@ -62,8 +62,9 @@ ROUTERAI_API_KEY = os.getenv('ROUTERAI_API_KEY')
 ROUTERAI_BASE_URL = os.getenv('ROUTERAI_BASE_URL', 'https://routerai.ru/api/v1')
 
 # LLM модели
-TEXT_MODEL = 'gpt-4.1-mini'       # для анализа текста
-VISION_MODEL = 'gpt-4.1-mini'     # для анализа изображений
+
+TEXT_MODEL = 'openai/gpt-4.1-mini' # для анализа текста
+VISION_MODEL = 'openai/gpt-4.1-mini'  # для анализа картинок
 
 # Лимиты
 MAX_TEXT_FOR_LLM = 8000           # макс символов текста для отправки в LLM
