@@ -563,6 +563,55 @@ def find_sent_folder(conn: imaplib.IMAP4_SSL) -> Optional[str]:
     
     return None
 
+# ── Email & Attachment Classification ─────────────────────────────────────
+
+def classify_email_category(from_address: str, to_addresses: str, mailbox_email: str) -> str:
+    """Определяет категорию письма при вставке."""
+    from_lower = (from_address or "").lower()
+    our_domains = ['totsamiy.com', 'lacannelle.ru']
+    
+    # own_notifications — наш noreply
+    if from_lower == 'noreply@totsamiy.com':
+        return 'own_notifications'
+    
+    # system — mailer-daemon, postmaster, ediweb
+    system_patterns = ['mailer-daemon@', 'postmaster@', 'do_not_reply@ediweb']
+    if any(p in from_lower for p in system_patterns):
+        return 'system'
+    
+    # external_auto — внешние noreply/no-reply
+    auto_patterns = ['noreply@', 'no-reply@', 'no_reply@', 'donotreply@', 'do-not-reply@']
+    is_our_domain = any(d in from_lower for d in our_domains)
+    if not is_our_domain and any(p in from_lower for p in auto_patterns):
+        return 'external_auto'
+    
+    # internal — от наших доменов
+    if is_our_domain:
+        return 'internal'
+    
+    # external_business — всё остальное
+    return 'external_business'
+
+
+def classify_attachment_status(filename: str, size_bytes: int, content_type: str) -> str:
+    """Определяет analysis_status вложения: pending или skip_junk."""
+    fname_lower = (filename or "").lower()
+    ctype_lower = (content_type or "").lower()
+    
+    # Мусорные расширения
+    junk_extensions = ['.gif', '.bmp', '.mso', '.dat', '.htm']
+    if any(fname_lower.endswith(ext) for ext in junk_extensions):
+        return 'skip_junk'
+    
+    # image001/image002 и т.д. < 50KB — подписи в письмах
+    if fname_lower.startswith('image00') and (size_bytes or 0) < 50000:
+        return 'skip_junk'
+    
+    # Файлы без имени или без расширения < 1KB
+    if not filename or (not '.' in filename and (size_bytes or 0) < 1000):
+        return 'skip_junk'
+    
+    return 'pending'
 
 # ============================================================
 # РАБОТА С ВЕТКАМИ
@@ -1116,7 +1165,12 @@ def store_email_attachments(cur, email_id: int, parsed: ParsedEmail) -> tuple[in
                 elif local_error:
                     storage_error = local_error
 
-        analysis_status = "pending" if storage_path else "failed"
+        if storage_path:
+            analysis_status = classify_attachment_status(
+                attachment.filename, attachment.size_bytes, attachment.content_type
+            )
+        else:
+            analysis_status = "failed"
 
         cur.execute(
             """
@@ -1172,9 +1226,9 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
             thread_id, mailbox_id, folder, direction,
             from_address, to_addresses, cc_addresses,
             subject, subject_normalized, body_text, body_html,
-            has_attachments, received_at
+            has_attachments, received_at, category
         ) VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         )
         ON CONFLICT (mailbox_id, folder, message_uid) DO NOTHING
         RETURNING id
