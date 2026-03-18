@@ -240,6 +240,10 @@ def get_unprocessed_docs(conn, batch_size=10, source_kind='telegram_message', mi
         WHERE source_kind = %s
         AND LENGTH(body_text) >= %s
         AND (meta->>'distilled') IS NULL
+        AND (
+            source_kind != 'email_message'
+            OR meta->>'email_category' IN ('internal', 'external_business')
+        )
         ORDER BY doc_date DESC
         LIMIT %s
     """, (source_kind, min_length, batch_size))
