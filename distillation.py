@@ -542,6 +542,15 @@ def run_distillation(source_kind='telegram_message', min_length=100,
 
 if __name__ == '__main__':
     import sys
+    import fcntl
+    
+    # Защита от одновременного запуска
+    lock_file = open('/tmp/distillation.lock', 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        print("Distillation уже запущен, выходим")
+        sys.exit(0)
     
     source = sys.argv[1] if len(sys.argv) > 1 else 'telegram_message'
     max_b = int(sys.argv[2]) if len(sys.argv) > 2 else 20
