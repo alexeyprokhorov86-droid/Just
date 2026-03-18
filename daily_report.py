@@ -319,6 +319,38 @@ def generate_report() -> str:
     report_parts.append(f"  • Telegram: {db_stats.get('telegram_total', 0):,} сообщений")
     report_parts.append(f"  • Закрыто цепочек: {db_stats.get('threads_closed_24h', 0)} за 24ч")
     report_parts.append(f"  • Активных ящиков: {db_stats.get('active_mailboxes', 0)}\n")
+    # === Email фильтрация ===
+    report_parts.append("📧 <b>Email за 24ч:</b>")
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT category, COUNT(*) FROM email_messages
+                WHERE received_at > NOW() - INTERVAL '24 hours'
+                GROUP BY category ORDER BY COUNT(*) DESC
+            """)
+            for row in cur.fetchall():
+                cat, cnt = row
+                emoji = {'internal': '👥', 'external_business': '💼', 
+                         'own_notifications': '🔔', 'system': '⚙️', 
+                         'external_auto': '📨'}.get(cat or '', '❓')
+                report_parts.append(f"  {emoji} {cat or 'без категории'}: {cnt}")
+            
+            cur.execute("""
+                SELECT analysis_status, COUNT(*) FROM email_attachments
+                WHERE created_at > NOW() - INTERVAL '24 hours'
+                GROUP BY analysis_status ORDER BY COUNT(*) DESC
+            """)
+            att_rows = cur.fetchall()
+            if att_rows:
+                report_parts.append("  📎 Вложения:")
+                for row in att_rows:
+                    status, cnt = row
+                    report_parts.append(f"    • {status}: {cnt}")
+        conn.close()
+    except Exception as e:
+        report_parts.append(f"  ⚠️ Ошибка: {e}")
+    report_parts.append("")
     
     # === RouterAI ===
     routerai = get_routerai_usage()
