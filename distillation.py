@@ -9,6 +9,7 @@ import os
 import time
 import requests
 from dotenv import load_dotenv
+from embedding_service import create_embedding
 
 load_dotenv('/home/admin/telegram_logger_bot/.env')
 
@@ -184,6 +185,11 @@ def save_extraction(cur, extracted, doc_ids):
             fact.get('confidence', 0.8)
         ))
         stats['facts'] += 1
+        try:
+            emb = create_embedding(fact.get('text', ''))
+            cur.execute("UPDATE km_facts SET embedding = %s WHERE id = currval('km_facts_id_seq')", (str(emb),))
+        except Exception:
+            pass
     
     # Решения
     for dec in extracted.get('decisions', []):
@@ -202,6 +208,11 @@ def save_extraction(cur, extracted, doc_ids):
             dec.get('importance', 0.5)
         ))
         stats['decisions'] += 1
+        try:
+            emb = create_embedding(dec.get('text', ''))
+            cur.execute("UPDATE km_decisions SET embedding = %s WHERE id = currval('km_decisions_id_seq')", (str(emb),))
+        except Exception:
+            pass
     
     # Связи
     for rel in extracted.get('relations', []):
@@ -237,6 +248,11 @@ def save_extraction(cur, extracted, doc_ids):
             deadline
         ))
         stats['tasks'] += 1
+        try:
+            emb = create_embedding(task.get('task_text', ''))
+            cur.execute("UPDATE km_tasks SET embedding = %s WHERE id = currval('km_tasks_id_seq')", (str(emb),))
+        except Exception:
+            pass
         
     # Сохраняем evidence — связь с документами
     for doc_id in doc_ids:
