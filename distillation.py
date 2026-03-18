@@ -215,7 +215,29 @@ def save_extraction(cur, extracted, doc_ids):
                 ON CONFLICT DO NOTHING
             """, (from_id, rel.get('relation', 'related_to'), to_id))
             stats['relations'] += 1
-    
+     # Задачи
+    for task in extracted.get('tasks', []):
+        assignee_id = resolve_entity(cur, task.get('assignee'), 'employee')
+        deadline = None
+        if task.get('deadline'):
+            try:
+                from datetime import datetime
+                deadline = datetime.strptime(task['deadline'], '%Y-%m-%d').date()
+            except:
+                pass
+        
+        cur.execute("""
+            INSERT INTO km_tasks (task_text, assignee_entity_id, source_document_id,
+                deadline, confidence)
+            VALUES (%s, %s, %s, %s, 0.8)
+        """, (
+            task.get('task_text', '')[:500],
+            assignee_id,
+            doc_ids[0] if doc_ids else None,
+            deadline
+        ))
+        stats['tasks'] += 1
+        
     # Сохраняем evidence — связь с документами
     for doc_id in doc_ids:
         for fact_type in ['facts', 'decisions']:
