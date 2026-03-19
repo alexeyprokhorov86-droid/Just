@@ -445,7 +445,7 @@ def save_extraction(cur, extracted, doc_ids):
     return stats
 
 
-def get_unprocessed_docs(conn, batch_size=10, source_kind='telegram_message', min_length=100):
+def get_unprocessed_docs(conn, batch_size=10, source_kind='telegram_message', min_length=25):
     """Получить необработанные документы."""
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     
@@ -480,7 +480,7 @@ def mark_as_processed(cur, doc_ids):
         """, (doc_id,))
 
 
-def run_distillation(source_kind='telegram_message', min_length=100, 
+def run_distillation(source_kind='telegram_message', min_length=25, 
                      batch_size=5, max_batches=50):
     """Основной цикл distillation."""
     conn = psycopg2.connect(**CONFIG_PG)
