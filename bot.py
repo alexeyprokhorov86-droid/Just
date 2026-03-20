@@ -3025,7 +3025,12 @@ def main():
         return
 
     from telegram.request import HTTPXRequest
-    request = HTTPXRequest(read_timeout=120, write_timeout=120, connect_timeout=30)
+    request = HTTPXRequest(
+        read_timeout=120,
+        write_timeout=120,
+        connect_timeout=30,
+        proxy="socks5://127.0.0.1:1080"
+    )
     application = Application.builder().token(BOT_TOKEN).request(request).build()
 
     # Инициализация планировщика для отложенного анализа документов
