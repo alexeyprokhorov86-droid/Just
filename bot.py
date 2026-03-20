@@ -1360,23 +1360,8 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
 
         # Скачиваем файл
         file_data = await file.download_as_bytearray()
-        # Сохраняем на S3
-        storage_path = ""
-        try:
-            from email_sync import get_s3_client
-            import hashlib
-            s3 = get_s3_client()
-            if s3:
-                bucket = os.getenv("ATTACHMENTS_BUCKET_NAME", "")
-                if bucket:
-                    digest = hashlib.sha256(bytes(file_data)).hexdigest()[:16]
-                    safe_fn = filename.replace("/", "_").replace("\\", "_") or "file"
-                    s3_key = f"tg_attachments/{table_name or 'unknown'}/{message.message_id}/{digest}_{safe_fn}"
-                    s3.put_object(Bucket=bucket, Key=s3_key, Body=bytes(file_data))
-                    storage_path = f"s3://{bucket}/{s3_key}"
-                    logger.info(f"Файл сохранён в S3: {storage_path}")
-        except Exception as e:
-            logger.warning(f"S3 upload error: {e}")
+        
+        # S3 upload выполняется ночью через migrate_tg_to_s3.py / audit_pipeline.py
             
         # Получаем полный контекст чата (8 дней = 192 часа)
         context = ""
