@@ -1678,7 +1678,16 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("📋 Полный анализ", callback_data=f"full_{message.message_id}")]
                 ])
                 
-                await message.reply_text(f"📄 Анализ{filename}:\n\n{summary}", reply_markup=keyboard)
+                for attempt in range(3):
+                    try:
+                        await message.reply_text(f"📄 Анализ{filename}:\n\n{summary}", reply_markup=keyboard)
+                        break
+                    except Exception as retry_e:
+                        if attempt < 2:
+                            import asyncio
+                            await asyncio.sleep(2)
+                        else:
+                            raise retry_e
                 
                 # Рассылка полного анализа в личку тем, кто включил
                 if len(media_analysis) > 400:  # Только если есть что добавить
