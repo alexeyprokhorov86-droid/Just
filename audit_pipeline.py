@@ -305,7 +305,7 @@ def find_tg_missing(conn):
                     'table': tbl,
                     'message_id': row[0],
                     'file_id': row[1],
-                    'message_type': row[2] or '',
+                    'media_type': row[2] or '',
                     'timestamp': row[3],
                     'has_analysis': bool(row[4] and row[4].strip()),
                     'has_content': bool(row[5] and row[5].strip()),
