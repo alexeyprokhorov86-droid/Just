@@ -1634,6 +1634,7 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Анализируем медиа если есть (кроме группы с отложенным анализом)
     media_analysis = ""
     content_text = ""
+    storage_path = ""
     if message.photo or message.video or message.voice or message.audio or (message.document and (message.document.mime_type or message.document.file_name)):
         # Для группы "Торты Отгрузки" не анализируем сразу - анализ будет в конце дня
         if not is_delayed_chat:
@@ -1746,9 +1747,8 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "forward_from_user_id": None,
         "media_file_id": media_file_id,
         "media_analysis": media_analysis,
-        storage_path = ""
         "content_text": content_text,
-        "storage_path": storage_path if 'storage_path' in dir() else "",
+        "storage_path": storage_path,
         "timestamp": message.date
     }
 
