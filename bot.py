@@ -3024,7 +3024,9 @@ def main():
         logger.error("DB_PASSWORD не установлен в .env!")
         return
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(read_timeout=120, write_timeout=120, connect_timeout=30)
+    application = Application.builder().token(BOT_TOKEN).request(request).build()
 
     # Инициализация планировщика для отложенного анализа документов
     
