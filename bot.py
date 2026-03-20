@@ -233,7 +233,7 @@ def save_message(table_name: str, message_data: dict):
                     message_text = EXCLUDED.message_text,
                     media_analysis = EXCLUDED.media_analysis,
                     content_text = EXCLUDED.content_text,
-                    storage_path = COALESCE(EXCLUDED.storage_path, storage_path)
+                    storage_path = EXCLUDED.storage_path
             """).format(sql.Identifier(table_name)), message_data)
             conn.commit()
             # Canonical zone
