@@ -67,7 +67,7 @@ ROUTERAI_BASE_URL = os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1")
 
 gpt_client = None
 if ROUTERAI_API_KEY:
-    gpt_client = OpenAI(api_key=ROUTERAI_API_KEY, base_url=ROUTERAI_BASE_URL)
+    gpt_client = OpenAI(api_key=ROUTERAI_API_KEY, base_url=ROUTERAI_BASE_URL, timeout=400)
     logger.info("GPT-4.1 через RouterAI активирован")
 else:
     logger.warning("ROUTERAI_API_KEY не установлен - анализ документов отключён")
