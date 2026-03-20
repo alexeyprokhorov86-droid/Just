@@ -292,7 +292,7 @@ def find_tg_missing(conn):
             continue
         try:
             cur.execute(f"""
-                SELECT message_id, media_file_id, media_type, timestamp,
+                SELECT message_id, media_file_id, message_type, timestamp,
                        media_analysis, content_text, storage_path
                 FROM {tbl}
                 WHERE media_file_id IS NOT NULL AND media_file_id != ''
@@ -305,7 +305,7 @@ def find_tg_missing(conn):
                     'table': tbl,
                     'message_id': row[0],
                     'file_id': row[1],
-                    'media_type': row[2] or '',
+                    'message_type': row[2] or '',
                     'timestamp': row[3],
                     'has_analysis': bool(row[4] and row[4].strip()),
                     'has_content': bool(row[5] and row[5].strip()),
@@ -378,9 +378,7 @@ def audit_email_attachments(conn):
     cur = conn.cursor()
     cur.execute("""
         SELECT COUNT(*) FROM email_attachments 
-        WHERE NOT is_junk
-          AND (content_text IS NULL OR content_text = '')
-          AND (analysis_text IS NULL OR analysis_text = '')
+        WHERE analysis_status = 'pending'
     """)
     count = cur.fetchone()[0]
     cur.close()
