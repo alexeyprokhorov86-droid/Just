@@ -132,6 +132,7 @@ def ensure_table_exists(chat_id: int, chat_title: str) -> str:
                     media_file_id TEXT,
                     media_analysis TEXT,
                     content_text TEXT,
+                    storage_path TEXT,
                     timestamp TIMESTAMPTZ NOT NULL,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE(message_id)
