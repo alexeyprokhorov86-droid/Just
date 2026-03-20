@@ -13,7 +13,6 @@ import os
 import re
 import logging
 import base64
-import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -133,7 +132,6 @@ def ensure_table_exists(chat_id: int, chat_title: str) -> str:
                     media_file_id TEXT,
                     media_analysis TEXT,
                     content_text TEXT,
-                    storage_path TEXT,
                     timestamp TIMESTAMPTZ NOT NULL,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE(message_id)
@@ -224,17 +222,16 @@ def save_message(table_name: str, message_data: dict):
                 INSERT INTO {} (
                     message_id, user_id, username, first_name, last_name,
                     message_text, message_type, reply_to_message_id,
-                    forward_from_user_id, media_file_id, media_analysis, content_text, storage_path, timestamp
+                    forward_from_user_id, media_file_id, media_analysis, content_text, timestamp
                 ) VALUES (
                     %(message_id)s, %(user_id)s, %(username)s, %(first_name)s, %(last_name)s,
                     %(message_text)s, %(message_type)s, %(reply_to_message_id)s,
-                    %(forward_from_user_id)s, %(media_file_id)s, %(media_analysis)s, %(content_text)s, %(storage_path)s, %(timestamp)s
+                    %(forward_from_user_id)s, %(media_file_id)s, %(media_analysis)s, %(content_text)s, %(timestamp)s
                 )
                 ON CONFLICT (message_id) DO UPDATE SET
                     message_text = EXCLUDED.message_text,
                     media_analysis = EXCLUDED.media_analysis,
-                    content_text = EXCLUDED.content_text,
-                    storage_path = EXCLUDED.storage_path
+                    content_text = EXCLUDED.content_text
             """).format(sql.Identifier(table_name)), message_data)
             conn.commit()
             # Canonical zone
@@ -1277,7 +1274,7 @@ async def analyze_video_with_whisper(file_data: bytes, filename: str = "", conte
 # ОБРАБОТКА МЕДИАФАЙЛОВ
 # ============================================================
 
-async def download_and_analyze_media(bot, message, table_name: str = None) -> tuple[str, str, str, str]:
+async def download_and_analyze_media(bot, message, table_name: str = None) -> tuple[str, str, str]:
     """Скачивает и анализирует медиафайл с учётом контекста чата.
 
     Возвращает: (media_type_str, media_analysis, content_text)
@@ -1285,7 +1282,6 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
     media_analysis = ""
     content_text = ""
     media_type_str = "media"
-    storage_path = ""
 
     try:
         file = None
@@ -1315,7 +1311,7 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
                 filename = "video.mp4"
             else:
                 logger.warning("Видео слишком большое для анализа")
-                return "video", "", "", ""
+                return "video", "", ""
         elif message.document:
             doc = message.document
             filename = doc.file_name or ""
@@ -1348,21 +1344,19 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
                     media_type_str = "video"
                 else:
                     logger.warning("Видео слишком большое для анализа")
-                    return "video", "", "", ""
+                    return "video", "", ""
             else:
                 media_type_str = "document"
-                return media_type_str, "", "", ""
+                return media_type_str, "", ""
         else:
-            return media_type_str, "", "", ""
+            return media_type_str, "", ""
 
         if not file:
-            return media_type_str, "", "", ""
+            return media_type_str, "", ""
 
         # Скачиваем файл
         file_data = await file.download_as_bytearray()
-        
-        # S3 upload выполняется ночью через migrate_tg_to_s3.py / audit_pipeline.py
-            
+
         # Получаем полный контекст чата (8 дней = 192 часа)
         context = ""
         if table_name and message.chat:
@@ -1452,7 +1446,7 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
         except Exception as e:
             logger.debug(f"Fact extraction error: {e}")
 
-    return media_type_str, media_analysis, content_text, storage_path
+    return media_type_str, media_analysis, content_text
 
 
 def determine_message_type(message) -> tuple[str, str | None]:
@@ -1621,11 +1615,10 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Анализируем медиа если есть (кроме группы с отложенным анализом)
     media_analysis = ""
     content_text = ""
-    storage_path = ""
     if message.photo or message.video or message.voice or message.audio or (message.document and (message.document.mime_type or message.document.file_name)):
         # Для группы "Торты Отгрузки" не анализируем сразу - анализ будет в конце дня
         if not is_delayed_chat:
-            analyzed_type, media_analysis, content_text, storage_path = await download_and_analyze_media(context.bot, message, table_name)
+            analyzed_type, media_analysis, content_text = await download_and_analyze_media(context.bot, message, table_name)
             if analyzed_type != "media":
                 message_type = analyzed_type
         else:
@@ -1664,15 +1657,7 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("📋 Полный анализ", callback_data=f"full_{message.message_id}")]
                 ])
                 
-                for _attempt in range(3):
-                    try:
-                        await message.reply_text(f"📄 Анализ{filename}:\n\n{summary}", reply_markup=keyboard)
-                        break
-                    except Exception as _retry_e:
-                        if _attempt < 2:
-                            await asyncio.sleep(3)
-                        else:
-                            logger.error(f"Не удалось отправить анализ после 3 попыток: {_retry_e}")
+                await message.reply_text(f"📄 Анализ{filename}:\n\n{summary}", reply_markup=keyboard)
                 
                 # Рассылка полного анализа в личку тем, кто включил
                 if len(media_analysis) > 400:  # Только если есть что добавить
@@ -1743,7 +1728,6 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "media_file_id": media_file_id,
         "media_analysis": media_analysis,
         "content_text": content_text,
-        "storage_path": storage_path,
         "timestamp": message.date
     }
 
@@ -3040,9 +3024,7 @@ def main():
         logger.error("DB_PASSWORD не установлен в .env!")
         return
 
-    from telegram.request import HTTPXRequest
-    request = HTTPXRequest(read_timeout=120, write_timeout=120, connect_timeout=30)
-    application = Application.builder().token(BOT_TOKEN).request(request).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
     # Инициализация планировщика для отложенного анализа документов
     
