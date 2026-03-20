@@ -1284,6 +1284,7 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
     media_analysis = ""
     content_text = ""
     media_type_str = "media"
+    storage_path = ""
 
     try:
         file = None
