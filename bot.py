@@ -223,16 +223,17 @@ def save_message(table_name: str, message_data: dict):
                 INSERT INTO {} (
                     message_id, user_id, username, first_name, last_name,
                     message_text, message_type, reply_to_message_id,
-                    forward_from_user_id, media_file_id, media_analysis, content_text, timestamp
+                    forward_from_user_id, media_file_id, media_analysis, content_text, storage_path, timestamp
                 ) VALUES (
                     %(message_id)s, %(user_id)s, %(username)s, %(first_name)s, %(last_name)s,
                     %(message_text)s, %(message_type)s, %(reply_to_message_id)s,
-                    %(forward_from_user_id)s, %(media_file_id)s, %(media_analysis)s, %(content_text)s, %(timestamp)s
+                    %(forward_from_user_id)s, %(media_file_id)s, %(media_analysis)s, %(content_text)s, %(storage_path)s, %(timestamp)s
                 )
                 ON CONFLICT (message_id) DO UPDATE SET
                     message_text = EXCLUDED.message_text,
                     media_analysis = EXCLUDED.media_analysis,
-                    content_text = EXCLUDED.content_text
+                    content_text = EXCLUDED.content_text,
+                    storage_path = COALESCE(EXCLUDED.storage_path, storage_path)
             """).format(sql.Identifier(table_name)), message_data)
             conn.commit()
             # Canonical zone
@@ -1275,7 +1276,7 @@ async def analyze_video_with_whisper(file_data: bytes, filename: str = "", conte
 # ОБРАБОТКА МЕДИАФАЙЛОВ
 # ============================================================
 
-async def download_and_analyze_media(bot, message, table_name: str = None) -> tuple[str, str, str]:
+async def download_and_analyze_media(bot, message, table_name: str = None) -> tuple[str, str, str, str]:
     """Скачивает и анализирует медиафайл с учётом контекста чата.
 
     Возвращает: (media_type_str, media_analysis, content_text)
@@ -1312,7 +1313,7 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
                 filename = "video.mp4"
             else:
                 logger.warning("Видео слишком большое для анализа")
-                return "video", "", ""
+                return "video", "", "", ""
         elif message.document:
             doc = message.document
             filename = doc.file_name or ""
@@ -1345,19 +1346,36 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
                     media_type_str = "video"
                 else:
                     logger.warning("Видео слишком большое для анализа")
-                    return "video", "", ""
+                    return "video", "", "", ""
             else:
                 media_type_str = "document"
-                return media_type_str, "", ""
+                return media_type_str, "", "", ""
         else:
-            return media_type_str, "", ""
+            return media_type_str, "", "", ""
 
         if not file:
-            return media_type_str, "", ""
+            return media_type_str, "", "", ""
 
         # Скачиваем файл
         file_data = await file.download_as_bytearray()
-
+        # Сохраняем на S3
+        storage_path = ""
+        try:
+            from email_sync import get_s3_client
+            import hashlib
+            s3 = get_s3_client()
+            if s3:
+                bucket = os.getenv("ATTACHMENTS_BUCKET_NAME", "")
+                if bucket:
+                    digest = hashlib.sha256(bytes(file_data)).hexdigest()[:16]
+                    safe_fn = filename.replace("/", "_").replace("\\", "_") or "file"
+                    s3_key = f"tg_attachments/{table_name or 'unknown'}/{message.message_id}/{digest}_{safe_fn}"
+                    s3.put_object(Bucket=bucket, Key=s3_key, Body=bytes(file_data))
+                    storage_path = f"s3://{bucket}/{s3_key}"
+                    logger.info(f"Файл сохранён в S3: {storage_path}")
+        except Exception as e:
+            logger.warning(f"S3 upload error: {e}")
+            
         # Получаем полный контекст чата (8 дней = 192 часа)
         context = ""
         if table_name and message.chat:
@@ -1447,7 +1465,7 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
         except Exception as e:
             logger.debug(f"Fact extraction error: {e}")
 
-    return media_type_str, media_analysis, content_text
+    return media_type_str, media_analysis, content_text, storage_path
 
 
 def determine_message_type(message) -> tuple[str, str | None]:
@@ -1619,7 +1637,7 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message.photo or message.video or message.voice or message.audio or (message.document and (message.document.mime_type or message.document.file_name)):
         # Для группы "Торты Отгрузки" не анализируем сразу - анализ будет в конце дня
         if not is_delayed_chat:
-            analyzed_type, media_analysis, content_text = await download_and_analyze_media(context.bot, message, table_name)
+            analyzed_type, media_analysis, content_text, storage_path = await download_and_analyze_media(context.bot, message, table_name)
             if analyzed_type != "media":
                 message_type = analyzed_type
         else:
@@ -1728,7 +1746,9 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "forward_from_user_id": None,
         "media_file_id": media_file_id,
         "media_analysis": media_analysis,
+        storage_path = ""
         "content_text": content_text,
+        "storage_path": storage_path if 'storage_path' in dir() else "",
         "timestamp": message.date
     }
 
