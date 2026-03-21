@@ -26,6 +26,13 @@ ROUTER_AI_KEY = os.getenv('ROUTERAI_API_KEY', '')
 
 EXTRACTION_SYSTEM_PROMPT = """Ты — система извлечения корпоративных знаний для кондитерской компании Фрумелад.
 Из каждого сообщения извлеки ВСЕ что найдёшь из следующих категорий.
+Все сообщения в батче — из ОДНОГО чата/канала, расположены хронологически. Анализируй их как связанную переписку, учитывай контекст предыдущих сообщений.
+
+НЕ извлекай:
+- Персональные данные (паспорта, ИНН физлиц, номера водительских удостоверений)
+- Дубликаты уже извлечённых фактов
+- Приветствия, благодарности, общие фразы без конкретного содержания
+
 Отвечай ТОЛЬКО валидным JSON без markdown-обёрток. Структура:
 {
   "facts": [
@@ -445,24 +452,46 @@ def save_extraction(cur, extracted, doc_ids):
     return stats
 
 
-def get_unprocessed_docs(conn, batch_size=10, source_kind='telegram_message', min_length=25):
-    """Получить необработанные документы."""
+def get_unprocessed_docs(conn, batch_size=10, source_kind='telegram_message', min_length=0):
+    """Получить необработанные документы — сгруппированные по каналу, хронологически."""
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     
-    # Документы которые ещё не обработаны (нет в meta.distilled)
+    # 1. Находим канал с наибольшим количеством необработанных
+    cur.execute("""
+        SELECT channel_name
+        FROM source_documents
+        WHERE source_kind = %s
+          AND (meta->>'distilled') IS NULL
+          AND (
+              source_kind != 'email_message'
+              OR meta->>'email_category' IN ('internal', 'external_business')
+          )
+        GROUP BY channel_name
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+    """, (source_kind,))
+    
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        return []
+    
+    channel = row['channel_name']
+    
+    # 2. Берём batch_size последовательных сообщений из этого канала
     cur.execute("""
         SELECT id, body_text, doc_date, author_name, channel_name, channel_ref
         FROM source_documents
         WHERE source_kind = %s
-        AND LENGTH(body_text) >= %s
-        AND (meta->>'distilled') IS NULL
-        AND (
-            source_kind != 'email_message'
-            OR meta->>'email_category' IN ('internal', 'external_business')
-        )
-        ORDER BY doc_date DESC
+          AND channel_name = %s
+          AND (meta->>'distilled') IS NULL
+          AND (
+              source_kind != 'email_message'
+              OR meta->>'email_category' IN ('internal', 'external_business')
+          )
+        ORDER BY doc_date ASC
         LIMIT %s
-    """, (source_kind, min_length, batch_size))
+    """, (source_kind, channel, batch_size))
     
     docs = cur.fetchall()
     cur.close()
@@ -480,8 +509,8 @@ def mark_as_processed(cur, doc_ids):
         """, (doc_id,))
 
 
-def run_distillation(source_kind='telegram_message', min_length=25, 
-                     batch_size=5, max_batches=50):
+def run_distillation(source_kind='telegram_message', min_length=0, 
+                     batch_size=10, max_batches=50):
     """Основной цикл distillation."""
     conn = psycopg2.connect(**CONFIG_PG)
     
