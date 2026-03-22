@@ -110,27 +110,62 @@ def get_company_context(conn):
     return context
 
 
-def get_facts_for_review(conn, limit=MAX_FACTS_PER_RUN):
-    """Получает факты для проверки — приоритет: без subject, новые."""
+def get_items_for_review(conn, limit=MAX_FACTS_PER_RUN):
+    """Получает сущности для проверки — факты, решения, задачи, политики."""
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    items = []
     
-    # Сначала факты без subject_entity за последние 48 часов
+    # Факты (приоритет — без subject)
     cur.execute("""
-        SELECT f.id, f.fact_type, f.fact_text, f.confidence,
+        SELECT f.id, 'fact' as item_type, f.fact_type as subtype, f.fact_text as text,
                e.canonical_name as subject_name
         FROM km_facts f
         LEFT JOIN km_entities e ON e.id = f.subject_entity_id
         WHERE f.created_at > NOW() - INTERVAL '48 hours'
           AND f.verification_status = 'extracted'
-        ORDER BY 
-            CASE WHEN f.subject_entity_id IS NULL THEN 0 ELSE 1 END,
-            f.confidence ASC
+        ORDER BY CASE WHEN f.subject_entity_id IS NULL THEN 0 ELSE 1 END, f.confidence ASC
         LIMIT %s
-    """, (limit,))
+    """, (limit // 2,))
+    items.extend(cur.fetchall())
     
-    facts = cur.fetchall()
+    # Решения
+    cur.execute("""
+        SELECT id, 'decision' as item_type, scope_type as subtype, decision_text as text,
+               NULL as subject_name
+        FROM km_decisions
+        WHERE created_at > NOW() - INTERVAL '48 hours'
+          AND verification_status = 'extracted'
+        ORDER BY created_at DESC
+        LIMIT %s
+    """, (limit // 6,))
+    items.extend(cur.fetchall())
+    
+    # Задачи
+    cur.execute("""
+        SELECT id, 'task' as item_type, NULL as subtype, task_text as text,
+               NULL as subject_name
+        FROM km_tasks
+        WHERE created_at > NOW() - INTERVAL '48 hours'
+          AND verification_status = 'extracted'
+        ORDER BY created_at DESC
+        LIMIT %s
+    """, (limit // 6,))
+    items.extend(cur.fetchall())
+    
+    # Политики
+    cur.execute("""
+        SELECT id, 'policy' as item_type, NULL as subtype, policy_text as text,
+               NULL as subject_name
+        FROM km_policies
+        WHERE created_at > NOW() - INTERVAL '48 hours'
+          AND verification_status = 'extracted'
+        ORDER BY created_at DESC
+        LIMIT %s
+    """, (limit // 6,))
+    items.extend(cur.fetchall())
+    
     cur.close()
-    return facts
+    return items
 
 
 REVIEW_SYSTEM_PROMPT = """Ты — ревизор базы знаний кондитерской компании Фрумелад (ООО "Фрумелад" и ООО "НФ").
@@ -148,7 +183,7 @@ REVIEW_SYSTEM_PROMPT = """Ты — ревизор базы знаний конд
 Отвечай ТОЛЬКО валидным JSON:
 {
   "verdicts": [
-    {"id": 123, "verdict": "keep|delete|uncertain", "reason": "краткая причина"}
+    {"id": 123, "type": "fact|decision|task|policy", "verdict": "keep|delete|uncertain", "reason": "краткая причина"}
   ],
   "new_rules": [
     {"value": "слово или паттерн", "reason": "почему это мусор"}
@@ -162,7 +197,7 @@ REVIEW_SYSTEM_PROMPT = """Ты — ревизор базы знаний конд
 def review_batch(facts_batch, company_context):
     """Проверяет батч фактов через LLM."""
     facts_text = "\n".join([
-        f"[ID:{f['id']}] type={f['fact_type']} subject={f['subject_name'] or 'НЕТ'} | {f['fact_text'][:200]}"
+        f"[{f['item_type'].upper()} ID:{f['id']}] subtype={f['subtype'] or '-'} subject={f['subject_name'] or 'НЕТ'} | {f['text'][:200]}"
         for f in facts_batch
     ])
     
@@ -187,29 +222,32 @@ def review_batch(facts_batch, company_context):
 
 
 def apply_verdicts(conn, verdicts):
-    """Применяет вердикты ревизора."""
+    """Применяет вердикты ревизора ко всем типам сущностей."""
     cur = conn.cursor()
     stats = {'kept': 0, 'deleted': 0, 'uncertain': 0}
     
+    table_map = {
+        'fact': ('km_facts', 'id'),
+        'decision': ('km_decisions', 'id'),
+        'task': ('km_tasks', 'id'),
+        'policy': ('km_policies', 'id'),
+    }
+    
     for v in verdicts:
-        fact_id = v.get('id')
+        item_id = v.get('id')
+        item_type = v.get('type', 'fact')
         verdict = v.get('verdict', 'uncertain')
-        reason = v.get('reason', '')
+        
+        table, id_col = table_map.get(item_type, ('km_facts', 'id'))
         
         if verdict == 'delete':
-            cur.execute("DELETE FROM km_facts WHERE id = %s", (fact_id,))
+            cur.execute(f"DELETE FROM {table} WHERE {id_col} = %s", (item_id,))
             stats['deleted'] += 1
         elif verdict == 'keep':
-            cur.execute("""
-                UPDATE km_facts SET verification_status = 'verified', updated_at = NOW() 
-                WHERE id = %s
-            """, (fact_id,))
+            cur.execute(f"UPDATE {table} SET verification_status = 'verified', updated_at = NOW() WHERE {id_col} = %s", (item_id,))
             stats['kept'] += 1
         else:
-            cur.execute("""
-                UPDATE km_facts SET verification_status = 'uncertain', updated_at = NOW()
-                WHERE id = %s
-            """, (fact_id,))
+            cur.execute(f"UPDATE {table} SET verification_status = 'uncertain', updated_at = NOW() WHERE {id_col} = %s", (item_id,))
             stats['uncertain'] += 1
     
     conn.commit()
@@ -292,7 +330,7 @@ def main():
     logger.info(f"Контекст компании: {len(company_context)} символов")
     
     # Получаем факты для проверки
-    facts = get_facts_for_review(conn)
+    facts = get_items_for_review(conn)
     logger.info(f"Фактов для проверки: {len(facts)}")
     
     if not facts:
