@@ -79,31 +79,42 @@ def call_llm(messages, model="openai/gpt-4.1", temperature=0.1):
 # STEP 0: ДЕДУПЛИКАЦИЯ ПО EMBEDDING SIMILARITY
 # ============================================================
 
-def deduplicate_facts(conn):
+# Таблицы для дедупликации: (table_name, text_column)
+DEDUP_TABLES = [
+    ('km_facts', 'fact_text'),
+    ('km_decisions', 'decision_text'),
+    ('km_tasks', 'task_text'),
+    ('km_policies', 'policy_text'),
+]
+
+
+def deduplicate_table(conn, table, text_col, max_dupes=DEDUP_MAX_PER_RUN):
     """
+    Универсальная дедупликация для любой km_* таблицы.
     Находит дубли через KNN-поиск (HNSW index).
-    Из пары оставляет более длинный факт, короткий -> 'duplicate'.
+    Из пары оставляет более длинный текст, короткий -> 'duplicate'.
     """
     cur = conn.cursor()
 
-    # Считаем сколько активных фактов с embedding
-    cur.execute("""
-        SELECT COUNT(*) FROM km_facts
+    cur.execute(f"""
+        SELECT COUNT(*) FROM {table}
         WHERE embedding IS NOT NULL
           AND verification_status NOT IN ('rejected', 'duplicate')
     """)
     total_active = cur.fetchone()[0]
-    logger.info(f"[DEDUP] Активных фактов с embedding: {total_active}")
+    logger.info(f"[DEDUP] {table}: активных с embedding: {total_active}")
 
-    # Берём батчами — сначала самые свежие (они скорее дубли старых)
+    if total_active == 0:
+        return 0
+
     offset = 0
     total_dupes = 0
-    seen_pairs = set()  # чтобы не дублировать пары
+    seen_pairs = set()
 
-    while offset < total_active and total_dupes < DEDUP_MAX_PER_RUN:
-        cur.execute("""
-            SELECT id, embedding, LENGTH(fact_text) as len
-            FROM km_facts
+    while offset < total_active and total_dupes < max_dupes:
+        cur.execute(f"""
+            SELECT id, embedding, LENGTH({text_col}) as len
+            FROM {table}
             WHERE embedding IS NOT NULL
               AND verification_status NOT IN ('rejected', 'duplicate')
             ORDER BY created_at DESC
@@ -116,13 +127,12 @@ def deduplicate_facts(conn):
 
         batch_dupes = 0
         for fid, emb, flen in batch:
-            if total_dupes >= DEDUP_MAX_PER_RUN:
+            if total_dupes >= max_dupes:
                 break
 
-            # KNN: ближайший сосед с sim > threshold
-            cur.execute("""
-                SELECT b.id, 1 - (b.embedding <=> %s::vector) as sim, LENGTH(b.fact_text) as len
-                FROM km_facts b
+            cur.execute(f"""
+                SELECT b.id, 1 - (b.embedding <=> %s::vector) as sim, LENGTH(b.{text_col}) as len
+                FROM {table} b
                 WHERE b.id != %s
                   AND b.embedding IS NOT NULL
                   AND b.verification_status NOT IN ('rejected', 'duplicate')
@@ -134,22 +144,19 @@ def deduplicate_facts(conn):
             if row and row[1] >= DEDUP_SIMILARITY_THRESHOLD:
                 neighbor_id, sim, neighbor_len = row
 
-                # Пропускаем уже обработанные пары
                 pair_key = tuple(sorted([fid, neighbor_id]))
                 if pair_key in seen_pairs:
                     continue
                 seen_pairs.add(pair_key)
 
-                # Оставляем более длинный факт (больше информации)
                 if flen >= neighbor_len:
-                    keep_id, remove_id = fid, neighbor_id
+                    remove_id = neighbor_id
                 else:
-                    keep_id, remove_id = neighbor_id, fid
+                    remove_id = fid
 
-                cur.execute("""
-                    UPDATE km_facts
-                    SET verification_status = 'duplicate',
-                        updated_at = NOW()
+                cur.execute(f"""
+                    UPDATE {table}
+                    SET verification_status = 'duplicate', updated_at = NOW()
                     WHERE id = %s
                       AND verification_status NOT IN ('rejected', 'duplicate')
                 """, (remove_id,))
@@ -159,11 +166,24 @@ def deduplicate_facts(conn):
                     batch_dupes += 1
 
         conn.commit()
-        logger.info(f"[DEDUP] Batch offset={offset}: найдено {batch_dupes} дублей")
+        logger.info(f"[DEDUP] {table} offset={offset}: {batch_dupes} дублей")
         offset += DEDUP_BATCH_SIZE
 
-    logger.info(f"[DEDUP] Итого помечено дублями: {total_dupes}")
+    logger.info(f"[DEDUP] {table}: итого помечено дублями: {total_dupes}")
     return total_dupes
+
+
+def deduplicate_all(conn):
+    """Дедупликация по всем km_* таблицам."""
+    results = {}
+    for table, text_col in DEDUP_TABLES:
+        try:
+            count = deduplicate_table(conn, table, text_col)
+            results[table] = count
+        except Exception as e:
+            logger.error(f"[DEDUP] Ошибка {table}: {e}")
+            results[table] = 0
+    return results
 
 
 # ============================================================
@@ -434,9 +454,11 @@ def main():
     # ============================================================
     logger.info("--- STEP 0: Дедупликация по embedding similarity ---")
     try:
-        dedup_count = deduplicate_facts(conn)
+        dedup_results = deduplicate_all(conn)
+        dedup_count = sum(dedup_results.values())
     except Exception as e:
         logger.error(f"Ошибка дедупликации: {e}")
+        dedup_results = {}
         dedup_count = 0
 
     # ============================================================
@@ -456,10 +478,11 @@ def main():
 
     if not facts:
         logger.info("Нечего проверять (LLM)")
+        dedup_lines = "\n".join([f"  {t}: {c}" for t, c in dedup_results.items() if c > 0]) or "  нет дублей"
         report = (
             f"<b>🔬 Ревизия знаний</b>\n\n"
-            f"<b>Step 0 — Дедупликация:</b>\n"
-            f"🔄 Помечено дублями: {dedup_count}\n\n"
+            f"<b>Step 0 — Дедупликация ({dedup_count}):</b>\n"
+            f"{dedup_lines}\n\n"
             f"<b>Step 1 — LLM-ревью:</b>\n"
             f"Нечего проверять ✅"
         )
@@ -535,19 +558,17 @@ def main():
     cur = conn2.cursor()
     cur.execute("SELECT COUNT(*) FROM km_facts WHERE verification_status NOT IN ('rejected','duplicate')")
     active_facts = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM km_facts WHERE verification_status = 'duplicate'")
-    dup_facts = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM km_filter_rules WHERE is_active = true")
     active_rules = cur.fetchone()[0]
     cur.close()
     conn2.close()
 
     # Отчёт
+    dedup_lines = "\n".join([f"  {t}: {c}" for t, c in dedup_results.items() if c > 0]) or "  нет дублей"
     report = (
         f"<b>🔬 Ревизия знаний</b>\n\n"
-        f"<b>Step 0 — Дедупликация:</b>\n"
-        f"🔄 Помечено дублями: {dedup_count}\n"
-        f"📊 Всего дублей в базе: {dup_facts}\n\n"
+        f"<b>Step 0 — Дедупликация ({dedup_count}):</b>\n"
+        f"{dedup_lines}\n\n"
         f"<b>Step 1 — LLM-ревью:</b>\n"
         f"Проверено: {len(facts)}\n"
         f"✅ Оставлено: {total_stats['kept']}\n"
