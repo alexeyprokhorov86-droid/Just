@@ -99,7 +99,7 @@ async def migrate_batch(conn, items, s3, dry_run=False):
     from telegram import Bot
     from telegram.request import HTTPXRequest
     
-    request = HTTPXRequest(read_timeout=120, connect_timeout=30)
+    request = HTTPXRequest(read_timeout=120, connect_timeout=30, proxy="socks5://127.0.0.1:1080")
     bot = Bot(token=BOT_TOKEN, request=request)
     
     migrated = 0
