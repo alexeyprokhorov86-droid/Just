@@ -13,6 +13,7 @@ import os
 import re
 import logging
 import base64
+import threading
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -75,6 +76,84 @@ else:
 # Хранение состояния для назначения ролей
 pending_role_assignments = {}
 
+# S3 конфигурация
+S3_BUCKET = os.getenv("ATTACHMENTS_BUCKET_NAME", "")
+S3_ENDPOINT = os.getenv("ATTACHMENTS_BUCKET_ENDPOINT", "")
+S3_REGION = os.getenv("ATTACHMENTS_BUCKET_REGION", "ru-central-1")
+S3_ACCESS_KEY = os.getenv("ATTACHMENTS_BUCKET_ACCESS_KEY", "")
+S3_SECRET_KEY = os.getenv("ATTACHMENTS_BUCKET_SECRET_KEY", "")
+S3_FORCE_PATH = os.getenv("ATTACHMENTS_BUCKET_FORCE_PATH_STYLE", "true").lower() == "true"
+ 
+_s3_client = None
+ 
+ 
+def get_s3_client():
+    """Ленивая инициализация S3 клиента."""
+    global _s3_client
+    if _s3_client is None and S3_BUCKET and S3_ACCESS_KEY:
+        try:
+            import boto3
+            from botocore.config import Config as BotoConfig
+            _s3_client = boto3.client(
+                service_name='s3',
+                endpoint_url=S3_ENDPOINT,
+                region_name=S3_REGION,
+                aws_access_key_id=S3_ACCESS_KEY,
+                aws_secret_access_key=S3_SECRET_KEY,
+                config=BotoConfig(s3={'addressing_style': 'path'} if S3_FORCE_PATH else {})
+            )
+            logger.info("S3 клиент инициализирован")
+        except Exception as e:
+            logger.warning(f"S3 недоступен: {e}")
+    return _s3_client
+ 
+ 
+def upload_to_s3_background(file_data: bytes, table_name: str, message_id: int, filename: str, media_type: str):
+    """Загружает файл в S3 в фоновом потоке (не блокирует бот)."""
+    try:
+        s3 = get_s3_client()
+        if not s3:
+            return
+ 
+        import hashlib
+        file_hash = hashlib.md5(file_data).hexdigest()[:12]
+        safe_name = re.sub(r'[^\w\-.]', '_', filename) if filename else f"{media_type}_{file_hash}"
+        s3_key = f"tg/{table_name}/{message_id}_{safe_name}"
+ 
+        # Определяем content_type
+        content_types = {
+            'photo': 'image/jpeg', 'image': 'image/jpeg', 'pdf': 'application/pdf',
+            'excel': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'word': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'powerpoint': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            'video': 'video/mp4', 'voice': 'audio/ogg', 'audio': 'audio/mpeg',
+        }
+        content_type = content_types.get(media_type, 'application/octet-stream')
+ 
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=file_data,
+            ContentType=content_type
+        )
+ 
+        # Обновляем storage_path в БД
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE {table_name} SET storage_path = %s WHERE message_id = %s",
+                    (f"s3://{S3_BUCKET}/{s3_key}", message_id)
+                )
+                conn.commit()
+        finally:
+            conn.close()
+ 
+        logger.info(f"S3 upload: {s3_key} ({len(file_data)} bytes)")
+ 
+    except Exception as e:
+        logger.warning(f"S3 upload failed (non-critical): {e}")
+ 
 
 # ============================================================
 # РАБОТА С БД
@@ -1356,6 +1435,14 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
 
         # Скачиваем файл
         file_data = await file.download_as_bytearray()
+        
+        # === S3 upload (фоновый, не блокирует анализ) ===
+        if S3_BUCKET and len(file_data) > 0:
+            threading.Thread(
+                target=upload_to_s3_background,
+                args=(bytes(file_data), table_name or "unknown", message.message_id, filename, media_type_str),
+                daemon=True
+            ).start()
 
         # Получаем полный контекст чата (8 дней = 192 часа)
         context = ""
@@ -2910,6 +2997,120 @@ async def list_employees_command(update: Update, context: ContextTypes.DEFAULT_T
     
     await update.message.reply_text(text[:4000], parse_mode="Markdown")
 
+# ============================================================
+# УПРАВЛЕНИЕ ПРАВИЛАМИ ФИЛЬТРАЦИИ (/rules)
+# ============================================================
+ 
+async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает pending правила фильтрации для одобрения/отклонения."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Только для администраторов")
+        return
+ 
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Pending правила
+            cur.execute("""
+                SELECT id, rule_type, value, reason, added_by, created_at
+                FROM km_filter_rules
+                WHERE approval_status = 'pending' AND is_active = true
+                ORDER BY created_at DESC
+                LIMIT 20
+            """)
+            pending = cur.fetchall()
+ 
+            # Статистика
+            cur.execute("""
+                SELECT 
+                    COUNT(*) FILTER (WHERE approval_status = 'approved' AND is_active = true) as approved,
+                    COUNT(*) FILTER (WHERE approval_status = 'pending' AND is_active = true) as pending,
+                    COUNT(*) FILTER (WHERE is_active = false) as disabled
+                FROM km_filter_rules
+            """)
+            stats = cur.fetchone()
+    finally:
+        conn.close()
+ 
+    if not pending:
+        await update.message.reply_text(
+            f"✅ Нет правил на рассмотрении\n\n"
+            f"📊 Активных: {stats[0]}, отключённых: {stats[2]}"
+        )
+        return
+ 
+    await update.message.reply_text(
+        f"📏 *Правила на рассмотрении: {len(pending)}*\n"
+        f"Активных: {stats[0]} | Отключённых: {stats[2]}\n\n"
+        f"Нажмите ✅ чтобы одобрить или ❌ чтобы отклонить:",
+        parse_mode="Markdown"
+    )
+ 
+    for rule_id, rule_type, value, reason, added_by, created_at in pending:
+        date_str = created_at.strftime("%d.%m") if created_at else ""
+        text = (
+            f"🏷 `{value}`\n"
+            f"Тип: {rule_type} | От: {added_by or '?'} | {date_str}\n"
+            f"Причина: {reason or '—'}"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Одобрить", callback_data=f"rule_approve:{rule_id}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"rule_reject:{rule_id}"),
+            ]
+        ])
+        await update.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+ 
+ 
+async def rules_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок одобрения/отклонения правил."""
+    query = update.callback_query
+    await query.answer()
+ 
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("⛔ Только для администратора", show_alert=True)
+        return
+ 
+    data = query.data
+ 
+    if data.startswith("rule_approve:"):
+        rule_id = int(data.split(":")[1])
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE km_filter_rules
+                    SET approval_status = 'approved', updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING value
+                """, (rule_id,))
+                row = cur.fetchone()
+                conn.commit()
+        finally:
+            conn.close()
+ 
+        value = row[0] if row else "?"
+        await query.edit_message_text(f"✅ Правило одобрено: `{value}`", parse_mode="Markdown")
+ 
+    elif data.startswith("rule_reject:"):
+        rule_id = int(data.split(":")[1])
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE km_filter_rules
+                    SET is_active = false, approval_status = 'rejected', updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING value
+                """, (rule_id,))
+                row = cur.fetchone()
+                conn.commit()
+        finally:
+            conn.close()
+ 
+        value = row[0] if row else "?"
+        await query.edit_message_text(f"❌ Правило отклонено: `{value}`", parse_mode="Markdown")
+
 def get_chat_id_by_title(chat_title: str) -> int | None:
     """Получает chat_id по названию чата из БД."""
     conn = get_db_connection()
@@ -3071,6 +3272,14 @@ def main():
     application.add_handler(CommandHandler("add_employee", add_employee_command))
     application.add_handler(CommandHandler("assign_email", assign_email_command))
     application.add_handler(CommandHandler("list_employees", list_employees_command))
+    # Команда /rules — управление правилами фильтрации
+    application.add_handler(CommandHandler("rules", rules_command))
+ 
+    # Callback для правил
+    application.add_handler(CallbackQueryHandler(
+        rules_callback_handler,
+        pattern=r'^rule_'
+    ))
 
     application.add_handler(MessageHandler(
         filters.Regex(r'^/emailthread_\d+'),
