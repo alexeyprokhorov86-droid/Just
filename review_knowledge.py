@@ -241,7 +241,10 @@ def apply_verdicts(conn, verdicts):
         table, id_col = table_map.get(item_type, ('km_facts', 'id'))
         
         if verdict == 'delete':
-            cur.execute(f"DELETE FROM {table} WHERE {id_col} = %s", (item_id,))
+            cur.execute(f"""
+                UPDATE {table} SET verification_status = 'rejected', updated_at = NOW() 
+                WHERE {id_col} = %s
+            """, (item_id,))
             stats['deleted'] += 1
         elif verdict == 'keep':
             cur.execute(f"UPDATE {table} SET verification_status = 'verified', updated_at = NOW() WHERE {id_col} = %s", (item_id,))
@@ -270,8 +273,8 @@ def apply_new_rules(conn, new_rules, remove_rules):
         cur.execute("SELECT id FROM km_filter_rules WHERE value = %s AND is_active = true", (value,))
         if not cur.fetchone():
             cur.execute("""
-                INSERT INTO km_filter_rules (rule_type, target, value, reason, added_by)
-                VALUES ('junk_word', 'all', %s, %s, 'llm_reviewer')
+                INSERT INTO km_filter_rules (rule_type, target, value, reason, added_by, approval_status)
+                VALUES ('junk_word', 'all', %s, %s, 'llm_reviewer', 'pending')
             """, (value, reason))
             added += 1
             logger.info(f"  Новое правило: '{value}' — {reason}")
@@ -331,6 +334,8 @@ def main():
     
     # Получаем факты для проверки
     facts = get_items_for_review(conn)
+    # Лимит — не более 30% от проверенных
+    max_delete = max(int(len(facts) * 0.3), 5)  # минимум 5
     logger.info(f"Фактов для проверки: {len(facts)}")
     
     if not facts:
@@ -377,6 +382,29 @@ def main():
         except Exception as e:
             logger.error(f"  Ошибка: {e}")
             errors += 1
+
+    # Проверка лимита
+    limit_warning = ""
+    if total_stats['deleted'] > max_delete:
+        limit_warning = f"\n⚠️ ВНИМАНИЕ: удалено {total_stats['deleted']} > лимит {max_delete} (30%)! Проверьте правила!"
+        logger.warning(limit_warning)
+    
+    # Сохраняем метрики здоровья
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO km_health_metrics (metric_date, facts_rejected, facts_verified, rules_added, rules_disabled)
+            VALUES (CURRENT_DATE, %s, %s, %s, %s)
+            ON CONFLICT (metric_date) DO UPDATE SET
+                facts_rejected = km_health_metrics.facts_rejected + EXCLUDED.facts_rejected,
+                facts_verified = km_health_metrics.facts_verified + EXCLUDED.facts_verified,
+                rules_added = km_health_metrics.rules_added + EXCLUDED.rules_added,
+                rules_disabled = km_health_metrics.rules_disabled + EXCLUDED.rules_disabled
+        """, (total_stats['deleted'], total_stats['kept'], total_new_rules, total_removed_rules))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        logger.error(f"Ошибка сохранения метрик: {e}")
     
     # Статистика
     conn2 = get_conn()
@@ -401,6 +429,7 @@ def main():
         f"  - Отключено: {total_removed_rules}\n"
         f"  Всего активных: {active_rules}\n\n"
         f"📊 Всего фактов в базе: {total_facts}"
+        f"{limit_warning}"
     )
     
     logger.info(f"Отчёт:\n{report}")
