@@ -290,13 +290,85 @@ def resolve_entity(cur, name, entity_type=None):
     
     return None
 
+# Кэш правил фильтрации (обновляется раз в запуск)
+_filter_rules_cache = None
 
-def save_extraction(cur, extracted, doc_ids):
+def load_filter_rules(conn):
+    """Загружает правила фильтрации из km_filter_rules."""
+    global _filter_rules_cache
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT rule_type, target, value FROM km_filter_rules 
+        WHERE is_active = true
+    """)
+    rules = {'junk_words': {'facts': [], 'decisions': [], 'all': []},
+             'min_length': {'facts': 0, 'decisions': 0}}
+    
+    for rule_type, target, value in cur.fetchall():
+        if rule_type == 'junk_word':
+            rules['junk_words'][target].append(value.lower())
+        elif rule_type == 'min_length':
+            rules['min_length'][target] = int(value)
+    
+    cur.close()
+    _filter_rules_cache = rules
+    return rules
+
+
+def get_filter_rules(conn):
+    """Возвращает кэшированные правила или загружает."""
+    global _filter_rules_cache
+    if _filter_rules_cache is None:
+        return load_filter_rules(conn)
+    return _filter_rules_cache
+
+
+def is_junk(text, target='facts', conn=None):
+    """Проверяет текст по правилам из km_filter_rules. True = мусор."""
+    if not text or not text.strip():
+        return True
+    
+    rules = get_filter_rules(conn) if conn else _filter_rules_cache
+    if not rules:
+        return False
+    
+    # Проверка минимальной длины
+    min_len = rules['min_length'].get(target, 0)
+    if min_len and len(text.strip()) < min_len:
+        return True
+    
+    t = text.lower()
+    
+    # Проверка junk_words для этого target + 'all'
+    for word in rules['junk_words'].get(target, []) + rules['junk_words'].get('all', []):
+        if word in t:
+            # Увеличиваем hit_count (необязательно в каждом вызове, можно батчем)
+            return True
+    
+    return False
+
+
+def update_hit_counts(conn, hits):
+    """Обновляет счётчики срабатываний правил."""
+    if not hits:
+        return
+    cur = conn.cursor()
+    for value in hits:
+        cur.execute("""
+            UPDATE km_filter_rules SET hit_count = hit_count + 1, updated_at = NOW()
+            WHERE value = %s AND is_active = true
+        """, (value,))
+    conn.commit()
+    cur.close()
+
+def save_extraction(cur, extracted, doc_ids, conn=None):
     """Сохранить извлечённые знания в km_* таблицы."""
     stats = {'facts': 0, 'decisions': 0, 'relations': 0, 'tasks': 0, 'policies': 0, 'procedures': 0, 'cases': 0}
     
     # Факты
     for fact in extracted.get('facts', []):
+        if is_junk(fact.get('text', ''), 'facts', conn):
+            continue
         subject_id = resolve_entity(cur, fact.get('subject'))
         object_id = resolve_entity(cur, fact.get('object'))
         
@@ -320,6 +392,8 @@ def save_extraction(cur, extracted, doc_ids):
     
     # Решения
     for dec in extracted.get('decisions', []):
+        if is_junk(dec.get('text', ''), 'decisions', conn):
+            continue
         decided_by_id = resolve_entity(cur, dec.get('decided_by'), 'employee')
         scope_entity_id = None
         
@@ -513,6 +587,7 @@ def run_distillation(source_kind='telegram_message', min_length=0,
                      batch_size=10, max_batches=50):
     """Основной цикл distillation."""
     conn = psycopg2.connect(**CONFIG_PG)
+    load_filter_rules(conn)
     
     total_stats = {'facts': 0, 'decisions': 0, 'relations': 0, 'tasks': 0, 'policies': 0, 'procedures': 0, 'cases': 0, 'errors': 0}
     
@@ -532,7 +607,7 @@ def run_distillation(source_kind='telegram_message', min_length=0,
             extracted = extract_knowledge(docs)
             
             cur = conn.cursor()
-            stats = save_extraction(cur, extracted, doc_ids)
+            stats = save_extraction(cur, extracted, doc_ids, conn)
             mark_as_processed(cur, doc_ids)
             conn.commit()
             cur.close()
