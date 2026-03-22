@@ -299,14 +299,17 @@ def load_filter_rules(conn):
     cur = conn.cursor()
     cur.execute("""
         SELECT rule_type, target, value FROM km_filter_rules 
-        WHERE is_active = true
+        WHERE is_active = true AND approval_status = 'active'
     """)
     rules = {'junk_words': {'facts': [], 'decisions': [], 'all': []},
+             'safe_words': [],
              'min_length': {'facts': 0, 'decisions': 0}}
     
     for rule_type, target, value in cur.fetchall():
         if rule_type == 'junk_word':
             rules['junk_words'][target].append(value.lower())
+        elif rule_type == 'safe_word':
+            rules['safe_words'].append(value.lower())
         elif rule_type == 'min_length':
             rules['min_length'][target] = int(value)
     
@@ -338,11 +341,15 @@ def is_junk(text, target='facts', conn=None):
         return True
     
     t = text.lower()
+
+    # Проверка safe_words — если содержит защищённое слово, НЕ мусор
+    for safe in rules.get('safe_words', []):
+        if safe in t:
+            return False
     
     # Проверка junk_words для этого target + 'all'
     for word in rules['junk_words'].get(target, []) + rules['junk_words'].get('all', []):
         if word in t:
-            # Увеличиваем hit_count (необязательно в каждом вызове, можно батчем)
             return True
     
     return False
