@@ -2,9 +2,10 @@
 """
 review_knowledge.py — LLM-ревизор базы знаний.
 
-Проверяет новые факты/решения, удаляет мусор, предлагает новые правила фильтрации.
-Запускается раз в сутки после distillation.
+Step 0: Дедупликация по embedding similarity (cosine > 0.95)
+Step 1: LLM-ревью новых фактов/решений/задач/политик
 
+Запускается раз в сутки после distillation.
 Cron: 0 4 * * * cd /home/admin/telegram_logger_bot && .../python review_knowledge.py >> .../review_knowledge.log 2>&1
 """
 
@@ -30,7 +31,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_USER_ID = os.getenv('ADMIN_USER_ID', '')
 
 DB_CONFIG = {
-    'host': '172.17.0.2',
+    'host': os.getenv('DB_HOST', '172.17.0.2'),
     'port': 5432,
     'dbname': 'knowledge_base',
     'user': 'knowledge',
@@ -41,6 +42,11 @@ DB_CONFIG = {
 MAX_FACTS_PER_RUN = 200
 # Размер батча для LLM
 LLM_BATCH_SIZE = 20
+
+# === Дедупликация ===
+DEDUP_SIMILARITY_THRESHOLD = 0.95
+DEDUP_BATCH_SIZE = 500
+DEDUP_MAX_PER_RUN = 2000
 
 
 def get_conn():
@@ -69,31 +75,126 @@ def call_llm(messages, model="openai/gpt-4.1", temperature=0.1):
     return resp.json()['choices'][0]['message']['content']
 
 
+# ============================================================
+# STEP 0: ДЕДУПЛИКАЦИЯ ПО EMBEDDING SIMILARITY
+# ============================================================
+
+def deduplicate_facts(conn):
+    """
+    Находит дубли через KNN-поиск (HNSW index).
+    Из пары оставляет более длинный факт, короткий -> 'duplicate'.
+    """
+    cur = conn.cursor()
+
+    # Считаем сколько активных фактов с embedding
+    cur.execute("""
+        SELECT COUNT(*) FROM km_facts
+        WHERE embedding IS NOT NULL
+          AND verification_status NOT IN ('rejected', 'duplicate')
+    """)
+    total_active = cur.fetchone()[0]
+    logger.info(f"[DEDUP] Активных фактов с embedding: {total_active}")
+
+    # Берём батчами — сначала самые свежие (они скорее дубли старых)
+    offset = 0
+    total_dupes = 0
+    seen_pairs = set()  # чтобы не дублировать пары
+
+    while offset < total_active and total_dupes < DEDUP_MAX_PER_RUN:
+        cur.execute("""
+            SELECT id, embedding, LENGTH(fact_text) as len
+            FROM km_facts
+            WHERE embedding IS NOT NULL
+              AND verification_status NOT IN ('rejected', 'duplicate')
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """, (DEDUP_BATCH_SIZE, offset))
+        batch = cur.fetchall()
+
+        if not batch:
+            break
+
+        batch_dupes = 0
+        for fid, emb, flen in batch:
+            if total_dupes >= DEDUP_MAX_PER_RUN:
+                break
+
+            # KNN: ближайший сосед с sim > threshold
+            cur.execute("""
+                SELECT b.id, 1 - (b.embedding <=> %s::vector) as sim, LENGTH(b.fact_text) as len
+                FROM km_facts b
+                WHERE b.id != %s
+                  AND b.embedding IS NOT NULL
+                  AND b.verification_status NOT IN ('rejected', 'duplicate')
+                ORDER BY b.embedding <=> %s::vector
+                LIMIT 1
+            """, (emb, fid, emb))
+            row = cur.fetchone()
+
+            if row and row[1] >= DEDUP_SIMILARITY_THRESHOLD:
+                neighbor_id, sim, neighbor_len = row
+
+                # Пропускаем уже обработанные пары
+                pair_key = tuple(sorted([fid, neighbor_id]))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+
+                # Оставляем более длинный факт (больше информации)
+                if flen >= neighbor_len:
+                    keep_id, remove_id = fid, neighbor_id
+                else:
+                    keep_id, remove_id = neighbor_id, fid
+
+                cur.execute("""
+                    UPDATE km_facts
+                    SET verification_status = 'duplicate',
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND verification_status NOT IN ('rejected', 'duplicate')
+                """, (remove_id,))
+
+                if cur.rowcount > 0:
+                    total_dupes += 1
+                    batch_dupes += 1
+
+        conn.commit()
+        logger.info(f"[DEDUP] Batch offset={offset}: найдено {batch_dupes} дублей")
+        offset += DEDUP_BATCH_SIZE
+
+    logger.info(f"[DEDUP] Итого помечено дублями: {total_dupes}")
+    return total_dupes
+
+
+# ============================================================
+# STEP 1: LLM-РЕВЬЮ (без изменений)
+# ============================================================
+
 def get_company_context(conn):
     """Загружает контекст компании для ревизора."""
     cur = conn.cursor()
-    
+
     # Ключевые факты из agent_memory
     cur.execute("""
-        SELECT category, subject, fact 
-        FROM agent_memory 
+        SELECT category, subject, fact
+        FROM agent_memory
         WHERE is_active = true AND category IN ('компания', 'персонал', 'бренд', 'продукция', 'клиент', 'поставщик')
         ORDER BY category, subject
         LIMIT 100
     """)
     memory_facts = cur.fetchall()
-    
+
     # Текущие правила фильтрации
     cur.execute("""
-        SELECT rule_type, value, reason, hit_count 
-        FROM km_filter_rules 
-        WHERE is_active = true 
+        SELECT rule_type, value, reason, hit_count
+        FROM km_filter_rules
+        WHERE is_active = true
         ORDER BY hit_count DESC
     """)
     rules = cur.fetchall()
-    
+
     cur.close()
-    
+
     # Формируем контекст
     context = "=== О КОМПАНИИ ===\n"
     current_cat = ""
@@ -102,11 +203,11 @@ def get_company_context(conn):
             context += f"\n[{cat.upper()}]\n"
             current_cat = cat
         context += f"- {subj}: {fact[:200]}\n"
-    
+
     context += "\n=== ТЕКУЩИЕ ПРАВИЛА ФИЛЬТРАЦИИ ===\n"
     for rtype, value, reason, hits in rules:
         context += f"- {rtype}: '{value}' ({reason}, срабатываний: {hits})\n"
-    
+
     return context
 
 
@@ -114,7 +215,7 @@ def get_items_for_review(conn, limit=MAX_FACTS_PER_RUN):
     """Получает сущности для проверки — факты, решения, задачи, политики."""
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     items = []
-    
+
     # Факты (приоритет — без subject)
     cur.execute("""
         SELECT f.id, 'fact' as item_type, f.fact_type as subtype, f.fact_text as text,
@@ -127,7 +228,7 @@ def get_items_for_review(conn, limit=MAX_FACTS_PER_RUN):
         LIMIT %s
     """, (limit // 2,))
     items.extend(cur.fetchall())
-    
+
     # Решения
     cur.execute("""
         SELECT id, 'decision' as item_type, scope_type as subtype, decision_text as text,
@@ -139,7 +240,7 @@ def get_items_for_review(conn, limit=MAX_FACTS_PER_RUN):
         LIMIT %s
     """, (limit // 6,))
     items.extend(cur.fetchall())
-    
+
     # Задачи
     cur.execute("""
         SELECT id, 'task' as item_type, NULL as subtype, task_text as text,
@@ -151,7 +252,7 @@ def get_items_for_review(conn, limit=MAX_FACTS_PER_RUN):
         LIMIT %s
     """, (limit // 6,))
     items.extend(cur.fetchall())
-    
+
     # Политики
     cur.execute("""
         SELECT id, 'policy' as item_type, NULL as subtype, policy_text as text,
@@ -163,7 +264,7 @@ def get_items_for_review(conn, limit=MAX_FACTS_PER_RUN):
         LIMIT %s
     """, (limit // 6,))
     items.extend(cur.fetchall())
-    
+
     cur.close()
     return items
 
@@ -200,24 +301,24 @@ def review_batch(facts_batch, company_context):
         f"[{f['item_type'].upper()} ID:{f['id']}] subtype={f['subtype'] or '-'} subject={f['subject_name'] or 'НЕТ'} | {f['text'][:200]}"
         for f in facts_batch
     ])
-    
+
     user_content = f"""{company_context}
 
 === ФАКТЫ ДЛЯ ПРОВЕРКИ ({len(facts_batch)} шт) ===
 {facts_text}
 
 Проверь каждый факт. JSON:"""
-    
+
     result = call_llm([
         {'role': 'system', 'content': REVIEW_SYSTEM_PROMPT},
         {'role': 'user', 'content': user_content}
     ])
-    
+
     # Парсим JSON
     result = result.strip()
     if result.startswith('```'):
         result = result.split('\n', 1)[1].rsplit('```', 1)[0]
-    
+
     return json.loads(result)
 
 
@@ -225,24 +326,24 @@ def apply_verdicts(conn, verdicts):
     """Применяет вердикты ревизора ко всем типам сущностей."""
     cur = conn.cursor()
     stats = {'kept': 0, 'deleted': 0, 'uncertain': 0}
-    
+
     table_map = {
         'fact': ('km_facts', 'id'),
         'decision': ('km_decisions', 'id'),
         'task': ('km_tasks', 'id'),
         'policy': ('km_policies', 'id'),
     }
-    
+
     for v in verdicts:
         item_id = v.get('id')
         item_type = v.get('type', 'fact')
         verdict = v.get('verdict', 'uncertain')
-        
+
         table, id_col = table_map.get(item_type, ('km_facts', 'id'))
-        
+
         if verdict == 'delete':
             cur.execute(f"""
-                UPDATE {table} SET verification_status = 'rejected', updated_at = NOW() 
+                UPDATE {table} SET verification_status = 'rejected', updated_at = NOW()
                 WHERE {id_col} = %s
             """, (item_id,))
             stats['deleted'] += 1
@@ -252,7 +353,7 @@ def apply_verdicts(conn, verdicts):
         else:
             cur.execute(f"UPDATE {table} SET verification_status = 'uncertain', updated_at = NOW() WHERE {id_col} = %s", (item_id,))
             stats['uncertain'] += 1
-    
+
     conn.commit()
     cur.close()
     return stats
@@ -263,7 +364,7 @@ def apply_new_rules(conn, new_rules, remove_rules):
     cur = conn.cursor()
     added = 0
     removed = 0
-    
+
     for rule in new_rules:
         value = rule.get('value', '').lower().strip()
         reason = rule.get('reason', '')
@@ -278,7 +379,7 @@ def apply_new_rules(conn, new_rules, remove_rules):
             """, (value, reason))
             added += 1
             logger.info(f"  Новое правило: '{value}' — {reason}")
-    
+
     for rule in remove_rules:
         value = rule.get('value', '').lower().strip()
         reason = rule.get('reason', '')
@@ -291,7 +392,7 @@ def apply_new_rules(conn, new_rules, remove_rules):
         if cur.rowcount > 0:
             removed += 1
             logger.info(f"  Правило отключено: '{value}' — {reason}")
-    
+
     conn.commit()
     cur.close()
     return added, removed
@@ -321,61 +422,83 @@ def main():
     except IOError:
         print("review_knowledge уже запущен")
         sys.exit(0)
-    
+
     logger.info("=" * 60)
     logger.info("РЕВИЗИЯ ЗНАНИЙ — СТАРТ")
     logger.info("=" * 60)
-    
+
     conn = get_conn()
-    
+
+    # ============================================================
+    # STEP 0: ДЕДУПЛИКАЦИЯ
+    # ============================================================
+    logger.info("--- STEP 0: Дедупликация по embedding similarity ---")
+    try:
+        dedup_count = deduplicate_facts(conn)
+    except Exception as e:
+        logger.error(f"Ошибка дедупликации: {e}")
+        dedup_count = 0
+
+    # ============================================================
+    # STEP 1: LLM-РЕВЬЮ
+    # ============================================================
+    logger.info("--- STEP 1: LLM-ревью новых фактов ---")
+
     # Загружаем контекст компании
     company_context = get_company_context(conn)
     logger.info(f"Контекст компании: {len(company_context)} символов")
-    
+
     # Получаем факты для проверки
     facts = get_items_for_review(conn)
     # Лимит — не более 30% от проверенных
     max_delete = max(int(len(facts) * 0.3), 5)  # минимум 5
     logger.info(f"Фактов для проверки: {len(facts)}")
-    
+
     if not facts:
-        logger.info("Нечего проверять")
-        send_report("🔬 Ревизия знаний: нечего проверять ✅")
+        logger.info("Нечего проверять (LLM)")
+        report = (
+            f"<b>🔬 Ревизия знаний</b>\n\n"
+            f"<b>Step 0 — Дедупликация:</b>\n"
+            f"🔄 Помечено дублями: {dedup_count}\n\n"
+            f"<b>Step 1 — LLM-ревью:</b>\n"
+            f"Нечего проверять ✅"
+        )
+        send_report(report)
         conn.close()
         return
-    
+
     total_stats = {'kept': 0, 'deleted': 0, 'uncertain': 0}
     total_new_rules = 0
     total_removed_rules = 0
     errors = 0
-    
+
     # Обрабатываем батчами
     for i in range(0, len(facts), LLM_BATCH_SIZE):
         batch = facts[i:i+LLM_BATCH_SIZE]
         batch_num = i // LLM_BATCH_SIZE + 1
         logger.info(f"Батч {batch_num}: {len(batch)} фактов")
-        
+
         try:
             result = review_batch(batch, company_context)
-            
+
             # Применяем вердикты
             verdicts = result.get('verdicts', [])
             stats = apply_verdicts(conn, verdicts)
             for k in stats:
                 total_stats[k] += stats[k]
-            
+
             # Применяем новые правила
             new_rules = result.get('new_rules', [])
             remove_rules = result.get('remove_rules', [])
             added, removed = apply_new_rules(conn, new_rules, remove_rules)
             total_new_rules += added
             total_removed_rules += removed
-            
+
             logger.info(f"  kept={stats['kept']}, deleted={stats['deleted']}, "
                        f"uncertain={stats['uncertain']}, +rules={added}, -rules={removed}")
-            
+
             time.sleep(1)  # Rate limiting
-            
+
         except json.JSONDecodeError as e:
             logger.error(f"  JSON parse error: {e}")
             errors += 1
@@ -388,53 +511,57 @@ def main():
     if total_stats['deleted'] > max_delete:
         limit_warning = f"\n⚠️ ВНИМАНИЕ: удалено {total_stats['deleted']} > лимит {max_delete} (30%)! Проверьте правила!"
         logger.warning(limit_warning)
-    
+
     # Сохраняем метрики здоровья
     try:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO km_health_metrics (metric_date, facts_rejected, facts_verified, rules_added, rules_disabled)
-            VALUES (CURRENT_DATE, %s, %s, %s, %s)
+            INSERT INTO km_health_metrics (metric_date, facts_rejected, facts_verified, facts_deduplicated, rules_added, rules_disabled)
+            VALUES (CURRENT_DATE, %s, %s, %s, %s, %s)
             ON CONFLICT (metric_date) DO UPDATE SET
                 facts_rejected = km_health_metrics.facts_rejected + EXCLUDED.facts_rejected,
                 facts_verified = km_health_metrics.facts_verified + EXCLUDED.facts_verified,
+                facts_deduplicated = km_health_metrics.facts_deduplicated + EXCLUDED.facts_deduplicated,
                 rules_added = km_health_metrics.rules_added + EXCLUDED.rules_added,
                 rules_disabled = km_health_metrics.rules_disabled + EXCLUDED.rules_disabled
-        """, (total_stats['deleted'], total_stats['kept'], total_new_rules, total_removed_rules))
+        """, (total_stats['deleted'], total_stats['kept'], dedup_count, total_new_rules, total_removed_rules))
         conn.commit()
         cur.close()
     except Exception as e:
         logger.error(f"Ошибка сохранения метрик: {e}")
-    
+
     # Статистика
     conn2 = get_conn()
     cur = conn2.cursor()
-    cur.execute("SELECT COUNT(*) FROM km_facts")
-    total_facts = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM km_facts WHERE verification_status NOT IN ('rejected','duplicate')")
+    active_facts = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM km_facts WHERE verification_status = 'duplicate'")
+    dup_facts = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM km_filter_rules WHERE is_active = true")
     active_rules = cur.fetchone()[0]
     cur.close()
     conn2.close()
-    
+
     # Отчёт
     report = (
         f"<b>🔬 Ревизия знаний</b>\n\n"
-        f"Проверено: {len(facts)} фактов\n"
+        f"<b>Step 0 — Дедупликация:</b>\n"
+        f"🔄 Помечено дублями: {dedup_count}\n"
+        f"📊 Всего дублей в базе: {dup_facts}\n\n"
+        f"<b>Step 1 — LLM-ревью:</b>\n"
+        f"Проверено: {len(facts)}\n"
         f"✅ Оставлено: {total_stats['kept']}\n"
-        f"❌ Удалено: {total_stats['deleted']}\n"
+        f"❌ Отклонено: {total_stats['deleted']}\n"
         f"❓ Неопределённо: {total_stats['uncertain']}\n"
         f"⚠️ Ошибок: {errors}\n\n"
-        f"📏 Правила фильтрации:\n"
-        f"  + Добавлено: {total_new_rules}\n"
-        f"  - Отключено: {total_removed_rules}\n"
-        f"  Всего активных: {active_rules}\n\n"
-        f"📊 Всего фактов в базе: {total_facts}"
+        f"📏 Правила: +{total_new_rules} / -{total_removed_rules} (активных: {active_rules})\n"
+        f"📊 Активных фактов: {active_facts}"
         f"{limit_warning}"
     )
-    
+
     logger.info(f"Отчёт:\n{report}")
     send_report(report)
-    
+
     conn.close()
     logger.info("РЕВИЗИЯ ЗАВЕРШЕНА")
 
