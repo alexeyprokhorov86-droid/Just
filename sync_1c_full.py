@@ -3320,7 +3320,6 @@ class Sync1C:
                     doc.get('Posted', False),
                     doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
                     doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
-                    doc.get('Подразделение_Key') if doc.get('Подразделение_Key') != EMPTY_UUID else None,
                     doc.get('Комментарий', ''),
                     doc.get('DeletionMark', False),
                     doc.get('Сценарий_Key') if doc.get('Сценарий_Key') != EMPTY_UUID else None,
