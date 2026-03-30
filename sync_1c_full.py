@@ -3876,7 +3876,7 @@ class Sync1C:
                     doc.get('Posted', False),
                     doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
                     doc.get('Комментарий', ''),
-                    doc.get('DeletionMark', False)
+                    doc.get('DeletionMark', False),
                     doc.get('Сценарий_Key') if doc.get('Сценарий_Key') != EMPTY_UUID else None,
                     doc.get('ВидПлана_Key') if doc.get('ВидПлана_Key') != EMPTY_UUID else None,
                     doc.get('НачалоПериода', '')[:10] if doc.get('НачалоПериода', '')[:4] != '0001' else None,
@@ -4185,7 +4185,7 @@ class Sync1C:
                     doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
                     doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
                     doc.get('Комментарий', ''),
-                    doc.get('DeletionMark', False)
+                    doc.get('DeletionMark', False),
                     doc.get('Сценарий_Key') if doc.get('Сценарий_Key') != EMPTY_UUID else None,
                     doc.get('ВидПлана_Key') if doc.get('ВидПлана_Key') != EMPTY_UUID else None,
                     doc.get('НачалоПериода', '')[:10] if doc.get('НачалоПериода', '')[:4] != '0001' else None,
@@ -4332,7 +4332,7 @@ class Sync1C:
                     doc.get('Исправление', False),
                     doc.get('СторнируемыйДокумент_Key') if doc.get('СторнируемыйДокумент_Key') != EMPTY_UUID else None,
                     doc.get('ИсправляемыйДокумент_Key') if doc.get('ИсправляемыйДокумент_Key') != EMPTY_UUID else None,
-                    doc.get('DeletionMark', False),
+                    doc.get('DeletionMark', False)
                 ))
 
                 # Табличная часть "Товары"
