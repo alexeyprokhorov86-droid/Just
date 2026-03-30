@@ -3300,8 +3300,8 @@ class Sync1C:
                 ref_key = doc.get('Ref_Key')
                 
                 cur.execute("""
-                    INSERT INTO c1_production_plan (ref_key, doc_number, doc_date, posted,
-                        organization_key, department_key, comment, is_deleted,
+                    INSERT INTO c1_sales_plan (ref_key, doc_number, doc_date, posted,
+                        organization_key, partner_key, comment, is_deleted,
                         scenario_key, plan_type_key, period_start, period_end, status, updated_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ref_key) DO UPDATE SET
@@ -3326,6 +3326,7 @@ class Sync1C:
                     doc.get('ВидПлана_Key') if doc.get('ВидПлана_Key') != EMPTY_UUID else None,
                     doc.get('НачалоПериода', '')[:10] if doc.get('НачалоПериода', '')[:4] != '0001' else None,
                     doc.get('ОкончаниеПериода', '')[:10] if doc.get('ОкончаниеПериода', '')[:4] != '0001' else None,
+                    doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
                     doc.get('Статус', '')
                 ))
                 
@@ -3524,10 +3525,10 @@ class Sync1C:
                 ref_key = doc.get('Ref_Key')
                 
                 cur.execute("""
-                    INSERT INTO c1_production_plan (ref_key, doc_number, doc_date, posted,
-                        organization_key, department_key, comment, is_deleted,
+                    INSERT INTO c1_purchase_plan (ref_key, doc_number, doc_date, posted,
+                        organization_key, comment, is_deleted,
                         scenario_key, plan_type_key, period_start, period_end, status, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ref_key) DO UPDATE SET
                         doc_number = EXCLUDED.doc_number,
                         doc_date = EXCLUDED.doc_date,
@@ -3543,7 +3544,6 @@ class Sync1C:
                     doc.get('Date', '')[:10],
                     doc.get('Posted', False),
                     doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
-                    doc.get('Подразделение_Key') if doc.get('Подразделение_Key') != EMPTY_UUID else None,
                     doc.get('Комментарий', ''),
                     doc.get('DeletionMark', False),
                     doc.get('Сценарий_Key') if doc.get('Сценарий_Key') != EMPTY_UUID else None,
@@ -3856,10 +3856,10 @@ class Sync1C:
                 ref_key = doc.get('Ref_Key')
                 
                 cur.execute("""
-                    INSERT INTO c1_sales_plan (ref_key, doc_number, doc_date, posted,
+                    INSERT INTO c1_purchase_plan (ref_key, doc_number, doc_date, posted,
                         organization_key, comment, is_deleted,
                         scenario_key, plan_type_key, period_start, period_end, status, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ref_key) DO UPDATE SET
                         doc_number = EXCLUDED.doc_number,
                         doc_date = EXCLUDED.doc_date,
