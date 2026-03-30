@@ -3319,6 +3319,7 @@ class Sync1C:
                     doc.get('Date', '')[:10],
                     doc.get('Posted', False),
                     doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
+                    doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
                     doc.get('Подразделение_Key') if doc.get('Подразделение_Key') != EMPTY_UUID else None,
                     doc.get('Комментарий', ''),
                     doc.get('DeletionMark', False),
@@ -3326,7 +3327,6 @@ class Sync1C:
                     doc.get('ВидПлана_Key') if doc.get('ВидПлана_Key') != EMPTY_UUID else None,
                     doc.get('НачалоПериода', '')[:10] if doc.get('НачалоПериода', '')[:4] != '0001' else None,
                     doc.get('ОкончаниеПериода', '')[:10] if doc.get('ОкончаниеПериода', '')[:4] != '0001' else None,
-                    doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
                     doc.get('Статус', '')
                 ))
                 
