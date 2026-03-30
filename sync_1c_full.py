@@ -3856,12 +3856,18 @@ class Sync1C:
                 ref_key = doc.get('Ref_Key')
                 
                 cur.execute("""
-                    INSERT INTO c1_purchase_plan (ref_key, doc_number, doc_date, posted,
-                        organization_key, comment, is_deleted, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                    INSERT INTO c1_sales_plan (ref_key, doc_number, doc_date, posted,
+                        organization_key, comment, is_deleted,
+                        scenario_key, plan_type_key, period_start, period_end, status, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ref_key) DO UPDATE SET
                         doc_number = EXCLUDED.doc_number,
                         doc_date = EXCLUDED.doc_date,
+                        scenario_key = EXCLUDED.scenario_key,
+                        plan_type_key = EXCLUDED.plan_type_key,
+                        period_start = EXCLUDED.period_start,
+                        period_end = EXCLUDED.period_end,
+                        status = EXCLUDED.status,
                         updated_at = NOW()
                 """, (
                     ref_key,
@@ -3871,6 +3877,11 @@ class Sync1C:
                     doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
                     doc.get('Комментарий', ''),
                     doc.get('DeletionMark', False)
+                    doc.get('Сценарий_Key') if doc.get('Сценарий_Key') != EMPTY_UUID else None,
+                    doc.get('ВидПлана_Key') if doc.get('ВидПлана_Key') != EMPTY_UUID else None,
+                    doc.get('НачалоПериода', '')[:10] if doc.get('НачалоПериода', '')[:4] != '0001' else None,
+                    doc.get('ОкончаниеПериода', '')[:10] if doc.get('ОкончаниеПериода', '')[:4] != '0001' else None,
+                    doc.get('Статус', '')
                 ))
                 
                 # Удаляем старые позиции
@@ -4154,11 +4165,17 @@ class Sync1C:
                 
                 cur.execute("""
                     INSERT INTO c1_sales_plan (ref_key, doc_number, doc_date, posted,
-                        organization_key, partner_key, comment, is_deleted, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        organization_key, partner_key, comment, is_deleted,
+                        scenario_key, plan_type_key, period_start, period_end, status, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ref_key) DO UPDATE SET
                         doc_number = EXCLUDED.doc_number,
                         doc_date = EXCLUDED.doc_date,
+                        scenario_key = EXCLUDED.scenario_key,
+                        plan_type_key = EXCLUDED.plan_type_key,
+                        period_start = EXCLUDED.period_start,
+                        period_end = EXCLUDED.period_end,
+                        status = EXCLUDED.status,
                         updated_at = NOW()
                 """, (
                     ref_key,
@@ -4169,6 +4186,11 @@ class Sync1C:
                     doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
                     doc.get('Комментарий', ''),
                     doc.get('DeletionMark', False)
+                    doc.get('Сценарий_Key') if doc.get('Сценарий_Key') != EMPTY_UUID else None,
+                    doc.get('ВидПлана_Key') if doc.get('ВидПлана_Key') != EMPTY_UUID else None,
+                    doc.get('НачалоПериода', '')[:10] if doc.get('НачалоПериода', '')[:4] != '0001' else None,
+                    doc.get('ОкончаниеПериода', '')[:10] if doc.get('ОкончаниеПериода', '')[:4] != '0001' else None,
+                    doc.get('Статус', '')
                 ))
                 
                 # Удаляем старые позиции
