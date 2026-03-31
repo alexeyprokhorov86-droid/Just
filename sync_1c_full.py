@@ -1556,6 +1556,7 @@ class Sync1C:
                 f"?$format=json"
                 f"&$top={batch_size}"
                 f"&$skip={skip}"
+                f"&$orderby=Ref_Key asc"
             )
             
             try:
