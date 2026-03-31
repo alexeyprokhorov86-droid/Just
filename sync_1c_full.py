@@ -920,7 +920,9 @@ def ensure_units_table(conn):
                 ADD COLUMN IF NOT EXISTS product_quantity NUMERIC(15,6),
                 ADD COLUMN IF NOT EXISTS status VARCHAR(50),
                 ADD COLUMN IF NOT EXISTS auto_select VARCHAR(50),
-                ADD COLUMN IF NOT EXISTS has_nested BOOLEAN DEFAULT FALSE
+                ADD COLUMN IF NOT EXISTS has_nested BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS valid_from TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS valid_to TIMESTAMP
             """)
             
             # Индексы для быстрого поиска
@@ -1919,7 +1921,7 @@ class Sync1C:
 
   
     def sync_specifications(self, conn):
-        """Синхронизация ресурсных спецификаций с полными данными."""
+        """Синхронизация ресурсных спецификаций с табличными частями."""
         print("\n[Ресурсные спецификации]")
         
         items = self.get_catalog_items("Catalog_РесурсныеСпецификации")
@@ -1928,7 +1930,10 @@ class Sync1C:
             print("  Нет данных")
             return 0
         
-        count = 0
+        spec_count = 0
+        out_count = 0
+        mat_count = 0
+        
         with conn.cursor() as cur:
             for item in items:
                 try:
@@ -1936,34 +1941,48 @@ class Sync1C:
                     if not ref_key or ref_key == EMPTY_UUID:
                         continue
                     
-                    # Статус
+                    if item.get('IsFolder', False):
+                        continue
+                    
                     status_raw = item.get('Статус', '')
                     status = status_raw if isinstance(status_raw, str) else ''
                     
-                    # Автоматический выбор (инвертируем флаг исключения)
                     exclude_auto = item.get('ИсключитьАвтоматическийВыборВДокументах', False)
                     auto_select = 'Вручную' if exclude_auto else 'Автоматически'
                     
-                    # Основное изделие (номенклатура) - КЛЮЧЕВОЕ ПОЛЕ!
+                    has_nested = item.get('ЕстьВложенныеСпецификации', False)
+                    
+                    valid_from = item.get('НачалоДействия')
+                    valid_to = item.get('КонецДействия')
+                    
+                    # Основное изделие из шапки
                     product_key = item.get('ОсновноеИзделиеНоменклатура_Key')
                     if product_key == EMPTY_UUID:
                         product_key = None
-                    
-                    # Количество выхода
-                    product_qty = item.get('ОсновноеИзделиеКоличествоУпаковок', 0)
+                    product_qty = 0
                     try:
-                        product_qty = float(product_qty) if product_qty else 0
+                        product_qty = float(item.get('ОсновноеИзделиеКоличествоУпаковок', 0) or 0)
                     except:
-                        product_qty = 0
+                        pass
                     
-                    # Есть вложенные спецификации
-                    has_nested = item.get('ЕстьВложенныеСпецификации', False)
+                    # Для сводных: берём product из ВыходныеИзделия
+                    outputs = item.get('ВыходныеИзделия', [])
+                    if (not product_key or product_qty == 0) and outputs:
+                        first_out = outputs[0]
+                        out_nom = first_out.get('Номенклатура_Key')
+                        if out_nom and out_nom != EMPTY_UUID:
+                            product_key = out_nom
+                        try:
+                            product_qty = float(first_out.get('КоличествоУпаковок', 0) or 0)
+                        except:
+                            pass
                     
                     cur.execute("""
                         INSERT INTO c1_specifications 
                         (ref_key, code, name, owner_key, is_deleted, updated_at,
-                         product_key, product_quantity, status, auto_select, has_nested)
-                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s)
+                         product_key, product_quantity, status, auto_select, has_nested,
+                         valid_from, valid_to)
+                        VALUES (%s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (ref_key) DO UPDATE SET
                             code = EXCLUDED.code,
                             name = EXCLUDED.name,
@@ -1974,7 +1993,9 @@ class Sync1C:
                             product_quantity = EXCLUDED.product_quantity,
                             status = EXCLUDED.status,
                             auto_select = EXCLUDED.auto_select,
-                            has_nested = EXCLUDED.has_nested
+                            has_nested = EXCLUDED.has_nested,
+                            valid_from = EXCLUDED.valid_from,
+                            valid_to = EXCLUDED.valid_to
                     """, (
                         ref_key,
                         item.get('Code', ''),
@@ -1985,16 +2006,59 @@ class Sync1C:
                         product_qty,
                         status,
                         auto_select,
-                        has_nested
+                        has_nested,
+                        valid_from,
+                        valid_to
                     ))
-                    count += 1
+                    spec_count += 1
+                    
+                    # Удаляем старые строки табличных частей
+                    cur.execute("DELETE FROM c1_spec_outputs WHERE spec_key = %s", (ref_key,))
+                    cur.execute("DELETE FROM c1_spec_materials WHERE spec_key = %s", (ref_key,))
+                    
+                    # Выходные изделия
+                    for out in outputs:
+                        nom_key = out.get('Номенклатура_Key')
+                        if not nom_key or nom_key == EMPTY_UUID:
+                            continue
+                        try:
+                            qty = float(out.get('КоличествоУпаковок', 0) or 0)
+                        except:
+                            qty = 0
+                        cur.execute("""
+                            INSERT INTO c1_spec_outputs (spec_key, line_number, nomenclature_key, quantity)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (spec_key, line_number) DO UPDATE SET
+                                nomenclature_key = EXCLUDED.nomenclature_key,
+                                quantity = EXCLUDED.quantity
+                        """, (ref_key, out.get('LineNumber'), nom_key, qty))
+                        out_count += 1
+                    
+                    # Материалы
+                    for mat in item.get('МатериалыИУслуги', []):
+                        nom_key = mat.get('Номенклатура_Key')
+                        if not nom_key or nom_key == EMPTY_UUID:
+                            continue
+                        try:
+                            qty = float(mat.get('КоличествоУпаковок', 0) or 0)
+                        except:
+                            qty = 0
+                        cur.execute("""
+                            INSERT INTO c1_spec_materials (spec_key, line_number, nomenclature_key, quantity)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (spec_key, line_number) DO UPDATE SET
+                                nomenclature_key = EXCLUDED.nomenclature_key,
+                                quantity = EXCLUDED.quantity
+                        """, (ref_key, mat.get('LineNumber'), nom_key, qty))
+                        mat_count += 1
+                    
                 except Exception as e:
                     print(f"    Ошибка записи спецификации: {e}")
             
             conn.commit()
         
-        print(f"  ✅ Сохранено: {count} спецификаций")
-        return count
+        print(f"  ✅ Сохранено: {spec_count} спецификаций, {out_count} выходов, {mat_count} материалов")
+        return spec_count
 
     def sync_all_catalogs(self, conn):
         """Синхронизация всех справочников."""
