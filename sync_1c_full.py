@@ -2061,6 +2061,157 @@ class Sync1C:
         print(f"  ✅ Сохранено: {spec_count} спецификаций, {out_count} выходов, {mat_count} материалов")
         return spec_count
 
+    def sync_evg_workshops(self, conn):
+        """Синхронизация справочника цехов производства."""
+        print("\n[Цеха производства]")
+        from urllib.parse import quote
+        
+        encoded = quote("Catalog_EVG_ЦехаПроизводства", safe='_')
+        resp = self.session.get(f"{self.base_url}/{encoded}?$format=json", timeout=30)
+        if resp.status_code != 200:
+            print(f"  Ошибка HTTP {resp.status_code}")
+            return 0
+        
+        items = resp.json().get('value', [])
+        count = 0
+        with conn.cursor() as cur:
+            for item in items:
+                ref = item.get('Ref_Key')
+                if not ref or ref == EMPTY_UUID:
+                    continue
+                cur.execute("""
+                    INSERT INTO c1_evg_workshops (ref_key, code, name, workshop, department_key, is_deleted)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (ref_key) DO UPDATE SET
+                        name = EXCLUDED.name, workshop = EXCLUDED.workshop,
+                        department_key = EXCLUDED.department_key, updated_at = NOW()
+                """, (
+                    ref, item.get('Code', ''), item.get('Description', ''),
+                    item.get('Цех', ''),
+                    item.get('Подразделение_Key') if item.get('Подразделение_Key') != EMPTY_UUID else None,
+                    item.get('DeletionMark', False)
+                ))
+                count += 1
+            conn.commit()
+        print(f"  ✅ Сохранено: {count} цехов")
+        return count
+
+    def sync_evg_labor_costs(self, conn):
+        """Синхронизация тарифов трудозатрат."""
+        print("\n[Трудозатраты]")
+        from urllib.parse import quote
+        
+        encoded = quote("InformationRegister_EVG_Трудозатраты", safe='_')
+        all_items = []
+        skip = 0
+        while True:
+            resp = self.session.get(
+                f'{self.base_url}/{encoded}?$format=json&$top=500&$skip={skip}&$orderby=Period desc',
+                timeout=60
+            )
+            if resp.status_code != 200:
+                break
+            batch = resp.json().get('value', [])
+            if not batch:
+                break
+            all_items.extend(batch)
+            if len(batch) < 500:
+                break
+            skip += 500
+            time.sleep(0.2)
+        
+        count = 0
+        with conn.cursor() as cur:
+            for item in all_items:
+                wk = item.get('Цех_Key')
+                pk = item.get('ФинальныйПродукт_Key')
+                if not wk or wk == EMPTY_UUID:
+                    continue
+                cur.execute("""
+                    INSERT INTO c1_evg_labor_costs (period, workshop_key, product_key, rate)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (period, workshop_key, product_key) DO UPDATE SET
+                        rate = EXCLUDED.rate
+                """, (
+                    item.get('Period', '')[:10], wk,
+                    pk if pk != EMPTY_UUID else None,
+                    item.get('ТарифНаИзготовление', 0)
+                ))
+                count += 1
+            conn.commit()
+        print(f"  ✅ Сохранено: {count} тарифов")
+        return count
+
+    def sync_nkt_access_log(self, conn, date_from=None):
+        """Синхронизация проходов сотрудников (СКУД)."""
+        print("\n[НКТ Входы/Выходы]")
+        from urllib.parse import quote
+        
+        if date_from is None:
+            date_from = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%dT00:00:00")
+        else:
+            date_from = date_from.strftime("%Y-%m-%dT00:00:00")
+        
+        encoded = quote("InformationRegister_НКТ_ВходыВыходы", safe='_')
+        all_items = []
+        skip = 0
+        while True:
+            resp = self.session.get(
+                f"{self.base_url}/{encoded}?$format=json&$top=500&$skip={skip}"
+                f"&$filter=Period ge datetime'{date_from}'"
+                f"&$orderby=Period desc",
+                timeout=120
+            )
+            if resp.status_code != 200:
+                break
+            batch = resp.json().get('value', [])
+            batch = [sanitize_dict(b) for b in batch]
+            if not batch:
+                break
+            all_items.extend(batch)
+            if len(batch) < 500:
+                break
+            skip += 500
+            if skip % 5000 == 0:
+                print(f"    Загружено: {len(all_items)}...")
+            time.sleep(0.2)
+        
+        count = 0
+        errors = 0
+        with conn.cursor() as cur:
+            for item in all_items:
+                period = item.get('Period')
+                emp = item.get('Сотрудник_Key')
+                if not period or not emp or emp == EMPTY_UUID:
+                    continue
+                time_in = item.get('ВремяВхода')
+                time_out = item.get('ВремяВыхода')
+                try:
+                    cur.execute("""
+                        INSERT INTO c1_nkt_access_log (period, employee_key, time_in, time_out,
+                            territory_in, territory_out, room, tab_number, full_name)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (period, employee_key) DO UPDATE SET
+                            time_in = EXCLUDED.time_in, time_out = EXCLUDED.time_out,
+                            territory_in = EXCLUDED.territory_in, territory_out = EXCLUDED.territory_out
+                    """, (
+                        period, emp,
+                        time_in if time_in and time_in[:4] != '0001' else None,
+                        time_out if time_out and time_out[:4] != '0001' else None,
+                        item.get('ТерриторияВхода', ''),
+                        item.get('ТерриторияВыхода', ''),
+                        item.get('Помещение', ''),
+                        item.get('ТабельныйНомер', ''),
+                        item.get('ФИО', '')
+                    ))
+                    count += 1
+                except Exception as e:
+                    conn.rollback()
+                    errors += 1
+            conn.commit()
+        print(f"  ✅ Сохранено: {count} проходов, ошибок: {errors}")
+        return count
+    
     def sync_all_catalogs(self, conn):
         """Синхронизация всех справочников."""
         print("\n" + "=" * 60)
@@ -5111,6 +5262,9 @@ def main_weekly(sync, conn):
     # Заказы и ордера за год
     sync.sync_customer_orders(conn, date_from_year, date_to)
     sync.sync_dispatch_orders(conn, date_from_year, date_to)
+    sync.sync_nkt_access_log(conn, date_from_year)
+    sync.sync_evg_workshops(conn)
+    sync.sync_evg_labor_costs(conn)
 
 def main_incremental(sync, conn):
     """Инкрементальная синхронизация (только новые документы)."""
@@ -5161,6 +5315,7 @@ def main_quick(sync, conn):
     date_from_orders = date_to - timedelta(days=14)
     sync.sync_dispatch_orders(conn, date_from_orders, date_to)
     sync.sync_stock_balance(conn)
+    sync.sync_nkt_access_log(conn)
 
 
 def main_hourly(sync, conn):
@@ -5220,6 +5375,9 @@ def main_daily(sync, conn):
     sync.sync_debt_offset(conn, date_from, date_to)
     sync.sync_goods_transfer(conn, date_from, date_to)
     sync.sync_dispatch_orders(conn, date_from, date_to)
+    sync.sync_nkt_access_log(conn, date_from)
+    sync.sync_evg_workshops(conn)
+    sync.sync_evg_labor_costs(conn)
     
     # Тяжёлые планы — с маленьким batch_size
     sync.sync_sales_plan_light(conn, date_from, date_to)
