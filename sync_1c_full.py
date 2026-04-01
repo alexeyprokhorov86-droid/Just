@@ -5139,7 +5139,8 @@ def main_quick(sync, conn):
     
     sync.sync_sales(conn, date_from, date_to)
     sync.sync_customer_orders(conn, date_from, date_to)
-    sync.sync_dispatch_orders(conn, date_from, date_to)
+    date_from_orders = date_to - timedelta(days=14)
+    sync.sync_dispatch_orders(conn, date_from_orders, date_to)
     sync.sync_stock_balance(conn)
 
 
@@ -5162,13 +5163,13 @@ def main_hourly(sync, conn):
     sync.sync_material_transfers(conn, date_from, date_to)
    
 def main_daily(sync, conn):
-    """Ежедневная синхронизация — все документы за 7 дней."""
+    """Ежедневная синхронизация — все документы за 14 дней."""
     print("\n" + "=" * 60)
     print("ЕЖЕДНЕВНАЯ СИНХРОНИЗАЦИЯ")
     print("=" * 60)
     
     date_to = datetime.now().date()
-    date_from = date_to - timedelta(days=7)
+    date_from = date_to - timedelta(days=14)
     print(f"Период: {date_from} — {date_to}")
     
     # Таблицы
@@ -5199,6 +5200,7 @@ def main_daily(sync, conn):
     sync.sync_internal_consumption(conn, date_from, date_to)
     sync.sync_debt_offset(conn, date_from, date_to)
     sync.sync_goods_transfer(conn, date_from, date_to)
+    sync.sync_dispatch_orders(conn, date_from, date_to)
     
     # Тяжёлые планы — с маленьким batch_size
     sync.sync_sales_plan_light(conn, date_from, date_to)
