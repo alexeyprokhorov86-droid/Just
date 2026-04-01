@@ -5093,6 +5093,25 @@ def main_full(sync, conn):
     sync.sync_all_warehouse(conn, date_from, date_to)
     sync.sync_all_finance(conn, date_from, date_to)
 
+def main_weekly(sync, conn):
+    """Еженедельная полная пересинхронизация заказов и ордеров за год."""
+    print("\n" + "=" * 60)
+    print("ЕЖЕНЕДЕЛЬНАЯ СИНХРОНИЗАЦИЯ (заказы + ордера за год)")
+    print("=" * 60)
+    
+    date_to = datetime.now().date()
+    date_from_year = date_to - timedelta(days=365)
+    print(f"Период: {date_from_year} — {date_to}")
+    
+    # Справочники
+    sync.sync_all_catalogs(conn)
+    sync.sync_nomenclature(conn)
+    sync.sync_clients(conn)
+    
+    # Заказы и ордера за год
+    sync.sync_customer_orders(conn, date_from_year, date_to)
+    sync.sync_dispatch_orders(conn, date_from_year, date_to)
+
 def main_incremental(sync, conn):
     """Инкрементальная синхронизация (только новые документы)."""
     ensure_sync_status_table(conn)
@@ -5219,6 +5238,8 @@ def main():
                         help='Часовая синхронизация (закупки, производство за 3 дня)')
     parser.add_argument('--daily', '-d', action='store_true',
                         help='Ежедневная синхронизация (все документы за 7 дней)')
+    parser.add_argument('--weekly', '-w', action='store_true',
+                        help='Еженедельная синхронизация (заказы и ордера за год)')
     args = parser.parse_args()
     
     mode = "incremental" if args.incremental else "full"
@@ -5253,6 +5274,8 @@ def main():
             main_hourly(sync, conn)
         elif args.daily:
             main_daily(sync, conn)
+        elif args.weekly:
+            main_weekly(sync, conn)
         elif args.incremental:
             main_incremental(sync, conn)
         else:
