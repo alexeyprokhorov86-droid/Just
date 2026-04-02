@@ -3081,7 +3081,7 @@ class Sync1C:
         self.sync_shortage(conn, date_from, date_to)
 
     def sync_bank_expenses(self, conn, date_from, date_to):
-        """Синхронизация документов 'Списание безналичных ДС'."""
+        """Синхронизация документов 'Списание безналичных ДС' с расшифровкой."""
         from urllib.parse import quote
         
         print("\n[Списание безналичных ДС]")
@@ -3092,7 +3092,7 @@ class Sync1C:
         encoded = quote("Document_СписаниеБезналичныхДенежныхСредств", safe='_')
         all_docs = []
         skip = 0
-        batch_size = 100
+        batch_size = 200
         
         while True:
             url = (
@@ -3132,6 +3132,9 @@ class Sync1C:
         if not all_docs:
             return 0
         
+        doc_count = 0
+        item_count = 0
+        
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM c1_bank_expenses WHERE doc_date BETWEEN %s AND %s",
@@ -3140,16 +3143,43 @@ class Sync1C:
             
             for doc in all_docs:
                 ref_key = doc.get('Ref_Key')
+                if not ref_key:
+                    continue
+                
+                cfi_key = doc.get('СтатьяДвиженияДенежныхСредств_Key')
+                if cfi_key == EMPTY_UUID:
+                    cfi_key = None
+                
+                dept_key = doc.get('Подразделение_Key')
+                if dept_key == EMPTY_UUID:
+                    dept_key = None
+                
+                bank_key = doc.get('БанковскийСчет_Key')
+                if bank_key == EMPTY_UUID:
+                    bank_key = None
+                
+                bank_date_raw = doc.get('ДатаВходящегоДокумента', '')
+                bank_date = bank_date_raw[:10] if bank_date_raw and bank_date_raw[:4] != '0001' else None
                 
                 cur.execute("""
                     INSERT INTO c1_bank_expenses (ref_key, doc_number, doc_date, posted,
                         organization_key, bank_account_key, counterparty_key, amount, 
-                        purpose, comment, is_deleted, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        purpose, comment, is_deleted, cash_flow_item_key, department_key, 
+                        operation, bank_date, bank_number, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ref_key) DO UPDATE SET
                         doc_number = EXCLUDED.doc_number,
                         doc_date = EXCLUDED.doc_date,
                         amount = EXCLUDED.amount,
+                        cash_flow_item_key = EXCLUDED.cash_flow_item_key,
+                        department_key = EXCLUDED.department_key,
+                        operation = EXCLUDED.operation,
+                        bank_account_key = EXCLUDED.bank_account_key,
+                        organization_key = EXCLUDED.organization_key,
+                        counterparty_key = EXCLUDED.counterparty_key,
+                        purpose = EXCLUDED.purpose,
+                        bank_date = EXCLUDED.bank_date,
+                        bank_number = EXCLUDED.bank_number,
                         updated_at = NOW()
                 """, (
                     ref_key,
@@ -3157,18 +3187,51 @@ class Sync1C:
                     doc.get('Date', '')[:10],
                     doc.get('Posted', False),
                     doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
-                    doc.get('БанковскийСчетОрганизации_Key') if doc.get('БанковскийСчетОрганизации_Key') != EMPTY_UUID else None,
+                    bank_key,
                     doc.get('Контрагент_Key') if doc.get('Контрагент_Key') != EMPTY_UUID else None,
                     doc.get('СуммаДокумента', 0),
                     doc.get('НазначениеПлатежа', ''),
                     doc.get('Комментарий', ''),
-                    doc.get('DeletionMark', False)
+                    doc.get('DeletionMark', False),
+                    cfi_key,
+                    dept_key,
+                    doc.get('ХозяйственнаяОперация', ''),
+                    bank_date,
+                    doc.get('НомерВходящегоДокумента', '')
                 ))
+                doc_count += 1
+                
+                # Расшифровка платежа
+                cur.execute("DELETE FROM c1_bank_expense_items WHERE doc_key = %s", (ref_key,))
+                
+                for item in doc.get('РасшифровкаПлатежа', []):
+                    item_cfi = item.get('СтатьяДвиженияДенежныхСредств_Key')
+                    if item_cfi == EMPTY_UUID:
+                        item_cfi = None
+                    
+                    cur.execute("""
+                        INSERT INTO c1_bank_expense_items (doc_key, line_number, partner_key, 
+                            counterparty_key, cash_flow_item_key, amount, organization_key)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (doc_key, line_number) DO UPDATE SET
+                            cash_flow_item_key = EXCLUDED.cash_flow_item_key,
+                            amount = EXCLUDED.amount,
+                            partner_key = EXCLUDED.partner_key
+                    """, (
+                        ref_key,
+                        item.get('LineNumber'),
+                        item.get('Партнер_Key') if item.get('Партнер_Key') != EMPTY_UUID else None,
+                        item.get('Контрагент_Key') if item.get('Контрагент_Key') != EMPTY_UUID else None,
+                        item_cfi,
+                        item.get('Сумма', 0),
+                        item.get('Организация_Key') if item.get('Организация_Key') != EMPTY_UUID else None,
+                    ))
+                    item_count += 1
             
             conn.commit()
         
-        print(f"  ✅ Сохранено: {len(all_docs)} списаний ДС")
-        return len(all_docs)
+        print(f"  ✅ Сохранено: {doc_count} списаний ДС, {item_count} строк расшифровки")
+        return doc_count
 
     def sync_customer_orders(self, conn, date_from, date_to):
         """Синхронизация документов 'Заказ клиента'."""
@@ -5314,6 +5377,7 @@ def main_quick(sync, conn):
     sync.sync_customer_orders(conn, date_from, date_to)
     date_from_orders = date_to - timedelta(days=14)
     sync.sync_dispatch_orders(conn, date_from_orders, date_to)
+    sync.sync_bank_expenses(conn, date_from, date_to)
     sync.sync_stock_balance(conn)
     sync.sync_nkt_access_log(conn)
 
@@ -5368,7 +5432,8 @@ def main_daily(sync, conn):
     sync.sync_shortage(conn, date_from, date_to)
     
     # Финансовые (кроме тяжёлых планов)
-    sync.sync_bank_expenses(conn, date_from, date_to)
+    date_to_future = date_to + timedelta(days=90)
+    sync.sync_bank_expenses(conn, date_from, date_to_future)
     sync.sync_customer_orders(conn, date_from, date_to)
     sync.sync_supplier_orders(conn, date_from, date_to)
     sync.sync_internal_consumption(conn, date_from, date_to)
