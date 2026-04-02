@@ -1672,6 +1672,58 @@ class Sync1C:
         print(f"  ✅ Сохранено: {count} складов")
         return count
 
+    def sync_bank_balances(self, conn):
+        """Синхронизация остатков на банковских счетах."""
+        from urllib.parse import quote
+        
+        print("\n[Остатки на счетах]")
+        
+        encoded = quote("InformationRegister_ОстаткиНаБанковскихСчетахПоДаннымВыписок", safe='_')
+        all_items = []
+        skip = 0
+        while True:
+            resp = self.session.get(
+                f'{self.base_url}/{encoded}?$format=json&$top=500&$skip={skip}&$orderby=Period desc',
+                timeout=60
+            )
+            if resp.status_code != 200:
+                break
+            batch = resp.json().get('value', [])
+            if not batch:
+                break
+            all_items.extend(batch)
+            if len(batch) < 500:
+                break
+            skip += 500
+            time.sleep(0.2)
+        
+        count = 0
+        with conn.cursor() as cur:
+            for item in all_items:
+                period = item.get('Period', '')[:10]
+                acc = item.get('БанковскийСчет_Key')
+                if not acc:
+                    continue
+                cur.execute("""
+                    INSERT INTO c1_bank_balances (period, bank_account_key, opening_balance, incoming, outgoing, closing_balance)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (period, bank_account_key) DO UPDATE SET
+                        opening_balance = EXCLUDED.opening_balance,
+                        incoming = EXCLUDED.incoming,
+                        outgoing = EXCLUDED.outgoing,
+                        closing_balance = EXCLUDED.closing_balance
+                """, (
+                    period, acc,
+                    item.get('НачальныйОстаток', 0),
+                    item.get('Поступление', 0),
+                    item.get('Списание', 0),
+                    item.get('КонечныйОстаток', 0)
+                ))
+                count += 1
+            conn.commit()
+        print(f"  ✅ Сохранено: {count} записей остатков")
+        return count
+  
     def sync_stock_balance(self, conn):
         """Синхронизация остатков на складах (полная перезагрузка)."""
         from urllib.parse import quote
@@ -5378,6 +5430,7 @@ def main_quick(sync, conn):
     date_from_orders = date_to - timedelta(days=14)
     sync.sync_dispatch_orders(conn, date_from_orders, date_to)
     sync.sync_bank_expenses(conn, date_from, date_to)
+    sync.sync_bank_balances(conn)
     sync.sync_stock_balance(conn)
     sync.sync_nkt_access_log(conn)
 
