@@ -15,7 +15,7 @@ DB_HOST = os.environ.get("DB_HOST", "172.20.0.2")
 DB_NAME = "knowledge_base"
 DB_USER = "knowledge"
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "Prokhorov2025Secure")
-SYNC_TOKEN_FILE = "/home/admin/synapse-data/matrix_sync_token"
+SYNC_TOKEN_FILE = "/home/admin/matrix-data/sync_token"
 
 
 def get_db():
