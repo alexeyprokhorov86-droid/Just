@@ -1,0 +1,16 @@
+[Unit]
+Description=Matrix Event Listener
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/telegram_logger_bot
+EnvironmentFile=/home/admin/telegram_logger_bot/.env
+ExecStart=/home/admin/telegram_logger_bot/venv/bin/python3 matrix_listener.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
