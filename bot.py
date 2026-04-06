@@ -3330,8 +3330,17 @@ def main():
     
     async def nutrition_photo_handler(update, context):
         msg = update.message
-        if not msg or not msg.from_user or not msg.photo:
+        if not msg or not msg.from_user:
             return
+        
+        # Проверяем — фото или документ-изображение
+        has_photo = bool(msg.photo)
+        has_image_doc = (msg.document and msg.document.mime_type 
+                        and msg.document.mime_type.startswith('image/'))
+        
+        if not has_photo and not has_image_doc:
+            return
+        
         try:
             from nutrition_bot import get_db
             conn = get_db()
@@ -3348,14 +3357,20 @@ def main():
                 return
         except:
             return
-        nutrition_photo(msg.to_dict())
+        
+        # Если документ-изображение — конвертируем в формат photo
+        msg_dict = msg.to_dict()
+        if has_image_doc and not has_photo:
+            msg_dict['photo'] = [{'file_id': msg.document.file_id, 'file_unique_id': msg.document.file_unique_id, 'width': 0, 'height': 0}]
+        
+        nutrition_photo(msg_dict)
     
     application.add_handler(CallbackQueryHandler(
         nutrition_callback_handler,
         pattern=r'^nutr_'
     ))
     application.add_handler(MessageHandler(
-        filters.PHOTO & filters.ChatType.PRIVATE,
+        (filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE,
         nutrition_photo_handler
     ), group=1)
     application.add_handler(MessageHandler(
