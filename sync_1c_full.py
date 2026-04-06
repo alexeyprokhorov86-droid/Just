@@ -4930,7 +4930,9 @@ class Sync1C:
     def sync_nomenclature_nutrition(self, conn):
         """Синхронизация доп. реквизитов номенклатуры (БЖУ, аллергены) для всего Сырья."""
         print("\n[НОМЕНКЛАТУРА — доп. реквизиты (нутриенты)]")
-        
+
+        from urllib.parse import quote
+      
         # Маппинг Свойство_Key -> колонка в БД
         NUTRITION_PROPS = {
             '89f344f6-8e2b-11f0-8e2c-000c299cc968': 'protein',
