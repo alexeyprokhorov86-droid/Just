@@ -399,6 +399,21 @@ def main(dry_run=False, limit=None):
         if confidence == 'low' or not verified:
             print(f"  ⚠ Пропуск: confidence={confidence}, verified={verified}")
             stats['low_confidence'] += 1
+            # Записываем в очередь для технолога с найденными данными
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO nutrition_requests (nom_id, nom_name, status, search_data, assigned_to, assigned_name)
+                VALUES (%s, %s, 'pending', %s, 
+                    (SELECT user_id FROM tg_user_roles WHERE role ILIKE '%%главн%%технолог%%' LIMIT 1),
+                    (SELECT first_name FROM tg_user_roles WHERE role ILIKE '%%главн%%технолог%%' LIMIT 1)
+                )
+                ON CONFLICT (nom_id) DO UPDATE SET search_data = EXCLUDED.search_data, updated_at = NOW()
+            """, (str(nom_id), name, json.dumps(final_data, ensure_ascii=False)))
+            conn.commit()
+            cur.close()
+        except Exception as e:
+            print(f"  DB error: {e}")
             time.sleep(0.5)
             continue
         
