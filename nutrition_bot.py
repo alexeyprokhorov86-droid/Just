@@ -100,7 +100,7 @@ def find_technologists(conn):
     """Найти актуальных технологов из tg_user_roles."""
     cur = conn.cursor()
     cur.execute("""
-        SELECT DISTINCT user_id, first_name, last_name, role
+        SELECT user_id, first_name, last_name, role
         FROM tg_user_roles
         WHERE role ILIKE '%технолог%'
         ORDER BY 
