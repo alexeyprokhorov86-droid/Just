@@ -3292,6 +3292,77 @@ def main():
         pattern=r'^email_'
     ))
 
+    # === Nutrition Bot: запрос БЖУ у технологов ===
+    from nutrition_bot import handle_callback as nutrition_callback
+    from nutrition_bot import handle_text_reply as nutrition_text_reply
+    from nutrition_bot import handle_photo as nutrition_photo
+    
+    async def nutrition_callback_handler(update, context):
+        await update.callback_query.answer()
+        nutrition_callback(update.callback_query.to_dict())
+    
+    async def nutrition_message_handler(update, context):
+        msg = update.message
+        if not msg or not msg.from_user:
+            return
+        # Проверяем есть ли активный nutrition запрос у этого пользователя
+        try:
+            from nutrition_bot import get_db
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id FROM nutrition_requests 
+                WHERE assigned_to = %s AND status IN ('awaiting_input', 'awaiting_reject_reason')
+                LIMIT 1
+            """, (msg.from_user.id,))
+            has_active = cur.fetchone() is not None
+            cur.close()
+            conn.close()
+            if not has_active:
+                return
+        except:
+            return
+        
+        if msg.photo:
+            nutrition_photo(msg.to_dict())
+        elif msg.text:
+            nutrition_text_reply(msg.to_dict())
+    
+    async def nutrition_photo_handler(update, context):
+        msg = update.message
+        if not msg or not msg.from_user or not msg.photo:
+            return
+        try:
+            from nutrition_bot import get_db
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id FROM nutrition_requests 
+                WHERE assigned_to = %s AND status = 'awaiting_photo'
+                LIMIT 1
+            """, (msg.from_user.id,))
+            has_active = cur.fetchone() is not None
+            cur.close()
+            conn.close()
+            if not has_active:
+                return
+        except:
+            return
+        nutrition_photo(msg.to_dict())
+    
+    application.add_handler(CallbackQueryHandler(
+        nutrition_callback_handler,
+        pattern=r'^nutr_'
+    ))
+    application.add_handler(MessageHandler(
+        filters.PHOTO & filters.ChatType.PRIVATE,
+        nutrition_photo_handler
+    ), group=1)
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND & filters.REPLY,
+        nutrition_message_handler
+    ), group=1)
+    
     # RAG агент в ЛИЧНЫХ сообщениях (без @упоминания)
     application.add_handler(MessageHandler(
         filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.REPLY,
