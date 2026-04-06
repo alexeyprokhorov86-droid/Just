@@ -5485,8 +5485,9 @@ def main_daily(sync, conn):
     sync.sync_shortage(conn, date_from, date_to)
     
     # Финансовые (кроме тяжёлых планов)
+    date_from_bank = date_to - timedelta(days=60)
     date_to_future = date_to + timedelta(days=90)
-    sync.sync_bank_expenses(conn, date_from, date_to_future)
+    sync.sync_bank_expenses(conn, date_from_bank, date_to_future)
     sync.sync_customer_orders(conn, date_from, date_to)
     sync.sync_supplier_orders(conn, date_from, date_to)
     sync.sync_internal_consumption(conn, date_from, date_to)
