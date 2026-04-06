@@ -38,8 +38,8 @@ ADMIN_USER_ID = int(os.environ.get("TELEGRAM_ADMIN_ID", "0"))
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SOCKS_PROXY = os.environ.get("SOCKS_PROXY", "socks5://127.0.0.1:1080")
 
-VERIFY_MODEL = "openai/gpt-4.1-mini"
-VISION_MODEL = "openai/gpt-4.1-mini"
+VERIFY_MODEL = "openai/gpt-5.4"
+VISION_MODEL = "google/gemini-2.5-pro"
 
 # Виды номенклатуры Сырья
 SYRYE_TYPE_IDS = [
