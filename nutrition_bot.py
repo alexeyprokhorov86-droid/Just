@@ -309,6 +309,66 @@ def send_batch_requests(count=5, user_id=None):
         time.sleep(0.5)
     return sent
 
+def invite_technologists_to_bot():
+    """Отправить приглашение в групповой чат технологам, которые не начали диалог с ботом."""
+    conn = get_db()
+    techs = find_technologists(conn)
+    
+    # Проверяем кто может получать личные сообщения
+    uninvited = []
+    for tech in techs:
+        result = tg_request("sendMessage", {
+            "chat_id": tech["user_id"],
+            "text": "✓"
+        })
+        if result and result.get("ok"):
+            # Удаляем тестовое сообщение
+            tg_request("deleteMessage", {
+                "chat_id": tech["user_id"],
+                "message_id": result["result"]["message_id"]
+            })
+        else:
+            uninvited.append(tech)
+    
+    if not uninvited:
+        logger.info("Все технологи уже доступны для бота")
+        conn.close()
+        return
+    
+    # Находим общий групповой чат
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT r.chat_id, m.chat_title
+        FROM tg_user_roles r
+        JOIN tg_chats_metadata m ON m.chat_id = r.chat_id
+        WHERE r.user_id = ANY(%s) AND r.role ILIKE '%%технолог%%'
+        LIMIT 1
+    """, ([t["user_id"] for t in uninvited],))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    if not row:
+        logger.warning("Не найден общий чат с технологами")
+        return
+    
+    chat_id, chat_title = row
+    
+    mentions = []
+    for tech in uninvited:
+        mentions.append(f"[{tech['name']}](tg://user?id={tech['user_id']})")
+    
+    text = (f"👋 {', '.join(mentions)}\n\n"
+            f"Для заполнения данных о пищевой ценности сырья, "
+            f"пожалуйста, напишите боту в личные сообщения команду /start\n\n"
+            f"После этого бот сможет отправлять вам запросы на заполнение БЖУ.")
+    
+    tg_request("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    })
+    logger.info(f"Приглашение отправлено в '{chat_title}' для {len(uninvited)} технологов")
 
 # === ОБРАБОТКА ОТВЕТОВ ===
 
@@ -732,6 +792,7 @@ if __name__ == "__main__":
     parser.add_argument('--check-deferred', action='store_true', help='Проверить отложенные')
     parser.add_argument('--technologists', action='store_true', help='Показать найденных технологов')
     parser.add_argument('--user', type=int, default=None, help='User ID (переопределить технолога)')
+    parser.add_argument('--invite', action='store_true', help='Пригласить технологов написать боту /start')
     args = parser.parse_args()
     
     if args.technologists:
@@ -756,3 +817,6 @@ if __name__ == "__main__":
     
     if args.check_deferred:
         check_deferred()
+
+    if args.invite:
+        invite_technologists_to_bot()
