@@ -4932,6 +4932,7 @@ class Sync1C:
         print("\n[НОМЕНКЛАТУРА — доп. реквизиты (нутриенты)]")
 
         from urllib.parse import quote
+        import json
       
         # Маппинг Свойство_Key -> колонка в БД
         NUTRITION_PROPS = {
