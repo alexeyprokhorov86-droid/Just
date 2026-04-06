@@ -31,8 +31,8 @@ DB_USER = os.environ.get("DB_USER", "knowledge")
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 
 # Модели
-SEARCH_MODEL = "openai/gpt-4o-mini-search-preview"
-VERIFY_MODEL = "openai/gpt-4.1-mini"
+SEARCH_MODEL = "perplexity/sonar-pro"
+VERIFY_MODEL = "openai/gpt-4.1"
 
 # Маппинг Свойство_Key -> поле
 NUTRITION_PROPS = {
@@ -396,8 +396,8 @@ def main(dry_run=False, limit=None):
               f"У={final_data.get('carbs')} Кал={final_data.get('calories')} "
               f"Аллергены={'Да' if final_data.get('has_allergens') else 'Нет'}")
         
-        if confidence == 'low' or not verified:
-            print(f"  ⚠ Пропуск: confidence={confidence}, verified={verified}")
+        if confidence == 'low':
+            print(f"  ⚠ Пропуск: confidence={confidence}")
             stats['low_confidence'] += 1
             # Записываем в очередь для технолога с найденными данными
         try:
