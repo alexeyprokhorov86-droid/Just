@@ -399,21 +399,30 @@ def main(dry_run=False, limit=None):
         if confidence == 'low':
             print(f"  ⚠ Пропуск: confidence={confidence}")
             stats['low_confidence'] += 1
-            # Записываем в очередь для технолога с найденными данными
-        try:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO nutrition_requests (nom_id, nom_name, status, search_data, assigned_to, assigned_name)
-                VALUES (%s, %s, 'pending', %s, 
-                    (SELECT user_id FROM tg_user_roles WHERE role ILIKE '%%главн%%технолог%%' LIMIT 1),
-                    (SELECT first_name FROM tg_user_roles WHERE role ILIKE '%%главн%%технолог%%' LIMIT 1)
-                )
-                ON CONFLICT (nom_id) DO UPDATE SET search_data = EXCLUDED.search_data, updated_at = NOW()
-            """, (str(nom_id), name, json.dumps(final_data, ensure_ascii=False)))
-            conn.commit()
-            cur.close()
-        except Exception as e:
-            print(f"  DB error: {e}")
+            # Записываем в очередь для технолога (кроме проработок и опытного)
+            SKIP_TECHNOLOGIST_TYPES = [
+                '97e5cba0-17af-11ec-bf1d-000c29247c35',  # Проработки Серии
+                'b63360b4-17af-11ec-bf1d-000c29247c35',  # Сырье для Опытного серии
+            ]
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT type_id FROM nomenclature WHERE id = %s::uuid", (str(nom_id),))
+                type_row = cur.fetchone()
+                if type_row and str(type_row[0]) not in SKIP_TECHNOLOGIST_TYPES:
+                    cur.execute("""
+                        INSERT INTO nutrition_requests (nom_id, nom_name, status, search_data, assigned_to, assigned_name)
+                        VALUES (%s, %s, 'pending', %s, 
+                            (SELECT user_id FROM tg_user_roles WHERE role ILIKE '%%главн%%технолог%%' LIMIT 1),
+                            (SELECT first_name FROM tg_user_roles WHERE role ILIKE '%%главн%%технолог%%' LIMIT 1)
+                        )
+                        ON CONFLICT (nom_id) DO UPDATE SET search_data = EXCLUDED.search_data, updated_at = NOW()
+                    """, (str(nom_id), name, json.dumps(final_data, ensure_ascii=False)))
+                    conn.commit()
+                else:
+                    print(f"  ⏭ Проработка/опытное — не отправляем технологу")
+                cur.close()
+            except Exception as e:
+                print(f"  DB error: {e}")
             time.sleep(0.5)
             continue
         
