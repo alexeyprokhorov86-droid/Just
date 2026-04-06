@@ -4926,7 +4926,149 @@ class Sync1C:
         conn.commit()
         cur.close()
         print(f"  Сохранено {len(values)} позиций номенклатуры")
-    
+
+    def sync_nomenclature_nutrition(self, conn):
+        """Синхронизация доп. реквизитов номенклатуры (БЖУ, аллергены) для всего Сырья."""
+        print("\n[НОМЕНКЛАТУРА — доп. реквизиты (нутриенты)]")
+        
+        # Маппинг Свойство_Key -> колонка в БД
+        NUTRITION_PROPS = {
+            '89f344f6-8e2b-11f0-8e2c-000c299cc968': 'protein',
+            '6415fc48-8e55-11f0-8e2c-000c299cc968': 'fat',
+            '72c01a93-8e2c-11f0-8e2c-000c299cc968': 'carbs',
+            '9f465a41-8e2c-11f0-8e2c-000c299cc968': 'sugar',
+            'c4c3da14-8e2d-11f0-8e2c-000c299cc968': 'calories',
+            'ec65aa99-8e2c-11f0-8e2c-000c299cc968': 'moisture',
+            '11fe0378-8e2d-11f0-8e2c-000c299cc968': 'fiber',
+            '3cdacac8-8e2d-11f0-8e2c-000c299cc968': 'lactose',
+            '87d8874e-8e2d-11f0-8e2c-000c299cc968': 'sweetness',
+        }
+        
+        ALLERGEN_PROPS = {
+            '87e46ae6-8e56-11f0-8e2c-000c299cc968': 'наличие_аллергенов',
+            'd68a8efc-8e56-11f0-8e2c-000c299cc968': 'глютен',
+            'e15c2ff6-8e56-11f0-8e2c-000c299cc968': 'ракообразные',
+            'ef1fea8c-8e56-11f0-8e2c-000c299cc968': 'яйца',
+            'fe76964e-8e56-11f0-8e2c-000c299cc968': 'рыба',
+            '0e9dc99e-8e57-11f0-8e2c-000c299cc968': 'арахис',
+            '1aa12403-8e57-11f0-8e2c-000c299cc968': 'соя',
+            '286d6d77-8e57-11f0-8e2c-000c299cc968': 'молоко_лактоза',
+            '35ad29ff-8e57-11f0-8e2c-000c299cc968': 'орехи',
+            '42c06b6c-8e57-11f0-8e2c-000c299cc968': 'сельдерей',
+            '4aef2c22-8e57-11f0-8e2c-000c299cc968': 'горчица',
+            '596e8fcb-8e57-11f0-8e2c-000c299cc968': 'кунжут',
+            '70229b66-8e57-11f0-8e2c-000c299cc968': 'диоксид_серы_сульфиты',
+            '7b4560cb-8e57-11f0-8e2c-000c299cc968': 'люпин',
+            '86c00960-8e57-11f0-8e2c-000c299cc968': 'моллюски',
+        }
+        
+        # Убеждаемся что колонки существуют
+        cur = conn.cursor()
+        for col in list(NUTRITION_PROPS.values()) + ['has_allergens', 'allergens']:
+            try:
+                if col == 'allergens':
+                    cur.execute(f"ALTER TABLE nomenclature ADD COLUMN IF NOT EXISTS {col} jsonb")
+                elif col == 'has_allergens':
+                    cur.execute(f"ALTER TABLE nomenclature ADD COLUMN IF NOT EXISTS {col} boolean")
+                else:
+                    cur.execute(f"ALTER TABLE nomenclature ADD COLUMN IF NOT EXISTS {col} numeric")
+            except Exception:
+                pass
+        conn.commit()
+        
+        # Все виды номенклатуры из группы "Сырье" + сам "Сырье"
+        SYRYE_TYPE_IDS = [
+            '59718fc5-64a8-11eb-8106-005056a759ff',  # Сырье (родитель)
+            'e6fc1a75-64a0-11eb-8106-005056a759ff',  # Сырье (без серий)
+            '773e4cfa-179f-11ec-bf1d-000c29247c35',  # Сырье Серии
+            '7389a6bb-17af-11ec-bf1d-000c29247c35',  # Добавки, ароматизаторы серии
+            'd503d3f5-ce32-11ed-8e18-000c299cc968',  # Подконтрольное сырье серии
+            '97e5cba0-17af-11ec-bf1d-000c29247c35',  # Проработки Серии
+            'b63360b4-17af-11ec-bf1d-000c29247c35',  # Сырье для Опытного серии
+        ]
+        
+        placeholders = ','.join(['%s'] * len(SYRYE_TYPE_IDS))
+        cur.execute(f"SELECT id FROM nomenclature WHERE type_id IN ({placeholders}) AND is_folder = false", SYRYE_TYPE_IDS)
+        nom_ids = [row[0] for row in cur.fetchall()]
+        print(f"  Номенклатура Сырья (все виды): {len(nom_ids)} позиций")
+        
+        if not nom_ids:
+            cur.close()
+            return
+        
+        all_prop_keys = set(NUTRITION_PROPS.keys()) | set(ALLERGEN_PROPS.keys())
+        updated = 0
+        errors = 0
+        encoded = quote("Catalog_Номенклатура", safe='_')
+        dp = quote("ДополнительныеРеквизиты", safe='')
+        
+        for i, nom_id in enumerate(nom_ids):
+            url = f"{self.base_url}/{encoded}(guid'{nom_id}')/{dp}?$format=json"
+            
+            try:
+                r = self.session.get(url, timeout=30)
+                if r.status_code != 200:
+                    errors += 1
+                    continue
+                
+                props = r.json().get('value', [])
+                if not props:
+                    continue
+                
+                nutrition = {}
+                allergens = {}
+                
+                for p in props:
+                    prop_key = p.get('Свойство_Key', '')
+                    value = p.get('Значение')
+                    
+                    if prop_key in NUTRITION_PROPS:
+                        try:
+                            nutrition[NUTRITION_PROPS[prop_key]] = float(value) if value else None
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    if prop_key in ALLERGEN_PROPS:
+                        name = ALLERGEN_PROPS[prop_key]
+                        if name == 'наличие_аллергенов':
+                            nutrition['has_allergens'] = str(value).lower() == 'true'
+                        else:
+                            allergens[name] = str(value).lower() == 'true'
+                
+                if allergens:
+                    nutrition['allergens'] = json.dumps(allergens, ensure_ascii=False)
+                
+                if nutrition:
+                    sets = []
+                    vals = []
+                    for col, val in nutrition.items():
+                        if col == 'allergens':
+                            sets.append(f"{col} = %s::jsonb")
+                        else:
+                            sets.append(f"{col} = %s")
+                        vals.append(val)
+                    vals.append(str(nom_id))
+                    
+                    cur.execute(
+                        f"UPDATE nomenclature SET {', '.join(sets)} WHERE id = %s::uuid",
+                        vals
+                    )
+                    updated += 1
+                    
+            except Exception as e:
+                errors += 1
+                if errors <= 3:
+                    print(f"  Ошибка для {nom_id}: {e}")
+                continue
+            
+            if (i + 1) % 100 == 0:
+                conn.commit()
+                print(f"  Обработано {i + 1} из {len(nom_ids)}...")
+        
+        conn.commit()
+        cur.close()
+        print(f"  Обновлено {updated} позиций, ошибок: {errors}")
+  
     def sync_clients(self, conn):
         """Синхронизация клиентов (партнёров)"""
         print("\n[КЛИЕНТЫ]")
@@ -5342,6 +5484,7 @@ def main_full(sync, conn):
     # Синхронизация новых справочников
     sync.sync_all_catalogs(conn)
     sync.sync_nomenclature(conn)
+    sync.sync_nomenclature_nutrition(conn)
     sync.sync_clients(conn)
     
     
@@ -5372,6 +5515,7 @@ def main_weekly(sync, conn):
     # Справочники
     sync.sync_all_catalogs(conn)
     sync.sync_nomenclature(conn)
+    sync.sync_nomenclature_nutrition(conn)
     sync.sync_clients(conn)
     
     # Заказы и ордера за год
