@@ -711,6 +711,60 @@ def _group_messages(messages: list, window_minutes: int = 3) -> list:
 
     return groups
 
+def search_knowledge(query: str, limit: int = 30) -> list:
+    """Поиск по базе знаний: km_facts, km_decisions, km_tasks, km_policies."""
+    from embedding_service import create_query_embedding
+    query_embedding = create_query_embedding(query)
+    emb_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+    
+    conn = get_db_connection()
+    results = []
+    
+    tables = [
+        ("km_facts", "fact_text", "fact_type"),
+        ("km_decisions", "decision_text", "decision_type"),
+        ("km_tasks", "task_text", "task_type"),
+        ("km_policies", "policy_text", "policy_type"),
+    ]
+    
+    per_table = max(limit // len(tables), 5)
+    
+    try:
+        with conn.cursor() as cur:
+            for table, text_col, type_col in tables:
+                try:
+                    cur.execute(f"""
+                        SELECT id, {text_col}, {type_col}, confidence, created_at,
+                               1 - (embedding <=> %s::vector) as similarity
+                        FROM {table}
+                        WHERE verification_status NOT IN ('rejected', 'duplicate')
+                          AND embedding IS NOT NULL
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                    """, (emb_str, emb_str, per_table))
+                    
+                    for row in cur.fetchall():
+                        sim = float(row[5]) if row[5] else 0
+                        if sim < 0.3:
+                            continue
+                        results.append({
+                            "source": f"knowledge:{table}",
+                            "source_type": "knowledge",
+                            "content": row[1],
+                            "type": row[2] or "",
+                            "confidence": float(row[3]) if row[3] else 0.8,
+                            "similarity": sim,
+                            "created_at": str(row[4]) if row[4] else "",
+                            "search_type": "vector",
+                        })
+                except Exception as e:
+                    logger.warning(f"search_knowledge {table}: {e}")
+    finally:
+        conn.close()
+    
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    logger.info(f"search_knowledge: {len(results)} результатов по запросу '{query[:50]}'")
+    return results[:limit]
 
 def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list = None,
                               time_context: dict = None) -> list:
@@ -2199,6 +2253,7 @@ def route_query(question, chat_context=""):
 - CHATS: переписка сотрудников в Telegram.
 - EMAIL: деловая переписка по почте.
 - WEB: интернет-поиск (только внешняя информация).
+- KNOWLEDGE: база знаний компании (факты, решения, задачи, политики). Для вопросов про правила, процессы, решения, кто за что отвечает, что было решено/сделано.
 
 ТИПЫ АНАЛИТИКИ (для 1С_ANALYTICS):
 top_clients, top_products, sales_summary, top_suppliers, production_summary, purchase_summary
@@ -2231,6 +2286,8 @@ top_clients, top_products, sales_summary, top_suppliers, production_summary, pur
 - Для бухгалтерских вопросов (НДС, налог, счёт, оплата) — обязательно чаты с "бухгалтерия", "априори", "отчеты по аутсорсингу"
 - Для вопросов про закупки — чаты с "закупки"
 - Для вопросов про производство — чаты с "производство"
+- Для вопросов про внутренние правила, решения, процессы, задачи — добавляй KNOWLEDGE
+- KNOWLEDGE хорош для "что было решено", "как мы делаем X", "кто отвечает за Y"
 - Минимум 2-3 шага, keywords — существительные без запятых
 - period: "за 2 недели" = "2weeks", "в январе" = "january", "недавно"/"в последний раз" = "2weeks"
 """
@@ -2595,9 +2652,10 @@ async def process_rag_query(question, chat_context=""):
             db_results.extend(results)
             logger.info(f"Step [{source}]: {len(results)} результатов")
         
-        elif source == "WEB":
-            web_results, web_citations = search_internet(step_keywords)
-            logger.info(f"Step [{source}]: получен ответ")
+        elif source == "KNOWLEDGE":
+            results = search_knowledge(step_keywords, limit=30)
+            db_results.extend(results)
+            logger.info(f"Step [{source}]: {len(results)} результатов")
     
     executed_sources = [step.get("source") for step in plan.get("steps", [])]
     db_results = deduplicate_results(db_results)
