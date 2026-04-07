@@ -268,15 +268,20 @@ def write_to_1c(nom_id, nutrition_data, existing_props):
     for prop_key, info in NUTRITION_PROPS.items():
         field = info['field']
         value = nutrition_data.get(field)
-        if value is not None:
-            new_props.append({
-                'LineNumber': str(line_number),
-                'Свойство_Key': prop_key,
-                'Значение': float(value),
-                'Значение_Type': 'Edm.Double',
-                'ТекстоваяСтрока': ''
-            })
-            line_number += 1
+        if value is None or isinstance(value, bool) or value == 'false' or value == 'true':
+            continue
+        try:
+            float_val = float(value)
+        except (ValueError, TypeError):
+            continue
+        new_props.append({
+            'LineNumber': str(line_number),
+            'Свойство_Key': prop_key,
+            'Значение': float_val,
+            'Значение_Type': 'Edm.Double',
+            'ТекстоваяСтрока': ''
+        })
+        line_number += 1
     
     allergens = nutrition_data.get('allergens', {})
     has_allergens = nutrition_data.get('has_allergens', False)
@@ -320,6 +325,16 @@ def write_to_1c(nom_id, nutrition_data, existing_props):
 def update_local_db(conn, nom_id, nutrition_data):
     """Обновить локальную БД PostgreSQL."""
     cur = conn.cursor()
+    
+    # Защита от некорректных типов (LLM может вернуть boolean вместо числа)
+    def safe_float(val):
+        if val is None or val is False or val is True or val == 'false' or val == 'true':
+            return None
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+    
     allergens_json = json.dumps(nutrition_data.get('allergens', {}), ensure_ascii=False)
     
     cur.execute("""
@@ -329,11 +344,16 @@ def update_local_db(conn, nom_id, nutrition_data):
             sweetness = %s, has_allergens = %s, allergens = %s::jsonb
         WHERE id = %s::uuid
     """, (
-        nutrition_data.get('protein'), nutrition_data.get('fat'),
-        nutrition_data.get('carbs'), nutrition_data.get('sugar'),
-        nutrition_data.get('calories'), nutrition_data.get('moisture'),
-        nutrition_data.get('fiber'), nutrition_data.get('lactose'),
-        nutrition_data.get('sweetness'), nutrition_data.get('has_allergens', False),
+        safe_float(nutrition_data.get('protein')),
+        safe_float(nutrition_data.get('fat')),
+        safe_float(nutrition_data.get('carbs')),
+        safe_float(nutrition_data.get('sugar')),
+        safe_float(nutrition_data.get('calories')),
+        safe_float(nutrition_data.get('moisture')),
+        safe_float(nutrition_data.get('fiber')),
+        safe_float(nutrition_data.get('lactose')),
+        safe_float(nutrition_data.get('sweetness')),
+        bool(nutrition_data.get('has_allergens', False)),
         allergens_json, str(nom_id)
     ))
     conn.commit()
