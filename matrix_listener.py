@@ -10,7 +10,7 @@ import aiohttp
 # Конфигурация
 MATRIX_URL = "http://127.0.0.1:8008"
 MATRIX_USER = "@aleksei:frumelad.ru"
-MATRIX_PASSWORD = os.environ.get("MATRIX_BOT_PASSWORD", "TempPass2026!")
+MATRIX_PASSWORD = os.environ.get("MATRIX_BOT_PASSWORD")
 DB_HOST = os.environ.get("DB_HOST", "172.20.0.2")
 DB_NAME = "knowledge_base"
 DB_USER = "knowledge"
