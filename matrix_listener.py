@@ -14,7 +14,7 @@ MATRIX_PASSWORD = os.environ.get("MATRIX_BOT_PASSWORD", "TempPass2026!")
 DB_HOST = os.environ.get("DB_HOST", "172.20.0.2")
 DB_NAME = "knowledge_base"
 DB_USER = "knowledge"
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "Prokhorov2025Secure")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
 SYNC_TOKEN_FILE = "/home/admin/matrix-data/sync_token"
 
 
