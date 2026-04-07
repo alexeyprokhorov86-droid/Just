@@ -301,6 +301,24 @@ def send_next_request(user_id=None):
 
 
 def send_batch_requests(count=5, user_id=None):
+    # Раз в день проверяем, все ли технологи написали /start
+    invite_flag = "/tmp/nutrition_invite_done"
+    today = time.strftime("%Y-%m-%d")
+    need_invite = True
+    try:
+        with open(invite_flag) as f:
+            if f.read().strip() == today:
+                need_invite = False
+    except FileNotFoundError:
+        pass
+    if need_invite:
+        try:
+            invite_technologists_to_bot()
+        except Exception as e:
+            logger.warning(f"invite_technologists error: {e}")
+        with open(invite_flag, "w") as f:
+            f.write(today)
+
     sent = 0
     for _ in range(count):
         if send_next_request(user_id) is None:
