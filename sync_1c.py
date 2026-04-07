@@ -3,6 +3,7 @@
 """
 
 import requests
+import os
 from requests.auth import HTTPBasicAuth
 import psycopg2
 from psycopg2.extras import execute_values
@@ -24,7 +25,7 @@ CONFIG_PG = {
     "port": 5432,
     "database": "knowledge_base",
     "user": "knowledge",
-    "password": "Prokhorov2025Secure",
+    "password": os.getenv("DB_PASSWORD"),
 }
 
 # ============================================================
