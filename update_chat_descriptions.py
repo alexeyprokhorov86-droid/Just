@@ -39,11 +39,11 @@ ROUTERAI_API_KEY = os.getenv("ROUTERAI_API_KEY")
 ROUTERAI_BASE_URL = os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1")
 
 DB_CONFIG = {
-    'host': os.getenv('DB_HOST', '172.17.0.2'),
+    'host': os.getenv('DB_HOST', '172.20.0.2'),
     'port': int(os.getenv('DB_PORT', 5432)),
     'dbname': os.getenv('DB_NAME', 'knowledge_base'),
     'user': os.getenv('DB_USER', 'knowledge'),
-    'password': os.getenv('DB_PASSWORD', 'Prokhorov2025Secure'),
+    'password': os.getenv('DB_PASSWORD'),
 }
 
 # Сколько месяцев анализировать
