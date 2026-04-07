@@ -44,7 +44,7 @@ DB_CONFIG = {
     'port': 5432,
     'dbname': 'knowledge_base',
     'user': 'knowledge',
-    'password': os.getenv('DB_PASSWORD', 'Prokhorov2025Secure')
+    'password': os.getenv('DB_PASSWORD'),
 }
 
 EXCLUDED_TABLES = {'tg_chat_1003360907471_torty_otgruzki'}
