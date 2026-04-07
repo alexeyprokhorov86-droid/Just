@@ -170,7 +170,8 @@ def get_unfilled_nomenclature(conn):
         FROM nomenclature 
         WHERE type_id IN ({placeholders})
           AND is_folder = false
-          AND (protein IS NULL AND fat IS NULL AND carbs IS NULL AND calories IS NULL)
+          AND (protein IS NULL OR protein = 0)
+          AND (calories IS NULL OR calories = 0)
         ORDER BY name
     """, SYRYE_TYPE_IDS)
     result = cur.fetchall()
@@ -268,8 +269,10 @@ def write_to_1c(nom_id, nutrition_data, existing_props):
     for prop_key, info in NUTRITION_PROPS.items():
         field = info['field']
         value = nutrition_data.get(field)
-        if value is None or isinstance(value, bool) or value == 'false' or value == 'true':
+        if isinstance(value, bool) or value == 'false' or value == 'true':
             continue
+        if value is None:
+            value = 0
         try:
             float_val = float(value)
         except (ValueError, TypeError):
@@ -329,11 +332,11 @@ def update_local_db(conn, nom_id, nutrition_data):
     # Защита от некорректных типов (LLM может вернуть boolean вместо числа)
     def safe_float(val):
         if val is None or val is False or val is True or val == 'false' or val == 'true':
-            return None
+            return 0.0
         try:
             return float(val)
         except (ValueError, TypeError):
-            return None
+            return 0.0
     
     allergens_json = json.dumps(nutrition_data.get('allergens', {}), ensure_ascii=False)
     
