@@ -27,7 +27,7 @@ DB_CONFIG = {
     'port': 5432,
     'dbname': 'knowledge_base',
     'user': 'knowledge',
-    'password': 'Prokhorov2025Secure'
+    'password': os.getenv('DB_PASSWORD'),
 }
 
 
