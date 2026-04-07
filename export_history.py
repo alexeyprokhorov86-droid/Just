@@ -20,7 +20,7 @@ API_ID = 34361670
 API_HASH = "2cbde1edc0755c956bc90b47cf5ec45b"
 
 # БД
-DB_HOST = "localhost"
+DB_HOST = os.getenv("DB_HOST", "172.20.0.2")
 DB_PORT = "5432"
 DB_NAME = "knowledge_base"
 DB_USER = "knowledge"
