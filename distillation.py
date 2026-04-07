@@ -268,16 +268,21 @@ def resolve_entity(cur, name, entity_type=None):
             VALUES (%s, %s, 'auto_created', 0.6)
             ON CONFLICT DO NOTHING
             RETURNING id
-            row = cur.fetchone()
-            if row:
-                try:
-                    emb = create_embedding(name)
-                    cur.execute("UPDATE km_entities SET embedding = %s WHERE id = %s", (str(emb), row[0]))
-                except Exception:
-                    pass
-                return row[0]
         """, (entity_type, name[:255]))
         row = cur.fetchone()
+        if not row:
+            cur.execute(
+                "SELECT id FROM km_entities WHERE canonical_name = %s LIMIT 1",
+                (name[:255],)
+            )
+            row = cur.fetchone()
+        if row:
+            try:
+                emb = create_embedding(name)
+                cur.execute("UPDATE km_entities SET embedding = %s WHERE id = %s", (str(emb), row[0]))
+            except Exception:
+                pass
+            return row[0]
         if row:
             try:
                 emb = create_embedding(name)
@@ -383,6 +388,7 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
             INSERT INTO km_facts (fact_type, subject_entity_id, object_entity_id,
                 fact_text, confidence, verification_status)
             VALUES (%s, %s, %s, %s, %s, 'extracted')
+            RETURNING id
         """, (
             fact.get('fact_type', 'general'),
             subject_id,
@@ -390,12 +396,16 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
             fact.get('text', ''),
             fact.get('confidence', 0.8)
         ))
+        fact_row = cur.fetchone()
+        fact_id = fact_row[0] if fact_row else None
         stats['facts'] += 1
-        try:
-            emb = create_embedding(fact.get('text', ''))
-            cur.execute("UPDATE km_facts SET embedding = %s WHERE id = currval('km_facts_id_seq')", (str(emb),))
-        except Exception:
-            pass
+        if fact_id:
+            fact['_id'] = fact_id
+            try:
+                emb = create_embedding(fact.get('text', ''))
+                cur.execute("UPDATE km_facts SET embedding = %s WHERE id = %s", (str(emb), fact_id))
+            except Exception:
+                pass
     
     # Решения
     for dec in extracted.get('decisions', []):
@@ -408,6 +418,7 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
             INSERT INTO km_decisions (decision_text, scope_type, scope_entity_id,
                 decided_by_entity_id, importance, confidence)
             VALUES (%s, %s, %s, %s, %s, 0.8)
+            RETURNING id
         """, (
             dec.get('text', ''),
             dec.get('scope', 'company'),
@@ -415,12 +426,16 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
             decided_by_id,
             dec.get('importance', 0.5)
         ))
+        dec_row = cur.fetchone()
+        dec_id = dec_row[0] if dec_row else None
         stats['decisions'] += 1
-        try:
-            emb = create_embedding(dec.get('text', ''))
-            cur.execute("UPDATE km_decisions SET embedding = %s WHERE id = currval('km_decisions_id_seq')", (str(emb),))
-        except Exception:
-            pass
+        if dec_id:
+            dec['_id'] = dec_id
+            try:
+                emb = create_embedding(dec.get('text', ''))
+                cur.execute("UPDATE km_decisions SET embedding = %s WHERE id = %s", (str(emb), dec_id))
+            except Exception:
+                pass
     
     # Связи
     for rel in extracted.get('relations', []):
@@ -449,18 +464,22 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
             INSERT INTO km_tasks (task_text, assignee_entity_id, source_document_id,
                 deadline, confidence)
             VALUES (%s, %s, %s, %s, 0.8)
+            RETURNING id
         """, (
             task.get('task_text', '')[:500],
             assignee_id,
             doc_ids[0] if doc_ids else None,
             deadline
         ))
+        task_row = cur.fetchone()
+        task_id = task_row[0] if task_row else None
         stats['tasks'] += 1
-        try:
-            emb = create_embedding(task.get('task_text', ''))
-            cur.execute("UPDATE km_tasks SET embedding = %s WHERE id = currval('km_tasks_id_seq')", (str(emb),))
-        except Exception:
-            pass
+        if task_id:
+            try:
+                emb = create_embedding(task.get('task_text', ''))
+                cur.execute("UPDATE km_tasks SET embedding = %s WHERE id = %s", (str(emb), task_id))
+            except Exception:
+                pass
 
     # Политики/правила
     for pol in extracted.get('policies', []):
@@ -524,11 +543,14 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
     for doc_id in doc_ids:
         for fact_type in ['facts', 'decisions']:
             for item in extracted.get(fact_type, []):
+                obj_id = item.get('_id')
+                if not obj_id:
+                    continue
                 cur.execute("""
                     INSERT INTO source_evidence (object_type, object_id, document_id, evidence_text)
-                    VALUES (%s, currval('km_facts_id_seq'), %s, %s)
+                    VALUES (%s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
-                """, (fact_type[:-1], doc_id, item.get('text', '')[:500]))
+                """, (fact_type[:-1], obj_id, doc_id, item.get('text', '')[:500]))
     
     return stats
 
