@@ -32,11 +32,11 @@ EMBED_BATCH_SIZE = 64   # батч для эмбеддингов
 MIN_DOC_LEN = 25        # минимальная длина документа
 
 DB_CONFIG = {
-    'host': '172.17.0.2',
+    'host': os.getenv('DB_HOST', '172.20.0.2'),
     'port': 5432,
     'dbname': 'knowledge_base',
     'user': 'knowledge',
-    'password': os.environ.get('DB_PASSWORD', 'Prokhorov2025Secure')
+     'password': os.environ.get('DB_PASSWORD'),
 }
 
 
