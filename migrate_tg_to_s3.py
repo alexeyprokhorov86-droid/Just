@@ -27,11 +27,11 @@ from dotenv import load_dotenv
 load_dotenv('/home/admin/telegram_logger_bot/.env')
 
 DB_CONFIG = {
-    'host': '172.17.0.2',
+    'host': os.getenv('DB_HOST', '172.20.0.2'),
     'port': 5432,
     'dbname': 'knowledge_base',
     'user': 'knowledge',
-    'password': os.getenv('DB_PASSWORD', 'Prokhorov2025Secure')
+    'password': os.getenv('DB_PASSWORD'),
 }
 
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
