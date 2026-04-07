@@ -10,11 +10,11 @@ from dotenv import load_dotenv
 load_dotenv('/home/admin/telegram_logger_bot/.env')
 
 CONFIG_PG = {
-    'host': '172.17.0.2',
+    'host': os.getenv('DB_HOST', '172.20.0.2'),
     'port': 5432,
     'dbname': 'knowledge_base',
     'user': 'knowledge',
-    'password': os.getenv('PG_PASSWORD', 'Prokhorov2025Secure')
+    'password': os.getenv('DB_PASSWORD'),
 }
 
 def get_tg_tables(conn):
