@@ -52,7 +52,7 @@ S3_SECRET_KEY = os.getenv('ATTACHMENTS_BUCKET_SECRET_KEY')
 S3_REGION = os.getenv('ATTACHMENTS_BUCKET_REGION')
 S3_BUCKET = os.getenv('ATTACHMENTS_BUCKET_NAME')
 
-DB_HOST = '172.17.0.2'
+DB_HOST = os.getenv('DB_HOST', '172.20.0.2')
 DB_PORT = 5432
 DB_NAME = 'knowledge_base'
 DB_USER = 'knowledge'
