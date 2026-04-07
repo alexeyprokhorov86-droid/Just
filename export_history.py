@@ -9,6 +9,7 @@ from datetime import datetime
 from telethon import TelegramClient
 from telethon.tl.types import Channel, Chat, User
 import psycopg2
+import os
 from psycopg2 import sql
 
 # ============================================================
@@ -23,7 +24,7 @@ DB_HOST = "localhost"
 DB_PORT = "5432"
 DB_NAME = "knowledge_base"
 DB_USER = "knowledge"
-DB_PASSWORD = "Prokhorov2025Secure"
+DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 # ============================================================
 
