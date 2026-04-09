@@ -895,8 +895,8 @@ def notify_thread_closed(thread_id: int, subject: str, summary_short: str, resol
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT user_id FROM tg_full_analysis_settings
-                WHERE send_full_analysis = TRUE
-            """)
+                WHERE send_full_analysis = TRUE AND user_id = %s
+            """, (int(os.getenv("ADMIN_USER_ID", "0")),))
             users = [row[0] for row in cur.fetchall()]
         conn.close()
     except Exception as e:
