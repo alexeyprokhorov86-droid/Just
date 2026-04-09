@@ -59,6 +59,18 @@ class BOMError:
     error_type: str  # no_spec, multiple_specs, circular_ref
     details: str = ""
 
+@dataclass
+class BOMIntermediate:
+    """Промежуточный полуфабрикат в дереве BOM"""
+    semifinished_key: str
+    semifinished_name: str
+    spec_key: str
+    parent_key: str
+    parent_name: str
+    multiplier: float
+    level: int
+    product_quantity: float
+    materials_sum: float
 
 @dataclass 
 class BOMResult:
@@ -67,6 +79,7 @@ class BOMResult:
     product_name: str
     materials: Dict[str, Material] = field(default_factory=dict)  # key -> Material
     errors: List[BOMError] = field(default_factory=list)
+    intermediates: List[BOMIntermediate] = field(default_factory=list)
     
 
 class BOMExploder:
@@ -299,6 +312,22 @@ class BOMExploder:
                         sub_qty = Decimal(str(sub_spec['product_quantity']))
                         if sub_qty > 0:
                             new_multiplier = mat_qty / sub_qty
+                            # Сохраняем промежуточный ПФ
+                            parent_key_str = product_key  # всегда ключ ГП
+                            parent_name_str = path[-1] if path else product_name
+                            sub_mats = self._spec_materials_cache.get(sub_spec['ref_key'], [])
+                            sub_materials_sum = sum(Decimal(str(m['quantity'])) for m in sub_mats)
+                            result.intermediates.append(BOMIntermediate(
+                                semifinished_key=mat_key,
+                                semifinished_name=nom_data['name'],
+                                spec_key=sub_spec['ref_key'],
+                                parent_key=parent_key_str,
+                                parent_name=parent_name_str,
+                                multiplier=float(new_multiplier),
+                                level=len(path),
+                                product_quantity=float(sub_qty),
+                                materials_sum=float(sub_materials_sum),
+                            ))
                             process_spec(
                                 sub_spec['ref_key'], 
                                 new_multiplier,
@@ -464,6 +493,27 @@ class BOMStorage:
             
             CREATE INDEX IF NOT EXISTS idx_bom_changes_calc ON bom_changes(calculation_id);
             CREATE INDEX IF NOT EXISTS idx_bom_changes_type ON bom_changes(change_type);
+            
+            -- Таблица промежуточных полуфабрикатов (дерево BOM)
+            CREATE TABLE IF NOT EXISTS bom_intermediate (
+                id SERIAL PRIMARY KEY,
+                calculation_id INTEGER NOT NULL,
+                product_key VARCHAR(50) NOT NULL,
+                product_name TEXT,
+                semifinished_key VARCHAR(50) NOT NULL,
+                semifinished_name TEXT,
+                spec_key VARCHAR(50),
+                parent_key VARCHAR(50),
+                parent_name TEXT,
+                multiplier NUMERIC(18,6),
+                level INTEGER DEFAULT 1,
+                product_quantity NUMERIC(18,6),
+                materials_sum NUMERIC(18,6),
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_bom_inter_calc ON bom_intermediate(calculation_id);
+            CREATE INDEX IF NOT EXISTS idx_bom_inter_product ON bom_intermediate(product_key);
         """)
         
         # Добавляем колонки если их нет (миграция со старой версии)
@@ -556,7 +606,25 @@ class BOMStorage:
                 level_1, level_2, level_3,
                 calc_time
             ))
-            
+
+        # Сохраняем промежуточные ПФ
+        for inter in result.intermediates:
+            self.cur.execute("""
+                INSERT INTO bom_intermediate
+                (calculation_id, product_key, product_name, semifinished_key, semifinished_name,
+                 spec_key, parent_key, parent_name, multiplier, level,
+                 product_quantity, materials_sum, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                self._calculation_id,
+                result.product_key, result.product_name,
+                inter.semifinished_key, inter.semifinished_name,
+                inter.spec_key, inter.parent_key, inter.parent_name,
+                inter.multiplier, inter.level,
+                inter.product_quantity, inter.materials_sum,
+                calc_time
+            ))
+        
         for err in result.errors:
             self.cur.execute("""
                 INSERT INTO bom_errors
