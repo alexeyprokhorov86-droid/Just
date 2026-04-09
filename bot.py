@@ -3012,6 +3012,48 @@ async def list_employees_command(update: Update, context: ContextTypes.DEFAULT_T
     
     await update.message.reply_text(text[:4000], parse_mode="Markdown")
 
+BOM_GROUP_CHAT_ID = -1003559489741  # Группа "Новые продукты и конкуренты"
+BOM_SERVER_URL = "http://95.174.92.209"
+
+async def bom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /bom — генерация ссылки на отчёт BOM"""
+    user = update.effective_user
+    if not user:
+        return
+
+    # Проверяем: команда только в личном чате
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("Эта команда работает только в личном чате с ботом.")
+        return
+
+    # Проверяем членство в группе
+    try:
+        member = await context.bot.get_chat_member(chat_id=BOM_GROUP_CHAT_ID, user_id=user.id)
+        if member.status in ('left', 'kicked'):
+            await update.message.reply_text("⛔ У вас нет доступа к отчёту BOM.\nОбратитесь к администратору.")
+            return
+    except Exception as e:
+        logger.warning(f"Ошибка проверки членства для /bom: {e}")
+        if str(user.id) != ADMIN_USER_ID:
+            await update.message.reply_text("⛔ Не удалось проверить доступ. Попробуйте позже.")
+            return
+
+    # Генерируем токен
+    from auth_bom import generate_token
+    token = generate_token(user.id)
+    url = f"{BOM_SERVER_URL}/bom_login?token={token}"
+
+    await update.message.reply_text(
+        f"📋 <b>Состав продукции</b>\n\n"
+        f"Ваша персональная ссылка (действует 7 дней):\n"
+        f"<a href=\"{url}\">Открыть отчёт BOM</a>\n\n"
+        f"<i>Ссылка привязана к вашему аккаунту.</i>",
+        parse_mode='HTML',
+        disable_web_page_preview=True
+    )
+    logger.info(f"BOM ссылка выдана пользователю {user.id} ({user.first_name})")
+
+
 # ============================================================
 # УПРАВЛЕНИЕ ПРАВИЛАМИ ФИЛЬТРАЦИИ (/rules)
 # ============================================================
@@ -3287,6 +3329,7 @@ def main():
     application.add_handler(CommandHandler("add_employee", add_employee_command))
     application.add_handler(CommandHandler("assign_email", assign_email_command))
     application.add_handler(CommandHandler("list_employees", list_employees_command))
+    application.add_handler(CommandHandler("bom", bom_command))
     # Команда /rules — управление правилами фильтрации
     application.add_handler(CommandHandler("rules", rules_command))
  
