@@ -351,6 +351,28 @@ def generate_report() -> str:
     except Exception as e:
         report_parts.append(f"  ⚠️ Ошибка: {e}")
     report_parts.append("")
+
+    # === Подписки на анализ ===
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT first_name, username, send_full_analysis 
+                FROM tg_full_analysis_settings 
+                ORDER BY send_full_analysis DESC, first_name
+            """)
+            subscribers = cur.fetchall()
+        conn.close()
+        
+        report_parts.append("📋 <b>Подписка на анализ документов:</b>")
+        for first_name, username, enabled in subscribers:
+            status = "✅" if enabled else "❌"
+            name = first_name or username or "—"
+            uname = f" (@{username})" if username else ""
+            report_parts.append(f"  {status} {name}{uname}")
+        report_parts.append("")
+    except Exception as e:
+        log(f"Ошибка получения подписок: {e}")
     
     # === RouterAI ===
     routerai = get_routerai_usage()
