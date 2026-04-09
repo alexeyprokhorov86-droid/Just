@@ -1769,9 +1769,23 @@ async def log_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 FROM tg_full_analysis_settings
                                 WHERE send_full_analysis = TRUE
                             """)
-                            users_to_notify = [row[0] for row in cur.fetchall()]
+                            all_subscribers = [row[0] for row in cur.fetchall()]
                     finally:
                         conn.close()
+                    
+                    # Фильтруем: admin получает всё, остальные — только из своих чатов
+                    users_to_notify = []
+                    chat_id = message.chat.id
+                    for uid in all_subscribers:
+                        if uid == ADMIN_USER_ID:
+                            users_to_notify.append(uid)
+                        else:
+                            try:
+                                member = await context.bot.get_chat_member(chat_id=chat_id, user_id=uid)
+                                if member.status in ('member', 'administrator', 'creator', 'restricted'):
+                                    users_to_notify.append(uid)
+                            except Exception:
+                                pass  # не состоит в чате или ошибка
                     
                     # Отправляем в личку
                     for uid in users_to_notify:
