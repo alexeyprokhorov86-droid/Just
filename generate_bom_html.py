@@ -9,6 +9,7 @@ import psycopg2
 import psycopg2.extras
 import json
 import os
+import re
 from decimal import Decimal
 from dotenv import load_dotenv
 
@@ -131,7 +132,8 @@ def fetch_data():
         SELECT DISTINCT ON (n.id)
             n.id::text as nom_key,
             n.article,
-            n.code
+            n.code,
+            n.weight
         FROM nomenclature n
         WHERE n.id IN (
             SELECT DISTINCT product_key::uuid
@@ -143,6 +145,7 @@ def fetch_data():
         product_articles[row['nom_key']] = {
             'article': row['article'] or '',
             'code': row['code'] or '',
+            'weight': float(row['weight']) if row['weight'] else 0,
         }
 
     # Спецификации (для потерь): product_quantity и сумма материалов
@@ -218,6 +221,7 @@ def build_products_json(data):
                 'key': pk,
                 'article': art.get('article', ''),
                 'code': art.get('code', ''),
+                'weight': art.get('weight', 0),
                 'groups': {},
                 'materials_list': [],  # для состава ТР ТС и КБЖУ
             }
@@ -265,6 +269,7 @@ def build_products_json(data):
             'qty_kg': qty_kg,
             'unit': unit,
             'level1': type_level_1,
+            'type_name': type_name,
             'protein': mat_nutr.get('protein'),
             'fat': mat_nutr.get('fat'),
             'carbs': mat_nutr.get('carbs'),
@@ -294,8 +299,22 @@ def build_products_json(data):
                 raw_cost += g['total_cost']
             groups.append(g)
 
-        # Состав по ТР ТС: ингредиенты из Себестоимость, по убыванию массовой доли
-        raw_materials = [m for m in prod['materials_list'] if m['level1'] == 'Себестоимость' and m['qty_kg'] > 0]
+        # Определяем сырьё (Себестоимость, но НЕ упаковка) для состава ТР ТС
+        def is_packaging(type_name):
+            tn = (type_name or '').lower()
+            return 'упаковка' in tn
+
+        def clean_name(name):
+            """Убрать 'серии', 'Серии', 'серия' и прочие служебные слова из названия"""
+            name = re.sub(r'\s+[Сс]ерии?\s*$', '', name)
+            name = re.sub(r'\s+[Сс]ерии?\s+', ' ', name)
+            name = re.sub(r'\s+гп\s+бородино\s*', ' ', name, flags=re.IGNORECASE)
+            name = re.sub(r'\s+бородино\s*', ' ', name, flags=re.IGNORECASE)
+            name = re.sub(r'\s+', ' ', name).strip()
+            return name
+
+        raw_materials = [m for m in prod['materials_list']
+                         if m['level1'] == 'Себестоимость' and m['qty_kg'] > 0 and not is_packaging(m.get('type_name', ''))]
         total_raw_kg = sum(m['qty_kg'] for m in raw_materials)
 
         # Ингредиенты по убыванию доли
@@ -304,7 +323,7 @@ def build_products_json(data):
             for m in sorted(raw_materials, key=lambda x: x['qty_kg'], reverse=True):
                 pct = (m['qty_kg'] / total_raw_kg) * 100
                 composition.append({
-                    'name': m['name'],
+                    'name': clean_name(m['name']),
                     'pct': round(pct, 1),
                 })
 
@@ -354,6 +373,7 @@ def build_products_json(data):
             'key': prod['key'],
             'article': prod.get('article', ''),
             'code': prod.get('code', ''),
+            'weight': prod.get('weight', 0),
             'groups': groups,
             'total_kg': round(total_kg, 4),
             'total_cost': round(total_cost, 2),
@@ -697,13 +717,15 @@ function updateKBZHU(prod) {{
     const c100 = outputG > 0 ? (raw.carbs / outputG) * 100 : 0;
     const s100 = outputG > 0 ? (raw.sugar / outputG) * 100 : 0;
     const cal100 = outputG > 0 ? (raw.calories / outputG) * 100 : 0;
+    const kj100 = cal100 * 4.184;
 
     el.innerHTML = `
         <div class="kbzhu-card"><div class="value">${{fmt(p100, 1)}}</div><div class="label">Белки, г</div></div>
         <div class="kbzhu-card"><div class="value">${{fmt(f100, 1)}}</div><div class="label">Жиры, г</div></div>
         <div class="kbzhu-card"><div class="value">${{fmt(c100, 1)}}</div><div class="label">Углеводы, г</div></div>
-        <div class="kbzhu-card"><div class="value">${{fmt(s100, 1)}}</div><div class="label">Сахар, г</div></div>
+        <div class="kbzhu-card"><div class="value">${{fmt(s100, 1)}}</div><div class="label">в т.ч. сахар, г</div></div>
         <div class="kbzhu-card"><div class="value">${{fmt(cal100, 0)}}</div><div class="label">кКал</div></div>
+        <div class="kbzhu-card"><div class="value">${{fmt(kj100, 0)}}</div><div class="label">кДж</div></div>
     `;
 
     const noteEl = document.getElementById('kbzhu-note');
@@ -719,30 +741,36 @@ function updateLosses(prod) {{
     const rawKg = prod.total_raw_kg || 0;
     if (rawKg === 0) {{ el.innerHTML = '<div class="kbzhu-note">Нет данных</div>'; return; }}
 
-    // 1. Чистые потери (общие)
-    // Сухие вещества на входе
-    const dryIn = prod.dry_input_kg || rawKg;
-    // Масса готового продукта при заданной влажности
-    const outputKg = dryIn / (1 - currentMoisture / 100);
-    const totalLoss = rawKg - outputKg;
+    // Масса готового продукта из номенклатуры (weight, кг)
+    const productWeight = prod.weight || 0;
+    if (productWeight === 0) {{
+        el.innerHTML = '<div class="kbzhu-note">Нет данных о весе продукта в номенклатуре</div>';
+        return;
+    }}
+
+    // 1. Общие потери: масса сырья на входе - вес продукта на выходе
+    const totalLoss = rawKg - productWeight;
     const totalLossPct = rawKg > 0 ? (totalLoss / rawKg) * 100 : 0;
 
-    // 2. Потери влаги
-    const moistureIn = prod.moisture_input_kg || 0;
-    const moistureOut = outputKg * (currentMoisture / 100);
-    const moistureLoss = moistureIn - moistureOut;
+    // 2. Сухие вещества на входе (с учётом влажности каждого ингредиента)
+    const dryIn = prod.dry_input_kg || rawKg;
 
-    // 3. Потери сухих веществ = чистые потери - потери влаги
-    const dryOut = outputKg * (1 - currentMoisture / 100);
+    // 3. Сухие вещества на выходе = вес продукта * (1 - влажность продукта / 100)
+    const dryOut = productWeight * (1 - currentMoisture / 100);
     const dryLoss = dryIn - dryOut;
     const dryLossPct = dryIn > 0 ? (dryLoss / dryIn) * 100 : 0;
+
+    // 4. Потери влаги
+    const moistureIn = prod.moisture_input_kg || 0;
+    const moistureOut = productWeight * (currentMoisture / 100);
+    const moistureLoss = moistureIn - moistureOut;
 
     el.innerHTML = `
     <div class="losses-grid">
         <div class="loss-card">
             <h4>Общие потери</h4>
             <div class="loss-row"><span class="lbl">Масса сырья на входе</span><span class="val">${{fmt(rawKg, 4)}} кг</span></div>
-            <div class="loss-row"><span class="lbl">Масса продукта на выходе</span><span class="val">${{fmt(outputKg, 4)}} кг</span></div>
+            <div class="loss-row"><span class="lbl">Вес продукта (номенклатура)</span><span class="val">${{fmt(productWeight, 4)}} кг</span></div>
             <div class="loss-row"><span class="lbl">Потери (абс.)</span><span class="val${{totalLoss > 0 ? ' negative' : ''}}">${{fmt(totalLoss, 4)}} кг</span></div>
             <div class="loss-row"><span class="lbl">Потери (%)</span><span class="val${{totalLossPct > 0 ? ' negative' : ''}}">${{fmt(totalLossPct, 1)}}%</span></div>
         </div>
@@ -780,19 +808,23 @@ function renderProduct(prod) {{
     // === TAB: BOM ===
     html += '<div class="tab-content active" id="tab-bom">';
     html += '<table class="bom-table">';
-    html += '<thead><tr><th>Материал</th><th class="num">Ед.</th><th class="num">Кол-во</th><th class="num">Цена, ₽</th><th class="num">Стоимость, ₽</th></tr></thead>';
+    html += '<thead><tr><th>Материал</th><th class="num">Ед.</th><th class="num">Кол-во</th><th class="num">Цена, ₽</th><th class="num">Стоимость, ₽</th><th class="num">% группы</th><th class="num">% итого</th></tr></thead>';
     html += '<tbody>';
 
     for (const group of prod.groups) {{
-        html += `<tr class="group-header"><td colspan="5">${{group.name}}</td></tr>`;
+        html += `<tr class="group-header"><td colspan="7">${{group.name}}</td></tr>`;
         for (const mat of group.materials) {{
             const pc = mat.price === 0 ? ' no-price' : '';
+            const pctGroup = group.total_cost > 0 ? (mat.cost / group.total_cost * 100) : 0;
+            const pctTotal = prod.total_cost > 0 ? (mat.cost / prod.total_cost * 100) : 0;
             html += `<tr>
                 <td style="padding-left:28px">${{mat.name}}</td>
                 <td class="num">${{mat.unit}}</td>
                 <td class="num">${{fmt(mat.qty, 4)}}</td>
                 <td class="num${{pc}}">${{fmt(mat.price, 2)}}</td>
                 <td class="num">${{fmt(mat.cost, 2)}}</td>
+                <td class="num">${{fmt(pctGroup, 1)}}%</td>
+                <td class="num">${{fmt(pctTotal, 1)}}%</td>
             </tr>`;
         }}
         html += `<tr class="group-subtotal">
@@ -801,6 +833,8 @@ function renderProduct(prod) {{
             <td class="num">${{fmt(group.total_kg, 4)}}</td>
             <td class="num"></td>
             <td class="num">${{fmt(group.total_cost, 2)}}</td>
+            <td class="num"></td>
+            <td class="num">${{prod.total_cost > 0 ? fmt(group.total_cost / prod.total_cost * 100, 1) + '%' : ''}}</td>
         </tr>`;
     }}
 
@@ -811,6 +845,8 @@ function renderProduct(prod) {{
         <td class="num">${{fmt(prod.raw_kg, 4)}}</td>
         <td class="num"></td>
         <td class="num">${{fmt(prod.raw_cost, 2)}}</td>
+        <td class="num"></td>
+        <td class="num">${{prod.total_cost > 0 ? fmt(prod.raw_cost / prod.total_cost * 100, 1) + '%' : ''}}</td>
     </tr>`;
 
     html += `<tr class="grand-total">
@@ -819,6 +855,8 @@ function renderProduct(prod) {{
         <td class="num">${{fmt(prod.total_kg, 4)}}</td>
         <td class="num"></td>
         <td class="num">${{fmt(prod.total_cost, 2)}}</td>
+        <td class="num"></td>
+        <td class="num">100%</td>
     </tr>`;
 
     html += '</tbody></table></div>';
