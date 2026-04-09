@@ -5504,6 +5504,13 @@ def main_full(sync, conn):
     sync.sync_all_production(conn, date_from, date_to)
     sync.sync_all_warehouse(conn, date_from, date_to)
     sync.sync_all_finance(conn, date_from, date_to)
+    # Пересчёт BOM после обновления спецификаций
+    try:
+        from bom_exploder import run_bom_explosion
+        print("\n=== BOM Explosion ===")
+        run_bom_explosion(trigger='daily_sync')
+    except Exception as e:
+        print(f"BOM Explosion ошибка: {e}")
 
 def main_weekly(sync, conn):
     """Еженедельная полная пересинхронизация заказов и ордеров за год."""
