@@ -922,12 +922,12 @@ def main():
         return
 
     rows = data['rows']
-    print(f"  Строк BOM: {{len(rows)}}, цен: {{len(data['prices'])}}")
-    print(f"  КБЖУ: {{len(data['nutrition'])}}, артикулов: {{len(data['product_articles'])}}")
-    print(f"  Спецификаций: {{len(data['specs'])}}")
+    print(f"  Строк BOM: {len(rows)}, цен: {len(data['prices'])}")
+    print(f"  КБЖУ: {len(data['nutrition'])}, артикулов: {len(data['product_articles'])}")
+    print(f"  Спецификаций: {len(data['specs'])}")
 
     product_list = build_products_json(data)
-    print(f"  Продуктов: {{len(product_list)}}")
+    print(f"  Продуктов: {len(product_list)}")
 
     html = generate_html(product_list, {'calc': data['calc'], 'errors': data['errors']})
 
@@ -935,7 +935,7 @@ def main():
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         f.write(html)
 
-    print(f"  HTML: {{OUTPUT_FILE}} ({{len(html):,}} bytes)")
+    print(f"  HTML: {OUTPUT_FILE} ({len(html):,} bytes)")
     print("Готово!")
 
 
