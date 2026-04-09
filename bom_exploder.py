@@ -23,11 +23,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация БД
+from dotenv import load_dotenv
+load_dotenv()
+
 DB_CONFIG = {
-    'host': 'localhost',
-    'port': 5432,
-    'dbname': 'knowledge_base',
-    'user': 'knowledge',
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': int(os.getenv('DB_PORT', '5432')),
+    'dbname': os.getenv('DB_NAME', 'knowledge_base'),
+    'user': os.getenv('DB_USER', 'knowledge'),
     'password': os.getenv('DB_PASSWORD'),
 }
 
