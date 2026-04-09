@@ -174,6 +174,36 @@ def fetch_data():
     """, (calc_id,))
     errors = cur.fetchall()
 
+    # Вложенные полуфабрикаты (дерево BOM)
+    cur.execute("""
+        SELECT product_key, product_name,
+               semifinished_key, semifinished_name,
+               parent_key, parent_name,
+               multiplier, level,
+               product_quantity, materials_sum
+        FROM bom_intermediate
+        WHERE calculation_id = %s
+        ORDER BY product_key, level, semifinished_name
+    """, (calc_id,))
+    intermediates_raw = cur.fetchall()
+
+    # Группируем по product_key
+    intermediates = {}
+    for row in intermediates_raw:
+        pk = row['product_key']
+        if pk not in intermediates:
+            intermediates[pk] = []
+        intermediates[pk].append({
+            'key': row['semifinished_key'],
+            'name': row['semifinished_name'],
+            'parent_key': row['parent_key'],
+            'parent_name': row['parent_name'],
+            'multiplier': float(row['multiplier']) if row['multiplier'] else 0,
+            'level': row['level'] or 1,
+            'output': float(row['product_quantity']) if row['product_quantity'] else 0,
+            'input': float(row['materials_sum']) if row['materials_sum'] else 0,
+        })
+
     cur.close()
     conn.close()
 
@@ -183,6 +213,7 @@ def fetch_data():
         'nutrition': nutrition,
         'product_articles': product_articles,
         'specs': specs,
+        'intermediates': intermediates,
         'calc': calc,
         'errors': errors,
     }
@@ -209,6 +240,7 @@ def build_products_json(data):
     nutrition = data['nutrition']
     product_articles = data['product_articles']
     specs = data['specs']
+    intermediates = data.get('intermediates', {})
 
     products = {}
 
@@ -389,6 +421,7 @@ def build_products_json(data):
             'spec_input': round(spec_input, 4),
             'dry_input_kg': round(dry_input, 6),
             'moisture_input_kg': round(total_moisture_input, 6),
+            'intermediates': intermediates.get(pk, []),
         })
 
     return product_list
@@ -799,6 +832,7 @@ function renderProduct(prod) {{
     // Tabs
     html += `<div class="tabs">
         <div class="tab active" data-tab="tab-bom" onclick="switchTab('tab-bom')">Спецификация</div>
+        <div class="tab" data-tab="tab-tree" onclick="switchTab('tab-tree')">Вложенные ПФ</div>
         <div class="tab" data-tab="tab-composition" onclick="switchTab('tab-composition')">Состав (ТР ТС)</div>
         <div class="tab" data-tab="tab-allergens" onclick="switchTab('tab-allergens')">Аллергены</div>
         <div class="tab" data-tab="tab-kbzhu" onclick="switchTab('tab-kbzhu')">КБЖУ</div>
@@ -860,6 +894,37 @@ function renderProduct(prod) {{
     </tr>`;
 
     html += '</tbody></table></div>';
+
+    // === TAB: Вложенные ПФ (дерево) ===
+    html += '<div class="tab-content" id="tab-tree"><div class="info-section">';
+    html += '<h3>Дерево спецификаций (вложенные полуфабрикаты)</h3>';
+
+    if (prod.intermediates && prod.intermediates.length > 0) {{
+        // Строим дерево: уровень → отступ
+        html += '<table class="bom-table"><thead><tr>';
+        html += '<th>Полуфабрикат</th><th class="num">Уровень</th>';
+        html += '<th class="num">Выход спец.</th><th class="num">Вход спец.</th>';
+        html += '<th class="num">Потери спец., %</th>';
+        html += '</tr></thead><tbody>';
+
+        for (const pf of prod.intermediates) {{
+            const indent = pf.level * 24;
+            const lossPct = pf.input > 0 ? ((pf.input - pf.output) / pf.input * 100) : 0;
+            const lossClass = lossPct > 0 ? ' negative' : '';
+            const prefix = '└─ '.repeat(Math.min(pf.level, 1)) + (pf.level > 1 ? '↳ ' : '');
+            html += `<tr>
+                <td style="padding-left:${{indent + 14}}px"><span style="color:#999">${{prefix}}</span>${{pf.name}}</td>
+                <td class="num">${{pf.level}}</td>
+                <td class="num">${{fmt(pf.output, 2)}}</td>
+                <td class="num">${{fmt(pf.input, 2)}}</td>
+                <td class="num${{lossClass}}">${{fmt(lossPct, 1)}}%</td>
+            </tr>`;
+        }}
+        html += '</tbody></table>';
+    }} else {{
+        html += '<p style="color:#999">Нет вложенных полуфабрикатов</p>';
+    }}
+    html += '</div></div>';
 
     // === TAB: Состав (ТР ТС) ===
     html += '<div class="tab-content" id="tab-composition"><div class="info-section">';
