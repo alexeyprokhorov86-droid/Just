@@ -6,7 +6,7 @@ Wants=proxy-tunnel-amsterdam.service proxy-tunnel-helsinki.service
 [Service]
 Type=simple
 User=admin
-ExecStart=/usr/bin/python3 /home/admin/Just/proxy_manager.py
+ExecStart=/usr/bin/python3 /home/admin/telegram_logger_bot/proxy_manager.py
 Restart=always
 RestartSec=15
 # Разрешаем перезапуск туннелей и бота
