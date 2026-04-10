@@ -3287,7 +3287,7 @@ def main():
         read_timeout=120,
         write_timeout=120,
         connect_timeout=30,
-        proxy="socks5://127.0.0.1:1080"
+        proxy="socks5h://127.0.0.1:1080"
     )
     application = Application.builder().token(BOT_TOKEN).request(request).build()
 
