@@ -22,7 +22,8 @@ from dotenv import load_dotenv
 import subprocess
 
 # Загружаем переменные окружения
-PROXY = {"https": "socks5h://127.0.0.1:1080", "http": "socks5h://127.0.0.1:1080"}
+from proxy_config import get_proxy_dict
+PROXY = get_proxy_dict()
 env_path = pathlib.Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path if env_path.exists() else None)
 
