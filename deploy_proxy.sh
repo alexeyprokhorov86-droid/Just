@@ -15,7 +15,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="/home/admin/Just"
+REPO_DIR="/home/admin/telegram_logger_bot"
 
 echo "=== [1/7] Установка autossh ==="
 if ! command -v autossh &>/dev/null; then
