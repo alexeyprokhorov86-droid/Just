@@ -26,6 +26,7 @@ import psycopg2
 import psycopg2.extras
 import requests
 import subprocess
+from proxy_config import get_proxy_dict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -322,7 +323,8 @@ async def fix_tg_media(conn, items):
     from telegram import Bot
     from telegram.request import HTTPXRequest
     
-    request = HTTPXRequest(read_timeout=120, connect_timeout=30, proxy="socks5://127.0.0.1:1080")
+    from proxy_config import get_proxy_url
+    request = HTTPXRequest(read_timeout=120, connect_timeout=30, proxy=get_proxy_url())
     bot = Bot(token=BOT_TOKEN, request=request)
     s3 = get_s3_client()
     gpt_client = get_gpt_client()
@@ -478,7 +480,7 @@ def send_report(text):
                 'chat_id': ADMIN_USER_ID,
                 'text': text[i:i+4000],
                 'parse_mode': 'HTML'
-            }, timeout=30, proxies={'https': 'socks5h://127.0.0.1:1080'})
+            }, timeout=30, proxies=get_proxy_dict())
         except Exception as e:
             logger.error(f"Отправка отчёта: {e}")
 
