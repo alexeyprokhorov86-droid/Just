@@ -282,7 +282,8 @@ def send_report(report: str):
                     "text": part,
                     "parse_mode": "HTML"
                 },
-                timeout=30
+                timeout=30,
+                proxies=PROXY
             )
         
         log("Отчёт отправлен в Telegram")
