@@ -3283,17 +3283,19 @@ def main():
         return
 
     from telegram.request import HTTPXRequest
+    from proxy_config import get_proxy_url
+    _proxy = get_proxy_url()
     request = HTTPXRequest(
         read_timeout=120,
         write_timeout=120,
         connect_timeout=30,
-        proxy="socks5h://127.0.0.1:1080"
+        proxy=_proxy
     )
     get_updates_request = HTTPXRequest(
         read_timeout=120,
         write_timeout=120,
         connect_timeout=30,
-        proxy="socks5h://127.0.0.1:1080"
+        proxy=_proxy
     )
     application = Application.builder().token(BOT_TOKEN).request(request).get_updates_request(get_updates_request).build()
 
