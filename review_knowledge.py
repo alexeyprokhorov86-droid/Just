@@ -18,6 +18,7 @@ import fcntl
 import psycopg2
 import psycopg2.extras
 import requests
+from proxy_config import get_proxy_dict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -429,7 +430,7 @@ def send_report(text):
                 'chat_id': ADMIN_USER_ID,
                 'text': text[i:i+4000],
                 'parse_mode': 'HTML'
-            }, timeout=30, proxies={'https': 'socks5h://127.0.0.1:1080'})
+            }, timeout=30, proxies=get_proxy_dict())
         except Exception as e:
             logger.error(f"Отправка отчёта: {e}")
 
