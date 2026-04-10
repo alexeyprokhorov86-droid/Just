@@ -1,0 +1,16 @@
+[Unit]
+Description=Proxy Health Monitor & Failover Manager
+After=network-online.target proxy-tunnel-amsterdam.service proxy-tunnel-helsinki.service
+Wants=proxy-tunnel-amsterdam.service proxy-tunnel-helsinki.service
+
+[Service]
+Type=simple
+User=admin
+ExecStart=/usr/bin/python3 /home/admin/Just/proxy_manager.py
+Restart=always
+RestartSec=15
+# Разрешаем перезапуск туннелей и бота
+# Требует sudoers entry (см. deploy_proxy.sh)
+
+[Install]
+WantedBy=multi-user.target

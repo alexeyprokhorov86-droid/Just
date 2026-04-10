@@ -1,0 +1,24 @@
+[Unit]
+Description=SSH SOCKS5 Tunnel to Amsterdam Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+Environment=AUTOSSH_GATETIME=30
+Environment=AUTOSSH_POLL=60
+ExecStart=/usr/bin/autossh -M 0 \
+    -N -D 127.0.0.1:1080 \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -o StrictHostKeyChecking=accept-new \
+    -i /home/admin/.ssh/amsterdam_proxy \
+    -p 22 \
+    root@109.234.38.39
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
