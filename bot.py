@@ -14,6 +14,7 @@ import re
 import logging
 import base64
 import threading
+import datetime
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -3272,6 +3273,118 @@ async def handle_full_analysis_button(update: Update, context: ContextTypes.DEFA
             logger.error(f"Ошибка отправки полного анализа: {e}")
             await query.answer("❌ Ошибка отправки", show_alert=True)
 
+async def element_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /element — выдаёт данные для входа в Element X."""
+    user_id = update.effective_user.id
+    
+    # Только в личных сообщениях
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "Напишите мне /element в личных сообщениях, и я отправлю вам данные для входа в Element X."
+        )
+        return
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT matrix_username, matrix_password, joined_at FROM matrix_user_mapping WHERE telegram_user_id = %s",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if not row:
+            await update.message.reply_text(
+                "Ваш аккаунт Element X пока не создан. Обратитесь к администратору."
+            )
+            return
+        
+        mx_user, mx_pass, joined_at = row
+        
+        status = "✅ Вы уже подключились!" if joined_at else "⏳ Ожидает подключения"
+        
+        await update.message.reply_text(
+            f"🔐 Ваши данные для входа в Element X\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Сервер: frumelad.ru\n"
+            f"Логин: {mx_user}\n"
+            f"Пароль: {mx_pass}\n"
+            f"Статус: {status}\n"
+            f"━━━━━━━━━━━━━━━\n\n"
+            f"📱 Как подключиться:\n"
+            f"1. Скачайте Element X (не Element!):\n"
+            f"   • iPhone: apps.apple.com/app/element-x/id1672254904\n"
+            f"   • Android: play.google.com/store/apps/details?id=io.element.android.x\n"
+            f"2. Откройте приложение\n"
+            f"3. Нажмите «Изменить сервер» и введите: frumelad.ru\n"
+            f"4. Введите логин и пароль выше\n"
+            f"5. Все рабочие чаты доступны в пространстве «Фрумелад»\n\n"
+            f"Сообщения синхронизируются с Telegram — можно пользоваться обоими мессенджерами."
+        )
+        
+        # Отмечаем что инвайт отправлен
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE matrix_user_mapping SET invited_at = NOW() WHERE telegram_user_id = %s AND invited_at IS NULL",
+            (user_id,)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"element_command error: {e}")
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
+
+
+async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневное напоминание в рабочих чатах о переходе на Element X."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT telegram_name, telegram_username 
+            FROM matrix_user_mapping 
+            WHERE joined_at IS NULL
+        """)
+        not_joined = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        if not not_joined:
+            return
+        
+        mentions = []
+        for name, username in not_joined:
+            if username:
+                mentions.append(f"@{username}")
+            else:
+                mentions.append(name)
+        
+        message = (
+            f"📢 Напоминание: переход на Element X\n\n"
+            f"Ещё не подключились ({len(not_joined)} чел.):\n"
+            f"{', '.join(mentions)}\n\n"
+            f"Напишите мне /element в личку — я отправлю данные для входа."
+        )
+        
+        # Отправляем в Руководство
+        from proxy_config import get_proxy_url
+        import requests as req
+        proxy_url = get_proxy_url()
+        req.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": -1003596439983, "text": message},
+            proxies={"https": proxy_url, "http": proxy_url},
+            timeout=30
+        )
+    except Exception as e:
+        logger.error(f"element_reminder error: {e}")
+
+
 def main():
     """Запуск бота."""
     if not BOT_TOKEN:
@@ -3340,6 +3453,7 @@ def main():
     application.add_handler(CommandHandler("bom", bom_command))
     # Команда /rules — управление правилами фильтрации
     application.add_handler(CommandHandler("rules", rules_command))
+    application.add_handler(CommandHandler("element", element_command))
  
     # Callback для правил
     application.add_handler(CallbackQueryHandler(
@@ -3472,6 +3586,8 @@ def main():
     
     logger.info("🚀 Бот запущен. Логирование + анализ медиа + роли активны.")
     application.add_error_handler(error_handler)
+    # Ежедневное напоминание о переходе на Element X (в 10:00 MSK = 07:00 UTC)
+    application.job_queue.run_daily(element_reminder, time=datetime.time(hour=7, minute=0))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
