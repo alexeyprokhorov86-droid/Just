@@ -7,6 +7,29 @@ import time
 import psycopg2
 import aiohttp
 
+# Подключение к БД mautrix для получения списка bridged-комнат
+MAUTRIX_DB_NAME = "mautrix_telegram"
+MAUTRIX_DB_USER = "mautrix_tg"
+MAUTRIX_DB_PASSWORD = os.environ.get("MAUTRIX_DB_PASSWORD", "MautrixTG2026")
+
+
+def get_bridged_rooms():
+    """Получить множество room_id забриджённых комнат."""
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST, dbname=MAUTRIX_DB_NAME,
+            user=MAUTRIX_DB_USER, password=MAUTRIX_DB_PASSWORD
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT mxid FROM portal WHERE mxid IS NOT NULL")
+            rooms = {row[0] for row in cur.fetchall()}
+        conn.close()
+        print(f"[matrix_listener] Loaded {len(rooms)} bridged rooms to skip")
+        return rooms
+    except Exception as e:
+        print(f"[matrix_listener] Warning: could not load bridged rooms: {e}")
+        return set()
+
 # Конфигурация
 MATRIX_URL = "http://127.0.0.1:8008"
 MATRIX_USER = "@aleksei:frumelad.ru"
@@ -112,9 +135,13 @@ async def main():
         sync_token = load_sync_token()
         room_names = {}
         saved_count = 0
+        bridged_rooms = get_bridged_rooms()
 
         while True:
             try:
+                # Обновляем список bridged-комнат каждый час
+                if saved_count % 100 == 0 or not hasattr(main, '_last_refresh'):
+                    bridged_rooms = get_bridged_rooms()
                 params = {
                     "timeout": "30000",
                     "filter": json.dumps({
@@ -147,6 +174,9 @@ async def main():
                                 room_names[room_id] = event.get("content", {}).get("name", room_id)
 
                         room_name = room_names.get(room_id, room_id)
+                        # Пропускаем bridged-комнаты — их source of truth Telegram-бот
+                        if room_id in bridged_rooms:
+                            continue
 
                         # Обрабатываем сообщения
                         for event in room_data.get("timeline", {}).get("events", []):
