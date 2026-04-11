@@ -180,7 +180,8 @@ async def download_matrix_media(session, access_token, mxc_url):
         return None
 
     server, media_id = parts
-    url = f"{MATRIX_URL}/_matrix/media/v3/download/{server}/{media_id}"
+    # Synapse 1.150+ требует authenticated media endpoint
+    url = f"{MATRIX_URL}/_matrix/client/v1/media/download/{server}/{media_id}"
 
     async with session.get(
         url,
