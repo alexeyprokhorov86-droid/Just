@@ -151,10 +151,24 @@ async def main():
                         # Обрабатываем сообщения
                         for event in room_data.get("timeline", {}).get("events", []):
                             if event.get("type") == "m.room.message":
+                                sender = event.get("sender", "")
+                                body = event.get("content", {}).get("body", "")
+
+                                # Пропускаем bridged-копии из Telegram (ghost-пользователи)
+                                if sender.startswith("@telegram_") and sender.endswith(":frumelad.ru"):
+                                    continue
+
+                                # Пропускаем бота бриджа
+                                if sender == "@telegrambot:frumelad.ru":
+                                    continue
+
+                                # Пропускаем команды бриджа
+                                if body and body.startswith("!tg "):
+                                    continue
+
                                 if save_message(conn, room_id, room_name, event):
                                     saved_count += 1
-                                    sender = event.get("sender", "")
-                                    body_preview = event.get("content", {}).get("body", "")[:50]
+                                    body_preview = (body or "")[:50]
                                     print(f"[matrix] #{saved_count}: {sender} in {room_name}: {body_preview}")
 
                     save_sync_token(new_token)
