@@ -39,8 +39,11 @@ WORK_ROOMS = {
     "БЗ R&D","БЗ R&D Chat","БЗ Бухгалтерия","БЗ Бухгалтерия Chat",
     "БЗ Закупки Chat","БЗ Склад","БЗ Склад Chat",
     "Подбор Персонала Внешний","Отчеты по аутсорсингу",
-    "R&D ~ общая рабочая группа","БЗ инструкции производство",
+    "R&D ~ общая рабочая группа","KELIN - ФНС",
+    "KELIN - кондитерская Прохорова","БЗ инструкции производство",
     "Закупки","Закупки - Упаковка","Продажи на ярды",
+    "Производство Кондитерская Прохорова",
+    "Фрумелад (НФ) Кадровые задачи по IT и 1С",
 }
 TG_TO_MATRIX_NAME = {"Руководство":"Руководство (bridged)","Дизайн упаковки Кондитерская Прохорова":"Дизайн упаковки"}
 MANUAL_USER_MAP = {805598873:"aleksei", 1058481218:"irina.prokhorova"}
@@ -109,6 +112,12 @@ def matrix_get_room_members(token, room_id):
 
 def matrix_invite_to_room(token, room_id, user_id):
     return requests.post(f"{MATRIX_URL}/_matrix/client/v3/rooms/{room_id}/invite",headers={"Authorization":f"Bearer {token}"},json={"user_id":user_id},timeout=10).status_code in (200,403)
+
+def matrix_user_has_devices(token, matrix_user_id):
+    """Проверить, заходил ли пользователь (есть ли у него устройства)."""
+    resp = requests.get(f"{MATRIX_URL}/_synapse/admin/v2/users/{matrix_user_id}/devices",
+        headers={"Authorization":f"Bearer {token}"},timeout=10)
+    return len(resp.json().get("devices",[])) > 0
 
 def ensure_table(conn):
     cur = conn.cursor()
@@ -183,7 +192,7 @@ def run_invite(args):
 
     logger.info(f"Matrix аккаунтов: {len(matrix_users)}, комнат: {len(room_map)}, сотрудников TG: {len(employees)}, уже приглашено: {len(already_invited)}")
 
-    to_invite = {}; no_matrix = []
+    to_invite = {}; already_active = {}; no_matrix = []
     for uid, emp in employees.items():
         if uid in already_invited: continue
         if uid in MANUAL_USER_MAP and MANUAL_USER_MAP[uid]=="aleksei": continue
@@ -192,19 +201,49 @@ def run_invite(args):
             if not mid and emp["username"]: no_matrix.append(f"{emp['first_name']}({emp['username']})")
             continue
         lp = mid.split(":")[0].lstrip("@")
-        to_invite[uid] = {"matrix_id":mid,"localpart":lp,"password":generate_password(),"first_name":emp["first_name"],"username":emp["username"],"chat_ids":emp["chat_ids"],"chat_titles":emp["chat_titles"]}
+        entry = {"matrix_id":mid,"localpart":lp,"first_name":emp["first_name"],"username":emp["username"],"chat_ids":emp["chat_ids"],"chat_titles":emp["chat_titles"]}
+
+        # Проверяем: уже заходил в Matrix?
+        if matrix_user_has_devices(token, mid):
+            already_active[uid] = entry
+            logger.info(f"  ✓ {emp['first_name']} ({lp}) — уже в Matrix, только invite в комнаты")
+        else:
+            entry["password"] = generate_password()
+            to_invite[uid] = entry
 
     if no_matrix: logger.info(f"Без Matrix-аккаунта: {', '.join(no_matrix)}")
-    if not to_invite: logger.info("Нечего приглашать."); conn.close(); return
 
-    # Группируем по чатам
+    # Сначала обрабатываем тех, кто УЖЕ в Matrix — только invite в комнаты
+    total_rooms = 0
+    if already_active:
+        logger.info(f"\n{'='*50}\nУже в Matrix ({len(already_active)} чел.) — приглашаю в комнаты:")
+        for uid, d in already_active.items():
+            for t in d["chat_titles"]:
+                if not t: continue
+                mn = TG_TO_MATRIX_NAME.get(t, t)
+                if mn not in room_map: continue
+                rid = room_map[mn]
+                members = matrix_get_room_members(token, rid)
+                if d["matrix_id"] in members: continue
+                if args.dry_run:
+                    logger.info(f"  [DRY-RUN] {d['first_name']} → {mn}")
+                else:
+                    ok = matrix_invite_to_room(token, rid, d["matrix_id"])
+                    logger.info(f"  {'✅' if ok else '❌'} {d['first_name']} → {mn}")
+                    total_rooms += 1; time.sleep(0.2)
+
+    if not to_invite:
+        logger.info(f"\nНовых для приглашения нет. В комнаты: {total_rooms}")
+        conn.close(); return
+
+    # Группируем НОВЫХ по чатам
     chat_to_uninvited = defaultdict(list)
     for uid in to_invite:
         for cid in to_invite[uid]["chat_ids"]:
             chat_to_uninvited[cid].append(uid)
 
     sorted_chats = sort_chats(list(chat_to_uninvited.keys()), chat_titles_map)
-    invited_users = set(); total_sent = 0; total_rooms = 0
+    invited_users = set(); total_sent = 0
 
     for chat_id in sorted_chats:
         chat_title = chat_titles_map.get(chat_id, str(chat_id))
