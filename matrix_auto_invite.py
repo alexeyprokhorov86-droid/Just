@@ -39,15 +39,14 @@ WORK_ROOMS = {
     "БЗ R&D","БЗ R&D Chat","БЗ Бухгалтерия","БЗ Бухгалтерия Chat",
     "БЗ Закупки Chat","БЗ Склад","БЗ Склад Chat",
     "Подбор Персонала Внешний","Отчеты по аутсорсингу",
-    "R&D ~ общая рабочая группа","KELIN - ФНС",
+    "R&D ~ общая рабочая группа",
     "KELIN - кондитерская Прохорова","БЗ инструкции производство",
     "Закупки","Закупки - Упаковка","Продажи на ярды",
-    "Производство Кондитерская Прохорова",
-    "Фрумелад (НФ) Кадровые задачи по IT и 1С",
 }
 TG_TO_MATRIX_NAME = {"Руководство":"Руководство (bridged)","Дизайн упаковки Кондитерская Прохорова":"Дизайн упаковки"}
 MANUAL_USER_MAP = {805598873:"aleksei", 1058481218:"irina.prokhorova"}
 SKIP_MATRIX_USERS = {"@bot:frumelad.ru","@aleksei:frumelad.ru"}
+SPACE_ROOM_ID = "!hRnxoPZwyiPRobHsCy:frumelad.ru"
 ELEMENT_ANDROID = "https://play.google.com/store/apps/details?id=io.element.android.x"
 ELEMENT_IOS = "https://apps.apple.com/app/element-x-secure-chat-call/id1631335820"
 ELEMENT_WEB = "https://app.element.io"
@@ -213,11 +212,21 @@ def run_invite(args):
 
     if no_matrix: logger.info(f"Без Matrix-аккаунта: {', '.join(no_matrix)}")
 
-    # Сначала обрабатываем тех, кто УЖЕ в Matrix — только invite в комнаты
+    # Сначала обрабатываем тех, кто УЖЕ в Matrix — Space + комнаты
     total_rooms = 0
+    space_members = matrix_get_room_members(token, SPACE_ROOM_ID)
     if already_active:
-        logger.info(f"\n{'='*50}\nУже в Matrix ({len(already_active)} чел.) — приглашаю в комнаты:")
+        logger.info(f"\n{'='*50}\nУже в Matrix ({len(already_active)} чел.) — приглашаю в Space и комнаты:")
         for uid, d in already_active.items():
+            # Space invite
+            if d["matrix_id"] not in space_members:
+                if args.dry_run:
+                    logger.info(f"  [DRY-RUN] {d['first_name']} → Space Фрумелад")
+                else:
+                    ok = matrix_invite_to_room(token, SPACE_ROOM_ID, d["matrix_id"])
+                    logger.info(f"  {'✅' if ok else '❌'} {d['first_name']} → Space Фрумелад")
+                    total_rooms += 1; time.sleep(0.2)
+            # Комнаты
             for t in d["chat_titles"]:
                 if not t: continue
                 mn = TG_TO_MATRIX_NAME.get(t, t)
@@ -282,9 +291,18 @@ def run_invite(args):
         for fn,uid,lp,pw in people_data: invited_users.add(uid)
         total_sent += len(people_data)
 
-        # Приглашение во ВСЕ комнаты
+        # Приглашение в Space + ВСЕ комнаты
         for fn,uid,lp,pw in people_data:
             d = to_invite[uid]
+            # Space
+            if d["matrix_id"] not in space_members:
+                if args.dry_run:
+                    logger.info(f"    [DRY-RUN] {fn} → Space Фрумелад")
+                else:
+                    ok = matrix_invite_to_room(token, SPACE_ROOM_ID, d["matrix_id"])
+                    logger.info(f"    {'✅' if ok else '❌'} {fn} → Space Фрумелад")
+                    total_rooms += 1; time.sleep(0.2)
+            # Комнаты
             for t in d["chat_titles"]:
                 if not t: continue
                 mn = TG_TO_MATRIX_NAME.get(t, t)
@@ -304,6 +322,21 @@ def run_invite_rooms(args):
     conn = get_db(); token = matrix_login()
     room_map = matrix_get_rooms(token); matrix_users = matrix_get_real_users(token)
     employees,_,_ = get_tg_employees_by_chat(conn); cnt = 0
+
+    # Сначала invite всех в Space Фрумелад
+    space_members = matrix_get_room_members(token, SPACE_ROOM_ID)
+    logger.info(f"Space Фрумелад: {len(space_members)} участников")
+    for uid,emp in employees.items():
+        mid = resolve_matrix_id(uid, emp["username"], matrix_users)
+        if not mid or mid in SKIP_MATRIX_USERS: continue
+        if mid not in space_members:
+            if args.dry_run: logger.info(f"  [DRY-RUN] {mid} → Space Фрумелад")
+            else:
+                ok = matrix_invite_to_room(token, SPACE_ROOM_ID, mid)
+                logger.info(f"  {'✅' if ok else '❌'} {mid} → Space Фрумелад"); cnt += 1
+            time.sleep(0.3)
+
+    # Затем invite в комнаты
     for uid,emp in employees.items():
         mid = resolve_matrix_id(uid, emp["username"], matrix_users)
         if not mid or mid in SKIP_MATRIX_USERS: continue
@@ -318,7 +351,7 @@ def run_invite_rooms(args):
                 ok = matrix_invite_to_room(token, room_map[mn], mid)
                 logger.info(f"  {'✅' if ok else '❌'} {mid} → {mn}"); cnt += 1
             time.sleep(0.3)
-    logger.info(f"\nВ комнаты: {cnt}"); conn.close()
+    logger.info(f"\nВсего приглашений: {cnt}"); conn.close()
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
