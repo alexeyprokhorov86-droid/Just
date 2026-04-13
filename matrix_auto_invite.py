@@ -21,12 +21,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("matrix_auto_invite")
 
 MATRIX_URL = os.environ.get("MATRIX_URL", "http://localhost:8008")
-MATRIX_ADMIN_USER = os.environ.get("MATRIX_ADMIN_USER", "")
-MATRIX_ADMIN_PASSWORD = os.environ.get("MATRIX_ADMIN_PASSWORD", "")
-DB_HOST = os.environ.get("DB_HOST", "")
+MATRIX_ADMIN_USER = os.environ.get("MATRIX_ADMIN_USER", "aleksei")
+MATRIX_ADMIN_PASSWORD = os.environ.get("MATRIX_ADMIN_PASSWORD", "TempPass2026!")
+DB_HOST = os.environ.get("DB_HOST", "172.20.0.2")
 DB_PORT = os.environ.get("DB_PORT", "5432")
-DB_NAME = os.environ.get("DB_NAME", "")
-DB_USER = os.environ.get("DB_USER", "")
+DB_NAME = os.environ.get("DB_NAME", "knowledge_base")
+DB_USER = os.environ.get("DB_USER", "knowledge")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
@@ -41,7 +41,7 @@ WORK_ROOMS = {
     "Подбор Персонала Внешний","Отчеты по аутсорсингу",
     "R&D ~ общая рабочая группа","БЗ инструкции производство",
     "Закупки","Закупки - Упаковка","Продажи на ярды",
-    }
+}
 TG_TO_MATRIX_NAME = {"Руководство":"Руководство (bridged)","Дизайн упаковки Кондитерская Прохорова":"Дизайн упаковки"}
 MANUAL_USER_MAP = {805598873:"aleksei", 1058481218:"irina.prokhorova"}
 SKIP_MATRIX_USERS = {"@bot:frumelad.ru","@aleksei:frumelad.ru"}
@@ -207,9 +207,12 @@ def run_invite(args):
     invited_users = set(); total_sent = 0; total_rooms = 0
 
     for chat_id in sorted_chats:
+        chat_title = chat_titles_map.get(chat_id, str(chat_id))
+        matrix_room_name = TG_TO_MATRIX_NAME.get(chat_title, chat_title)
+        if matrix_room_name not in room_map:
+            continue
         people = [uid for uid in chat_to_uninvited[chat_id] if uid not in invited_users]
         if not people: continue
-        chat_title = chat_titles_map.get(chat_id, str(chat_id))
         logger.info(f"\n── {chat_title} ({len(people)} чел.) ──")
 
         # Сброс паролей
