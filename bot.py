@@ -3587,7 +3587,8 @@ def main():
     logger.info("🚀 Бот запущен. Логирование + анализ медиа + роли активны.")
     application.add_error_handler(error_handler)
     # Ежедневное напоминание о переходе на Element X (в 10:00 MSK = 07:00 UTC)
-    application.job_queue.run_daily(element_reminder, time=datetime.time(hour=7, minute=0))
+    from datetime import time as dt_time
+    application.job_queue.run_daily(element_reminder, time=dt_time(hour=7, minute=0))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
