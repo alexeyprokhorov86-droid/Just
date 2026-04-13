@@ -21,12 +21,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("matrix_auto_invite")
 
 MATRIX_URL = os.environ.get("MATRIX_URL", "http://localhost:8008")
-MATRIX_ADMIN_USER = os.environ.get("MATRIX_ADMIN_USER", "aleksei")
-MATRIX_ADMIN_PASSWORD = os.environ.get("MATRIX_ADMIN_PASSWORD", "TempPass2026!")
-DB_HOST = os.environ.get("DB_HOST", "172.20.0.2")
+MATRIX_ADMIN_USER = os.environ.get("MATRIX_ADMIN_USER", "")
+MATRIX_ADMIN_PASSWORD = os.environ.get("MATRIX_ADMIN_PASSWORD", "")
+DB_HOST = os.environ.get("DB_HOST", "")
 DB_PORT = os.environ.get("DB_PORT", "5432")
-DB_NAME = os.environ.get("DB_NAME", "knowledge_base")
-DB_USER = os.environ.get("DB_USER", "knowledge")
+DB_NAME = os.environ.get("DB_NAME", "")
+DB_USER = os.environ.get("DB_USER", "")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
@@ -39,12 +39,9 @@ WORK_ROOMS = {
     "БЗ R&D","БЗ R&D Chat","БЗ Бухгалтерия","БЗ Бухгалтерия Chat",
     "БЗ Закупки Chat","БЗ Склад","БЗ Склад Chat",
     "Подбор Персонала Внешний","Отчеты по аутсорсингу",
-    "R&D ~ общая рабочая группа","KELIN - ФНС",
-    "KELIN - кондитерская Прохорова","БЗ инструкции производство",
+    "R&D ~ общая рабочая группа","БЗ инструкции производство",
     "Закупки","Закупки - Упаковка","Продажи на ярды",
-    "Производство Кондитерская Прохорова",
-    "Фрумелад (НФ) Кадровые задачи по IT и 1С",
-}
+    }
 TG_TO_MATRIX_NAME = {"Руководство":"Руководство (bridged)","Дизайн упаковки Кондитерская Прохорова":"Дизайн упаковки"}
 MANUAL_USER_MAP = {805598873:"aleksei", 1058481218:"irina.prokhorova"}
 SKIP_MATRIX_USERS = {"@bot:frumelad.ru","@aleksei:frumelad.ru"}
