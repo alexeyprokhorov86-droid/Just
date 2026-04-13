@@ -103,7 +103,7 @@ def find_technologists(conn):
     cur.execute("""
         SELECT user_id, first_name, last_name, role
         FROM tg_user_roles
-        WHERE role ILIKE '%технолог%'
+        WHERE role ILIKE '%технолог%' AND is_active = true
         ORDER BY 
             CASE WHEN role ILIKE '%главн%' THEN 0 ELSE 1 END,
             role
@@ -360,7 +360,7 @@ def invite_technologists_to_bot():
         SELECT DISTINCT r.chat_id, m.chat_title
         FROM tg_user_roles r
         JOIN tg_chats_metadata m ON m.chat_id = r.chat_id
-        WHERE r.user_id = ANY(%s) AND r.role ILIKE '%%технолог%%'
+        WHERE r.user_id = ANY(%s) AND r.role ILIKE '%%технолог%%' AND r.is_active = true
         LIMIT 1
     """, ([t["user_id"] for t in uninvited],))
     row = cur.fetchone()
