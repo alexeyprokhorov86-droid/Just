@@ -126,7 +126,7 @@ class EmailChunker(BaseChunker):
         """Возвращает {email_id: source_documents.id}."""
         if not email_ids:
             return {}
-        cur = self.conn.cursor()
+        cur = self.write_conn.cursor()
         try:
             refs = [f"email:{eid}" for eid in email_ids]
             cur.execute(
@@ -183,7 +183,7 @@ class EmailChunker(BaseChunker):
             parent_1c_ref=str(em["id"]),
             chunk_date=date_str,
             confidence=ENVELOPE_CONFIDENCE,
-            document_id=0,
+            document_id=None,
             chunk_no=0,
             token_count=self.estimate_tokens(text),
         )
@@ -225,7 +225,7 @@ class EmailChunker(BaseChunker):
                 parent_1c_ref=str(em["id"]),
                 chunk_date=date_str,
                 confidence=BODY_CONFIDENCE,
-                document_id=parent_doc_id or 0,
+                document_id=parent_doc_id,
                 chunk_no=i + 1,  # 0 = envelope
                 token_count=self.estimate_tokens(full_text),
             ))

@@ -36,16 +36,26 @@ class BaseChunker(ABC):
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
         self._conn = None
+        self._write_conn = None
 
     @property
     def conn(self):
+        """Read connection (for SELECT / server-side cursors)."""
         if self._conn is None or self._conn.closed:
             self._conn = psycopg2.connect(**DB_CONFIG)
         return self._conn
 
+    @property
+    def write_conn(self):
+        """Separate write connection (for INSERT/commit without killing read cursors)."""
+        if self._write_conn is None or self._write_conn.closed:
+            self._write_conn = psycopg2.connect(**DB_CONFIG)
+        return self._write_conn
+
     def close(self):
-        if self._conn and not self._conn.closed:
-            self._conn.close()
+        for c in (self._conn, self._write_conn):
+            if c and not c.closed:
+                c.close()
 
     @abstractmethod
     def generate_chunks(self, full: bool = False) -> List[Chunk]:
@@ -70,13 +80,13 @@ class BaseChunker(ABC):
             return 0
 
         saved = 0
-        cur = self.conn.cursor()
+        cur = self.write_conn.cursor()
         try:
             for i in range(0, len(chunks), DB_BATCH_SIZE):
                 batch = chunks[i:i + DB_BATCH_SIZE]
                 values = []
                 for c in batch:
-                    doc_id = c.document_id or c.parent_document_id or 0
+                    doc_id = c.document_id or c.parent_document_id or None
                     tok = c.token_count or self.estimate_tokens(c.chunk_text)
                     values.append((
                         doc_id, c.chunk_no, c.chunk_text, tok,
@@ -101,10 +111,10 @@ class BaseChunker(ABC):
                 if saved % LOG_EVERY == 0:
                     logger.info(f"  saved {saved}/{len(chunks)} chunks...")
 
-            self.conn.commit()
+            self.write_conn.commit()
             logger.info(f"Saved {saved} chunks total")
         except Exception:
-            self.conn.rollback()
+            self.write_conn.rollback()
             raise
         finally:
             cur.close()
