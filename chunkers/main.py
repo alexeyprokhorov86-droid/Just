@@ -41,6 +41,8 @@ def parse_args():
                         help="Показать что будет сделано, не записывать")
     parser.add_argument("--no-embed", action="store_true",
                         help="Пропустить генерацию embeddings")
+    parser.add_argument("--batch", type=int, default=0,
+                        help="Ограничить количество документов для обработки (0 = все)")
     return parser.parse_args()
 
 
@@ -64,7 +66,10 @@ def main():
     total_chunks = 0
     for name, chunker_cls in selected.items():
         logger.info(f"--- Processing: {name} ---")
-        chunker = chunker_cls(dry_run=dry_run)
+        try:
+            chunker = chunker_cls(dry_run=dry_run, batch_limit=args.batch)
+        except TypeError:
+            chunker = chunker_cls(dry_run=dry_run)
         try:
             chunks = chunker.generate_chunks(full=full)
             logger.info(f"  {name}: generated {len(chunks)} chunks")
