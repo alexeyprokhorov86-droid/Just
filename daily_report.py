@@ -282,7 +282,8 @@ def get_email_stats() -> dict:
 
 def get_km_stats() -> dict:
     stats = {"health": None, "pending_rules": 0,
-             "facts_total": 0, "facts_new": 0, "decisions_total": 0, "decisions_new": 0}
+             "facts_total": 0, "facts_new": 0, "decisions_total": 0, "decisions_new": 0,
+             "auto_approved": {}, "suspicious_rules": []}
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -311,6 +312,21 @@ def get_km_stats() -> dict:
             "SELECT count(*) as cnt FROM km_decisions WHERE created_at > NOW() - INTERVAL '24 hours' "
             "AND verification_status NOT IN ('rejected','duplicate')")
         stats["decisions_new"] = row["cnt"] if row else 0
+
+        # Auto-approved rules watchdog
+        rows = _safe_query(cur,
+            "SELECT rule_type, count(*) as cnt FROM km_filter_rules "
+            "WHERE approval_status = 'approved' AND added_by = 'llm_reviewer' "
+            "AND created_at > NOW() - INTERVAL '24 hours' GROUP BY rule_type")
+        stats["auto_approved"] = {r["rule_type"]: r["cnt"] for r in rows}
+
+        rows = _safe_query(cur,
+            "SELECT value, rule_type FROM km_filter_rules "
+            "WHERE approval_status = 'approved' AND added_by = 'llm_reviewer' "
+            "AND created_at > NOW() - INTERVAL '24 hours' "
+            "ORDER BY CASE rule_type WHEN 'junk_word' THEN 1 WHEN 'min_length' THEN 2 WHEN 'safe_word' THEN 3 END, "
+            "LENGTH(value) ASC LIMIT 4")
+        stats["suspicious_rules"] = [(r["value"], r["rule_type"]) for r in rows]
 
         cur.close()
         conn.close()
@@ -481,6 +497,15 @@ def generate_report() -> str:
         parts.append(f"  Ревизия: verified {verified}, rejected {rejected}, duplicate {dedup}")
     if km["pending_rules"]:
         parts.append(f"  Новые правила: {km['pending_rules']} (pending)")
+    aa = km.get("auto_approved", {})
+    if aa:
+        total_aa = sum(aa.values())
+        aa_str = ", ".join(f"{k}: {v}" for k, v in aa.items())
+        parts.append(f"  Auto-approved: {total_aa} ({aa_str})")
+        suspicious = km.get("suspicious_rules", [])
+        if suspicious:
+            check_str = ", ".join(f'"{v}" ({t})' for v, t in suspicious)
+            parts.append(f"  Проверь: {check_str}")
     parts.append(f"  База: facts {km['facts_total']:,} (+{km['facts_new']}), decisions {km['decisions_total']:,} (+{km['decisions_new']})")
     parts.append("")
 

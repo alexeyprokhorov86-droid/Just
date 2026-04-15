@@ -396,7 +396,7 @@ def apply_new_rules(conn, new_rules, remove_rules):
         if not cur.fetchone():
             cur.execute("""
                 INSERT INTO km_filter_rules (rule_type, target, value, reason, added_by, approval_status)
-                VALUES ('junk_word', 'all', %s, %s, 'llm_reviewer', 'pending')
+                VALUES ('junk_word', 'all', %s, %s, 'llm_reviewer', 'approved')
             """, (value, reason))
             added += 1
             logger.info(f"  Новое правило: '{value}' — {reason}")
