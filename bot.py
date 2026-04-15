@@ -2007,7 +2007,9 @@ async def roles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_role_assignment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает назначение ролей в групповом чате."""
     message = update.message
-    
+    if not message:
+        return
+
     if not message.reply_to_message:
         return
     
@@ -3107,7 +3109,9 @@ async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pending:
         await update.message.reply_text(
             f"✅ Нет правил на рассмотрении\n\n"
-            f"📊 Активных: {stats[0]}, отключённых: {stats[2]}"
+            f"📊 Активных: {stats[0]}, отключённых: {stats[2]}\n\n"
+            f"Поиск: /rules_find <слово>\n"
+            f"Отключить: /rules_off <id>"
         )
         return
  
@@ -3182,6 +3186,81 @@ async def rules_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
  
         value = row[0] if row else "?"
         await query.edit_message_text(f"❌ Правило отклонено: `{value}`", parse_mode="Markdown")
+
+
+async def rules_find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Поиск активных правил фильтрации по значению."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Только для администраторов")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /rules_find <слово>")
+        return
+
+    query_str = " ".join(context.args).strip()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, value, rule_type, added_by, created_at::date
+                FROM km_filter_rules
+                WHERE is_active = true AND value ILIKE %s
+                ORDER BY created_at DESC LIMIT 10
+            """, (f"%{query_str}%",))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        await update.message.reply_text(f'🔍 Правила с "{query_str}" не найдены')
+        return
+
+    lines = [f'🔍 Найдено {len(rows)} для "{query_str}":\n']
+    for i, (rid, value, rtype, added_by, created) in enumerate(rows, 1):
+        date_str = created.strftime("%d.%m") if created else ""
+        lines.append(f'{i}. [ID:{rid}] "{value}" ({rtype}) — {added_by or "?"}, {date_str}')
+    lines.append(f"\nОтключить: /rules_off {rows[0][0]}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def rules_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Деактивация правил фильтрации по ID."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Только для администраторов")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /rules_off <id> [id2] [id3]...")
+        return
+
+    try:
+        ids = [int(x) for x in context.args]
+    except ValueError:
+        await update.message.reply_text("ID должны быть числами")
+        return
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE km_filter_rules SET is_active = false, updated_at = NOW()
+                WHERE id = ANY(%s) AND is_active = true
+                RETURNING id, value, rule_type
+            """, (ids,))
+            updated = cur.fetchall()
+            conn.commit()
+    finally:
+        conn.close()
+
+    if not updated:
+        await update.message.reply_text("Ничего не отключено (правила не найдены или уже неактивны)")
+        return
+
+    lines = [f"✅ Отключено: {len(updated)}"]
+    for rid, value, rtype in updated:
+        lines.append(f'  "{value}" ({rtype}, ID:{rid})')
+    await update.message.reply_text("\n".join(lines))
 
 def get_chat_id_by_title(chat_title: str) -> int | None:
     """Получает chat_id по названию чата из БД."""
@@ -3478,6 +3557,8 @@ def main():
     application.add_handler(CommandHandler("bom", bom_command))
     # Команда /rules — управление правилами фильтрации
     application.add_handler(CommandHandler("rules", rules_command))
+    application.add_handler(CommandHandler("rules_find", rules_find_command))
+    application.add_handler(CommandHandler("rules_off", rules_off_command))
     application.add_handler(CommandHandler("element", element_command))
 
     # Notifications
