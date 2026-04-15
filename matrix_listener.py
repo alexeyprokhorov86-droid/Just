@@ -4,6 +4,12 @@ import json
 import os
 import sys
 import time
+import pathlib
+from dotenv import load_dotenv
+
+env_path = pathlib.Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path if env_path.exists() else None)
+
 import psycopg2
 import aiohttp
 
@@ -33,7 +39,7 @@ def get_bridged_rooms():
 # Конфигурация
 MATRIX_URL = "http://127.0.0.1:8008"
 MATRIX_USER = "@aleksei:frumelad.ru"
-MATRIX_PASSWORD = os.environ.get("MATRIX_BOT_PASSWORD")
+MATRIX_PASSWORD = os.environ.get("MATRIX_ADMIN_PASSWORD")
 DB_HOST = os.environ.get("DB_HOST", "172.20.0.2")
 DB_NAME = "knowledge_base"
 DB_USER = "knowledge"

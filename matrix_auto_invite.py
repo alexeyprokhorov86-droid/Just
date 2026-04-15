@@ -34,7 +34,7 @@ WORK_ROOMS = {
     "Бухгалтерия Фрумелад/НФ","Руководство (bridged)","Производство",
     "Априори & Фрумелад/НФ","Секретариат","HR-Фрумелад/НФ",
     "Фрумелад задачи на разработку BSG","Торты Отгрузки",
-    "Фрумелад поддержка BSG","Дизайн упаковки",
+    "Фрумелад поддержка BSG","Дизайн упаковки Кондитерская Прохорова",
     "Новые продукты и конкуренты","БЗ Производство Chat","БЗ Производство",
     "БЗ R&D","БЗ R&D Chat","БЗ Бухгалтерия","БЗ Бухгалтерия Chat",
     "БЗ Закупки Chat","БЗ Склад","БЗ Склад Chat",
@@ -42,9 +42,32 @@ WORK_ROOMS = {
     "R&D ~ общая рабочая группа",
     "KELIN - кондитерская Прохорова","БЗ инструкции производство",
     "Закупки","Закупки - Упаковка","Продажи на ярды",
+    "Склад - Производство",
+    "Фрумелад (НФ) Кадровые задачи по IT и 1С",
+    "Производство Кондитерская Прохорова",
+    "HR Фрумелад",
 }
-TG_TO_MATRIX_NAME = {"Руководство":"Руководство (bridged)","Дизайн упаковки Кондитерская Прохорова":"Дизайн упаковки"}
-MANUAL_USER_MAP = {805598873:"aleksei", 1058481218:"irina.prokhorova"}
+TG_TO_MATRIX_NAME = {
+    "Руководство":"Руководство (bridged)",
+    "Фрумелад (НБ) Кадровые задачи по IT и 1С":"Фрумелад (НФ) Кадровые задачи по IT и 1С",
+}
+MANUAL_USER_MAP = {
+    805598873:"aleksei",
+    1058481218:"irina.prokhorova",
+    5905835671:"3loy81",
+    5612803898:"alevtina",
+    966229312:"elena.pimoshina",
+    6845467619:"hr.anna",
+    5197199676:"aleksandr",
+    7177180466:"vasilisa.matveeva",
+    1534248288:"vladimir",
+    922771146:"rail.rafiullin",
+    6084881785:"rakhat",
+    6895239041:"sergey",
+    1499853379:"tokhir.islamov",
+    1813272296:"user_1813272296",
+    1614345350:"igor",
+}
 SKIP_MATRIX_USERS = {"@bot:frumelad.ru","@aleksei:frumelad.ru"}
 SPACE_ROOM_ID = "!hRnxoPZwyiPRobHsCy:frumelad.ru"
 ELEMENT_ANDROID = "https://play.google.com/store/apps/details?id=io.element.android.x"
@@ -71,8 +94,11 @@ def tg_send_message(chat_id, text, parse_mode="Markdown"):
     resp = requests.post(url, json={"chat_id":chat_id,"text":text,"parse_mode":parse_mode,"disable_web_page_preview":True}, proxies=proxies, timeout=15)
     return resp.json()
 
+MATRIX_SESSION = requests.Session()
+MATRIX_SESSION.trust_env = False  # bypass HTTP_PROXY for localhost
+
 def matrix_login():
-    resp = requests.post(f"{MATRIX_URL}/_matrix/client/v3/login",json={"type":"m.login.password","user":MATRIX_ADMIN_USER,"password":MATRIX_ADMIN_PASSWORD},timeout=10)
+    resp = MATRIX_SESSION.post(f"{MATRIX_URL}/_matrix/client/v3/login",json={"type":"m.login.password","user":MATRIX_ADMIN_USER,"password":MATRIX_ADMIN_PASSWORD},timeout=10)
     data = resp.json()
     if "access_token" not in data:
         logger.error(f"Matrix login failed: {data}"); sys.exit(1)
@@ -81,7 +107,7 @@ def matrix_login():
 def matrix_get_real_users(token):
     users = {}; _from = "0"
     while True:
-        resp = requests.get(f"{MATRIX_URL}/_synapse/admin/v2/users",headers={"Authorization":f"Bearer {token}"},params={"limit":100,"from":_from},timeout=15)
+        resp = MATRIX_SESSION.get(f"{MATRIX_URL}/_synapse/admin/v2/users",headers={"Authorization":f"Bearer {token}"},params={"limit":100,"from":_from},timeout=15)
         data = resp.json()
         for u in data.get("users",[]):
             name = u["name"]
@@ -92,12 +118,12 @@ def matrix_get_real_users(token):
     return users
 
 def matrix_reset_password(token, mid, pw):
-    return requests.put(f"{MATRIX_URL}/_synapse/admin/v2/users/{mid}",headers={"Authorization":f"Bearer {token}"},json={"password":pw,"logout_devices":False},timeout=10).status_code==200
+    return MATRIX_SESSION.put(f"{MATRIX_URL}/_synapse/admin/v2/users/{mid}",headers={"Authorization":f"Bearer {token}"},json={"password":pw,"logout_devices":False},timeout=10).status_code==200
 
 def matrix_get_rooms(token):
     rooms = {}; _from = 0
     while True:
-        resp = requests.get(f"{MATRIX_URL}/_synapse/admin/v1/rooms",headers={"Authorization":f"Bearer {token}"},params={"limit":100,"from":_from},timeout=15)
+        resp = MATRIX_SESSION.get(f"{MATRIX_URL}/_synapse/admin/v1/rooms",headers={"Authorization":f"Bearer {token}"},params={"limit":100,"from":_from},timeout=15)
         data = resp.json()
         for r in data.get("rooms",[]):
             name = r.get("name")
@@ -107,14 +133,14 @@ def matrix_get_rooms(token):
     return rooms
 
 def matrix_get_room_members(token, room_id):
-    return set(requests.get(f"{MATRIX_URL}/_synapse/admin/v1/rooms/{room_id}/members",headers={"Authorization":f"Bearer {token}"},timeout=10).json().get("members",[]))
+    return set(MATRIX_SESSION.get(f"{MATRIX_URL}/_synapse/admin/v1/rooms/{room_id}/members",headers={"Authorization":f"Bearer {token}"},timeout=10).json().get("members",[]))
 
 def matrix_invite_to_room(token, room_id, user_id):
-    return requests.post(f"{MATRIX_URL}/_matrix/client/v3/rooms/{room_id}/invite",headers={"Authorization":f"Bearer {token}"},json={"user_id":user_id},timeout=10).status_code in (200,403)
+    return MATRIX_SESSION.post(f"{MATRIX_URL}/_matrix/client/v3/rooms/{room_id}/invite",headers={"Authorization":f"Bearer {token}"},json={"user_id":user_id},timeout=10).status_code in (200,403)
 
 def matrix_user_has_devices(token, matrix_user_id):
     """Проверить, заходил ли пользователь (есть ли у него устройства)."""
-    resp = requests.get(f"{MATRIX_URL}/_synapse/admin/v2/users/{matrix_user_id}/devices",
+    resp = MATRIX_SESSION.get(f"{MATRIX_URL}/_synapse/admin/v2/users/{matrix_user_id}/devices",
         headers={"Authorization":f"Bearer {token}"},timeout=10)
     return len(resp.json().get("devices",[])) > 0
 
@@ -191,9 +217,9 @@ def run_invite(args):
 
     logger.info(f"Matrix аккаунтов: {len(matrix_users)}, комнат: {len(room_map)}, сотрудников TG: {len(employees)}, уже приглашено: {len(already_invited)}")
 
-    to_invite = {}; already_active = {}; no_matrix = []
+    # Classify all employees: need_tg_invite, need_rooms_only, no_matrix
+    need_tg_invite = {}; need_rooms = {}; no_matrix = []
     for uid, emp in employees.items():
-        if uid in already_invited: continue
         if uid in MANUAL_USER_MAP and MANUAL_USER_MAP[uid]=="aleksei": continue
         mid = resolve_matrix_id(uid, emp["username"], matrix_users)
         if not mid or mid in SKIP_MATRIX_USERS:
@@ -202,53 +228,55 @@ def run_invite(args):
         lp = mid.split(":")[0].lstrip("@")
         entry = {"matrix_id":mid,"localpart":lp,"first_name":emp["first_name"],"username":emp["username"],"chat_ids":emp["chat_ids"],"chat_titles":emp["chat_titles"]}
 
-        # Проверяем: уже заходил в Matrix?
-        if matrix_user_has_devices(token, mid):
-            already_active[uid] = entry
-            logger.info(f"  ✓ {emp['first_name']} ({lp}) — уже в Matrix, только invite в комнаты")
-        else:
+        # Всем нужна проверка комнат
+        need_rooms[uid] = entry
+
+        # TG-приглашение нужно только новым (не invited, без устройств)
+        if uid not in already_invited and not matrix_user_has_devices(token, mid):
             entry["password"] = generate_password()
-            to_invite[uid] = entry
+            need_tg_invite[uid] = entry
+        elif uid not in already_invited and matrix_user_has_devices(token, mid):
+            logger.info(f"  ✓ {emp['first_name']} ({lp}) — уже в Matrix, только invite в комнаты")
 
     if no_matrix: logger.info(f"Без Matrix-аккаунта: {', '.join(no_matrix)}")
 
-    # Сначала обрабатываем тех, кто УЖЕ в Matrix — Space + комнаты
+    # === Фаза 1: Space + комнаты для ВСЕХ (и новых, и уже приглашённых) ===
     total_rooms = 0
     space_members = matrix_get_room_members(token, SPACE_ROOM_ID)
-    if already_active:
-        logger.info(f"\n{'='*50}\nУже в Matrix ({len(already_active)} чел.) — приглашаю в Space и комнаты:")
-        for uid, d in already_active.items():
-            # Space invite
-            if d["matrix_id"] not in space_members:
-                if args.dry_run:
-                    logger.info(f"  [DRY-RUN] {d['first_name']} → Space Фрумелад")
-                else:
-                    ok = matrix_invite_to_room(token, SPACE_ROOM_ID, d["matrix_id"])
-                    logger.info(f"  {'✅' if ok else '❌'} {d['first_name']} → Space Фрумелад")
-                    total_rooms += 1; time.sleep(0.2)
-            # Комнаты
-            for t in d["chat_titles"]:
-                if not t: continue
-                mn = TG_TO_MATRIX_NAME.get(t, t)
-                if mn not in room_map: continue
-                rid = room_map[mn]
-                members = matrix_get_room_members(token, rid)
-                if d["matrix_id"] in members: continue
-                if args.dry_run:
-                    logger.info(f"  [DRY-RUN] {d['first_name']} → {mn}")
-                else:
-                    ok = matrix_invite_to_room(token, rid, d["matrix_id"])
-                    logger.info(f"  {'✅' if ok else '❌'} {d['first_name']} → {mn}")
-                    total_rooms += 1; time.sleep(0.2)
+    logger.info(f"\n{'='*50}\nПроверка Space + комнат для {len(need_rooms)} чел.:")
+    for uid, d in need_rooms.items():
+        # Space invite
+        if d["matrix_id"] not in space_members:
+            if args.dry_run:
+                logger.info(f"  [DRY-RUN] {d['first_name']} → Space Фрумелад")
+            else:
+                ok = matrix_invite_to_room(token, SPACE_ROOM_ID, d["matrix_id"])
+                logger.info(f"  {'✅' if ok else '❌'} {d['first_name']} → Space Фрумелад")
+                total_rooms += 1; time.sleep(0.2)
+        # Комнаты
+        for t in d["chat_titles"]:
+            if not t: continue
+            mn = TG_TO_MATRIX_NAME.get(t, t)
+            if mn not in room_map: continue
+            rid = room_map[mn]
+            members = matrix_get_room_members(token, rid)
+            if d["matrix_id"] in members: continue
+            if args.dry_run:
+                logger.info(f"  [DRY-RUN] {d['first_name']} → {mn}")
+            else:
+                ok = matrix_invite_to_room(token, rid, d["matrix_id"])
+                logger.info(f"  {'✅' if ok else '❌'} {d['first_name']} → {mn}")
+                total_rooms += 1; time.sleep(0.2)
 
-    if not to_invite:
-        logger.info(f"\nНовых для приглашения нет. В комнаты: {total_rooms}")
+    # === Фаза 2: TG-сообщения для НОВЫХ пользователей без устройств ===
+    if not need_tg_invite:
+        logger.info(f"\nНовых для TG-приглашения нет. В комнаты: {total_rooms}")
         conn.close(); return
 
-    # Группируем НОВЫХ по чатам
+    # Группируем новых по чатам
     chat_to_uninvited = defaultdict(list)
-    for uid in to_invite:
-        for cid in to_invite[uid]["chat_ids"]:
+    for uid in need_tg_invite:
+        for cid in need_tg_invite[uid]["chat_ids"]:
             chat_to_uninvited[cid].append(uid)
 
     sorted_chats = sort_chats(list(chat_to_uninvited.keys()), chat_titles_map)
@@ -266,7 +294,7 @@ def run_invite(args):
         # Сброс паролей
         people_data = []
         for uid in people:
-            d = to_invite[uid]
+            d = need_tg_invite[uid]
             if not args.dry_run:
                 if not matrix_reset_password(token, d["matrix_id"], d["password"]):
                     logger.warning(f"  ❌ пароль {d['matrix_id']}"); continue
@@ -283,37 +311,13 @@ def run_invite(args):
             if result.get("ok"):
                 logger.info(f"  ✅ Отправлено в '{chat_title}' ({len(people_data)} чел.)")
                 for fn,uid,lp,pw in people_data:
-                    save_invite(conn, uid, to_invite[uid]["username"], fn, to_invite[uid]["matrix_id"], pw, chat_id)
+                    save_invite(conn, uid, need_tg_invite[uid]["username"], fn, need_tg_invite[uid]["matrix_id"], pw, chat_id)
             else:
                 logger.warning(f"  ❌ '{chat_title}': {result.get('description')}"); continue
             time.sleep(2)
 
         for fn,uid,lp,pw in people_data: invited_users.add(uid)
         total_sent += len(people_data)
-
-        # Приглашение в Space + ВСЕ комнаты
-        for fn,uid,lp,pw in people_data:
-            d = to_invite[uid]
-            # Space
-            if d["matrix_id"] not in space_members:
-                if args.dry_run:
-                    logger.info(f"    [DRY-RUN] {fn} → Space Фрумелад")
-                else:
-                    ok = matrix_invite_to_room(token, SPACE_ROOM_ID, d["matrix_id"])
-                    logger.info(f"    {'✅' if ok else '❌'} {fn} → Space Фрумелад")
-                    total_rooms += 1; time.sleep(0.2)
-            # Комнаты
-            for t in d["chat_titles"]:
-                if not t: continue
-                mn = TG_TO_MATRIX_NAME.get(t, t)
-                if mn not in room_map: continue
-                rid = room_map[mn]
-                if args.dry_run:
-                    logger.info(f"    [DRY-RUN] {fn} → {mn}")
-                else:
-                    ok = matrix_invite_to_room(token, rid, d["matrix_id"])
-                    logger.info(f"    {'✅' if ok else '❌'} {fn} → {mn}")
-                    total_rooms += 1; time.sleep(0.2)
 
     logger.info(f"\n{'='*50}\nИтого: TG-приглашений {total_sent}, в комнаты {total_rooms}")
     conn.close()

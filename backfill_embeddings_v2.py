@@ -32,7 +32,6 @@ log = logging.getLogger(__name__)
 BATCH_SIZE = 32        # encode batch (tested: no OOM on 16GB)
 FETCH_SIZE = 500       # rows per DB fetch
 MAX_TEXT_CHARS = 512   # truncation (cosine sim 0.99 vs 1000 chars)
-COMMIT_EVERY = 500     # commit to DB every N chunks
 
 def main():
     conn = psycopg2.connect(**DB_CONFIG)
@@ -58,35 +57,33 @@ def main():
     # Warmup
     model.encode(["warmup"], normalize_embeddings=True, convert_to_numpy=True, prompt_name="document")
 
-    # Process in batches using server-side cursor for memory efficiency
+    # Process in FETCH_SIZE batches using simple SELECT with LIMIT/OFFSET-like
+    # approach via WHERE id > last_id (keyset pagination). This avoids the
+    # server-side cursor issue where COMMIT invalidates named cursors.
     processed = 0
-    pending_updates = []
     t_start = time.time()
     t_last_log = t_start
+    last_id = 0
 
-    cur_read = conn.cursor("backfill_cursor")
-    cur_read.itersize = FETCH_SIZE
-    cur_read.execute(
-        "SELECT id, chunk_text FROM source_chunks WHERE embedding_v2 IS NULL ORDER BY id"
-    )
+    while True:
+        cur.execute(
+            "SELECT id, chunk_text FROM source_chunks "
+            "WHERE embedding_v2 IS NULL AND id > %s ORDER BY id LIMIT %s",
+            (last_id, FETCH_SIZE),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            break
 
-    batch_ids = []
-    batch_texts = []
+        # Encode in sub-batches of BATCH_SIZE
+        for i in range(0, len(rows), BATCH_SIZE):
+            batch = rows[i : i + BATCH_SIZE]
+            ids = [r[0] for r in batch]
+            texts = [r[1][:MAX_TEXT_CHARS] if r[1] else "" for r in batch]
 
-    for row in cur_read:
-        chunk_id, chunk_text = row
-        batch_ids.append(chunk_id)
-        batch_texts.append(chunk_text[:MAX_TEXT_CHARS] if chunk_text else "")
-
-        if len(batch_texts) >= BATCH_SIZE:
-            _encode_and_queue(model, batch_ids, batch_texts, pending_updates)
-            processed += len(batch_ids)
-            batch_ids, batch_texts = [], []
-
-            # Commit periodically
-            if len(pending_updates) >= COMMIT_EVERY:
-                _flush_updates(conn, cur, pending_updates)
-                pending_updates = []
+            _encode_and_queue(model, ids, texts, pending_updates := [])
+            _flush_updates(conn, cur, pending_updates)
+            processed += len(ids)
 
             # Log progress
             now = time.time()
@@ -100,15 +97,7 @@ def main():
                 )
                 t_last_log = now
 
-    # Final batch
-    if batch_texts:
-        _encode_and_queue(model, batch_ids, batch_texts, pending_updates)
-        processed += len(batch_ids)
-
-    if pending_updates:
-        _flush_updates(conn, cur, pending_updates)
-
-    cur_read.close()
+        last_id = rows[-1][0]
 
     elapsed = time.time() - t_start
     rate = processed / elapsed if elapsed > 0 else 0

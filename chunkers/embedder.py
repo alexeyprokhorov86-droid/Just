@@ -14,21 +14,30 @@ logger = logging.getLogger(__name__)
 
 _model = None  # singleton
 
+# Обрезка текста до ~512 токенов (~2000 символов для русского).
+# Qwen3 поддерживает 8192, но длинные тексты сильно замедляют CPU inference.
+MAX_TEXT_CHARS = 1000
 
-def load_model():
+
+def load_model(backend: str = "torch"):
     """
     Lazy singleton загрузка Qwen3-Embedding-0.6B.
-    ~1.2GB модель, ~2GB RAM при inference.
+    backend: "torch" (default) или "onnx" (быстрее на CPU).
     """
     global _model
     if _model is not None:
         return _model
 
-    logger.info(f"Loading embedding model: {EMBEDDING_MODEL}...")
+    logger.info(f"Loading embedding model: {EMBEDDING_MODEL} (backend={backend})...")
     t0 = time.time()
 
     from sentence_transformers import SentenceTransformer
-    _model = SentenceTransformer(EMBEDDING_MODEL)
+
+    kwargs = {}
+    if backend == "onnx":
+        kwargs["backend"] = "onnx"
+
+    _model = SentenceTransformer(EMBEDDING_MODEL, **kwargs)
 
     dim = _model.get_sentence_embedding_dimension()
     elapsed = time.time() - t0
@@ -43,38 +52,48 @@ def load_model():
     return _model
 
 
+def _truncate(text: str, max_chars: int = MAX_TEXT_CHARS) -> str:
+    """Обрезка текста до max_chars символов."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars]
+
+
 class Embedder:
     """Обёртка для batch embedding с Qwen3-Embedding-0.6B."""
 
-    def __init__(self, batch_size: int = EMBEDDING_BATCH_SIZE):
+    def __init__(self, batch_size: int = EMBEDDING_BATCH_SIZE, backend: str = "torch"):
         self.batch_size = batch_size
+        self.backend = backend
         self.model = None
         self.dim = EMBEDDING_DIM
 
     def ensure_loaded(self):
         if self.model is None:
-            self.model = load_model()
+            self.model = load_model(backend=self.backend)
             self.dim = self.model.get_sentence_embedding_dimension()
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """
         Encode список текстов → list of float vectors.
-        Qwen3-Embedding использует prompt_name='passage' для документов.
+        Тексты обрезаются до MAX_TEXT_CHARS символов для скорости.
         """
         self.ensure_loaded()
 
         if not texts:
             return []
 
+        truncated = [_truncate(t) for t in texts]
+
         embeddings = self.model.encode(
-            texts,
+            truncated,
             batch_size=self.batch_size,
-            show_progress_bar=False,
+            show_progress_bar=len(truncated) > 100,
             normalize_embeddings=True,
+            convert_to_numpy=True,
             prompt_name="document",
         )
 
-        # numpy → list[list[float]] для совместимости с psycopg2/pgvector
         if isinstance(embeddings, np.ndarray):
             return embeddings.tolist()
         return [e.tolist() for e in embeddings]
@@ -95,6 +114,7 @@ class Embedder:
             batch_size=1,
             show_progress_bar=False,
             normalize_embeddings=True,
+            convert_to_numpy=True,
             prompt_name="query",
         )
         if isinstance(emb, np.ndarray):

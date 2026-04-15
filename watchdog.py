@@ -155,16 +155,6 @@ def check_service_errors() -> list[str]:
         log(f"Ошибка проверки логов: {e}")
         return []
 
-def restart_service():
-    """Перезапускает сервис."""
-    try:
-        subprocess.run(["sudo", "systemctl", "restart", "telegram-logger"], timeout=30)
-        log("Сервис перезапущен")
-        return True
-    except Exception as e:
-        log(f"Ошибка перезапуска: {e}")
-        return False
-
 def skip_stuck_update():
     """Пропускает застрявшее обновление."""
     try:

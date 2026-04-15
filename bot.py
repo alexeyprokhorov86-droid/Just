@@ -3220,7 +3220,8 @@ async def rules_find_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for i, (rid, value, rtype, added_by, created) in enumerate(rows, 1):
         date_str = created.strftime("%d.%m") if created else ""
         lines.append(f'{i}. [ID:{rid}] "{value}" ({rtype}) — {added_by or "?"}, {date_str}')
-    lines.append(f"\nОтключить: /rules_off {rows[0][0]}")
+    all_ids = " ".join(str(r[0]) for r in rows)
+    lines.append(f"\nОтключить: /rules_off {all_ids}")
     await update.message.reply_text("\n".join(lines))
 
 

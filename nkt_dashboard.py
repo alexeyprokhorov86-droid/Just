@@ -22,6 +22,7 @@ DB_NAME = "knowledge_base"
 DB_USER = "knowledge"
 DB_PASS = os.getenv("DB_PASSWORD", "")
 
+PREFIX = os.getenv("NKT_PREFIX", "/nkt")
 app = Flask(__name__)
 
 
@@ -229,7 +230,8 @@ canvas { max-width: 100%; }
 
 # ── Pages ───────────────────────────────────────────────────────────────
 
-@app.route("/")
+@app.route(PREFIX + "/")
+@app.route(PREFIX)
 def index():
     names = fetch_employee_names()
     now = datetime.now()
@@ -261,7 +263,7 @@ def index():
 <body>
 <h1>СКУД НКТ &mdash; Посещаемость сотрудников</h1>
 <div class="card">
-<form method="get" action="/employee">
+<form method="get" action="{PREFIX}/employee">
   <div class="form-row">
     <div class="form-group">
       <label>Сотрудник</label>
@@ -293,7 +295,7 @@ def index():
     return Response(html, content_type="text/html; charset=utf-8")
 
 
-@app.route("/employee")
+@app.route(PREFIX + "/employee")
 def employee_detail():
     name = request.args.get("name", "")
     month = int(request.args.get("month", datetime.now().month))
@@ -407,7 +409,7 @@ def employee_detail():
 <!-- After-hours config -->
 <div class="card">
 <h2>Время после окончания рабочего дня</h2>
-<form method="get" action="/employee">
+<form method="get" action="{PREFIX}/employee">
   <input type="hidden" name="name" value="{name}">
   <input type="hidden" name="month" value="{month}">
   <input type="hidden" name="year" value="{year}">
