@@ -173,3 +173,22 @@ curl -x socks5h://127.0.0.1:1080 https://api.anthropic.com
 ```bash
 ls -t .claude/sessions/ | head -3 | xargs -I {} cat .claude/sessions/{}
 ```
+
+## Текущие задачи (обновлять вручную)
+
+Файлы задач в корне репозитория:
+- `TASK_rules_manage.md` — реализация /rules_find и /rules_off в боте
+- `TASK_NOTIFICATIONS.md` — уведомления
+
+### Очередь задач (апрель 2026):
+1. **TASK_rules_manage.md** — поиск и деактивация правил фильтрации из бота
+2. **RAG Фаза 2** — переключение на source_chunks (после завершения backfill)
+3. **Qwen3-Reranker-0.6B** — локальный reranker
+4. **Periodic Synthesis для 1С** — автосуммирование продаж/закупок/производства в km_facts
+
+### Backlog:
+- Дедупликация km_facts (embedding similarity в review_knowledge.py)
+- Бот в Element X (Matrix-транспорт для /search, /analysis)
+- matrix_auto_invite.py в cron
+- sync_bank_balances — проверить деплой
+- .well-known для frumelad.ru
