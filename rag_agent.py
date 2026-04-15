@@ -2565,7 +2565,7 @@ def rerank_results(question: str, results: list, top_k: int = 10) -> list:
 # ОСНОВНОЙ ReAct ЦИКЛ
 # =============================================================================
 
-async def process_rag_query(question, chat_context=""):
+async def process_rag_query(question, chat_context="", user_info: dict = None):
     """
     ReAct цикл обработки RAG-запроса:
     1. Smart Router (выбор чатов + план)
@@ -2577,10 +2577,13 @@ async def process_rag_query(question, chat_context=""):
     """
     logger.info(f"RAG запрос: {question}")
     start_time = time.time()
-    
+    if not user_info:
+        user_info = {}
+
     # === Шаг 1: Smart Router ===
     plan = route_query(question, chat_context)
     plan = ensure_plan_sources(plan, question)
+    router_time_ms = int((time.time() - start_time) * 1000)
     logger.info(f"Query plan: type={plan.get('query_type')}, steps={len(plan.get('steps', []))}, "
                f"target_chats={plan.get('target_chats', [])}")
     
@@ -2780,8 +2783,71 @@ async def process_rag_query(question, chat_context=""):
         f"quotas={source_counts}"
     )
 
+    search_time_ms = int((time.time() - start_time) * 1000) - router_time_ms
+
     # === Шаг 5: Генерация ответа (GPT-4.1) ===
-    return generate_response(question, evidence_results, web_results, web_citations, chat_context)
+    gen_start = time.time()
+    response = generate_response(question, evidence_results, web_results, web_citations, chat_context)
+    generation_time_ms = int((time.time() - gen_start) * 1000)
+
+    # === Логирование ===
+    _log_rag_query({
+        "user_id": user_info.get("user_id"),
+        "username": user_info.get("username"),
+        "first_name": user_info.get("first_name"),
+        "chat_id": user_info.get("chat_id"),
+        "chat_type": user_info.get("chat_type"),
+        "question": question,
+        "primary_intent": primary_intent,
+        "detected_intents": list(detect_query_intents(question)),
+        "router_query_type": plan.get("query_type"),
+        "router_target_chats": plan.get("target_chats"),
+        "sources_used": executed_sources,
+        "evidence_count": len(evidence_results),
+        "evidence_sources": json.dumps(source_counts),
+        "evaluator_sufficient": evaluation.get("sufficient", True),
+        "retry_count": 0,
+        "rerank_applied": len(db_results) > 12,
+        "response_length": len(response),
+        "response_time_ms": int((time.time() - start_time) * 1000),
+        "router_time_ms": router_time_ms,
+        "search_time_ms": search_time_ms,
+        "generation_time_ms": generation_time_ms,
+        "web_search_used": bool(web_results),
+        "error": None,
+    })
+
+    return response
+
+
+def _log_rag_query(data: dict):
+    """Записывает RAG-запрос в лог. Не блокирует основной поток."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO rag_query_log (
+                    user_id, username, first_name, chat_id, chat_type,
+                    question, primary_intent, detected_intents,
+                    router_query_type, router_target_chats, sources_used,
+                    evidence_count, evidence_sources, evaluator_sufficient,
+                    retry_count, rerank_applied, response_length,
+                    response_time_ms, router_time_ms, search_time_ms,
+                    generation_time_ms, web_search_used, error
+                ) VALUES (
+                    %(user_id)s, %(username)s, %(first_name)s, %(chat_id)s, %(chat_type)s,
+                    %(question)s, %(primary_intent)s, %(detected_intents)s,
+                    %(router_query_type)s, %(router_target_chats)s, %(sources_used)s,
+                    %(evidence_count)s, %(evidence_sources)s, %(evaluator_sufficient)s,
+                    %(retry_count)s, %(rerank_applied)s, %(response_length)s,
+                    %(response_time_ms)s, %(router_time_ms)s, %(search_time_ms)s,
+                    %(generation_time_ms)s, %(web_search_used)s, %(error)s
+                )
+            """, data)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"RAG log error: {e}")
 
 
 async def index_new_message(table_name: str, message_id: int, content: str):

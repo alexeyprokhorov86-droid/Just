@@ -382,7 +382,10 @@ async def handle_command(session, access_token, room_id, event, command, args):
 
         await send_typing(session, access_token, room_id)
         try:
-            response = await process_rag_query(args, "")
+            response = await process_rag_query(args, "", user_info={
+                "user_id": None, "username": sender, "first_name": sender.split(":")[0].lstrip("@"),
+                "chat_id": None, "chat_type": "matrix",
+            })
             await send_message(session, access_token, room_id, response, reply_to=event_id)
         except Exception as e:
             logger.error(f"Search error: {e}")
@@ -447,7 +450,10 @@ async def handle_text_message(session, access_token, room_id, event):
     await send_typing(session, access_token, room_id)
 
     try:
-        response = await process_rag_query(body, "")
+        response = await process_rag_query(body, "", user_info={
+            "user_id": None, "username": sender, "first_name": sender.split(":")[0].lstrip("@"),
+            "chat_id": None, "chat_type": "matrix",
+        })
 
         if response:
             await send_message(session, access_token, room_id, response, reply_to=event_id)
