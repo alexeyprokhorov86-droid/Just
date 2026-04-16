@@ -10,6 +10,7 @@ Cron: 0 4 * * * cd /home/admin/telegram_logger_bot && .../python review_knowledg
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -300,6 +301,12 @@ REVIEW_SYSTEM_PROMPT = """Ты — ревизор базы знаний конд
 - delete — факт не относится к компании (рассылки, спам, чужие компании, персональные данные, общие фразы)
 - uncertain — непонятно, нужна дополнительная проверка
 
+НИКОГДА не предлагай как junk_word следующие категории терминов — это ценные данные компании:
+- IT-инфраструктура: vpn, wireguard, openvpn, ssh, ssl/tls, dns, firewall, nginx, docker, postgres, redis, прокси, порты
+- HR/кадры/выплаты: зарплата, оклад, премия, аванс, ндфл, ндс, налог, больничный, отпуск, табель, трудовой договор, увольнение, найм, сотрудник, штат
+- Финансы/банки: счёт, банк, баланс, прибыль, убыток, выручка, маржа, себестоимость
+- Юридические: договор, акт, гпх, паспорт, фио
+
 Также предложи новые слова/паттерны для автоматической фильтрации если заметишь повторяющийся мусор.
 
 Отвечай ТОЛЬКО валидным JSON:
@@ -314,6 +321,48 @@ REVIEW_SYSTEM_PROMPT = """Ты — ревизор базы знаний конд
     {"value": "слово или паттерн", "reason": "почему это правило ошибочно фильтрует полезное"}
   ]
 }"""
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Защита от ложных авто-апрувов (см. сессию 2026-04-16, FP «wireguard»,
+# «vpn», «зарплата ...», «оклад ...» и т.п.)
+# ──────────────────────────────────────────────────────────────────────
+
+# Подстроки. Любое предлагаемое значение, содержащее одну из них (после
+# .lower().strip()), НЕ добавляется как junk_word.
+SAFE_SUBSTRINGS = (
+    # IT-инфраструктура
+    "vpn", "wireguard", "openvpn", "ssh", "ssl", "tls", "dns",
+    "firewall", "nginx", "docker", "kubernetes", "postgres", "redis",
+    "kafka", "proxy", "socks", "tcp", "port",
+    # HR / кадры / выплаты
+    "зарплат", "оклад", "премия", "аванс", "ндфл", "ндс", "налог",
+    "больничн", "отпуск", "табель", "трудов", "договор",
+    "увольнен", "найм", "сотрудник", "штат", "ставк",
+    # Финансы / банки
+    "счёт", "счет", "банк", "баланс", "прибыл", "убыток",
+    "выручк", "маржа", "себестоим",
+    # Юридические / документы
+    " акт ", "гпх", "паспорт", "фио", "инн", "кпп", "огрн",
+)
+
+REGEX_META_RE = re.compile(r"[\[\](){}|*+?\\]|\.\*|\\d|\\w|\\s")
+
+
+def _is_safe_term(value: str) -> str | None:
+    """Возвращает причину, по которой value НЕ должно стать junk_word.
+    None — значение безопасно добавлять."""
+    if not value:
+        return "empty"
+    v = f" {value.lower()} "
+    for sub in SAFE_SUBSTRINGS:
+        if sub in v or value.lower().startswith(sub) or value.lower().endswith(sub):
+            return f"matches whitelist substring '{sub}'"
+    return None
+
+
+def _has_regex_meta(value: str) -> bool:
+    return bool(REGEX_META_RE.search(value))
 
 
 def review_batch(facts_batch, company_context):
@@ -381,9 +430,19 @@ def apply_verdicts(conn, verdicts):
 
 
 def apply_new_rules(conn, new_rules, remove_rules):
-    """Добавляет/удаляет правила фильтрации."""
+    """Добавляет/удаляет правила фильтрации.
+
+    Защита от ложных авто-апрувов:
+      слой 1 — whitelist `_is_safe_term()` (IT/HR/finance);
+      слой 2 — отказ если такое value уже есть в истории
+               (любой is_active или false_positive_count>0);
+      слой 3 — regex-паттерны идут как `pending` (ручной review).
+    """
     cur = conn.cursor()
     added = 0
+    added_pending = 0
+    skipped_whitelist = 0
+    skipped_history = 0
     removed = 0
 
     for rule in new_rules:
@@ -391,15 +450,53 @@ def apply_new_rules(conn, new_rules, remove_rules):
         reason = rule.get('reason', '')
         if not value or len(value) < 3:
             continue
-        # Проверяем что такого правила ещё нет
-        cur.execute("SELECT id FROM km_filter_rules WHERE value = %s AND is_active = true", (value,))
-        if not cur.fetchone():
-            cur.execute("""
-                INSERT INTO km_filter_rules (rule_type, target, value, reason, added_by, approval_status)
-                VALUES ('junk_word', 'all', %s, %s, 'llm_reviewer', 'approved')
-            """, (value, reason))
+
+        # Слой 1: whitelist
+        safe_reason = _is_safe_term(value)
+        if safe_reason:
+            skipped_whitelist += 1
+            logger.warning(f"  [SKIP-WHITELIST] '{value}' — {safe_reason}")
+            continue
+
+        # Слой 2: история (любая запись с этим value, активная или нет)
+        cur.execute(
+            "SELECT id, is_active, false_positive_count "
+            "FROM km_filter_rules WHERE value = %s",
+            (value,),
+        )
+        existing = cur.fetchone()
+        if existing:
+            ex_id, ex_active, ex_fp = existing
+            if ex_active:
+                continue  # уже активно — молча
+            skipped_history += 1
+            logger.warning(
+                f"  [SKIP-HISTORY] '{value}' — есть запись id={ex_id} "
+                f"(active={ex_active}, fp={ex_fp}); LLM повторно предложил"
+            )
+            continue
+
+        # Слой 3: regex → pending, plain word → approved
+        if _has_regex_meta(value):
+            status = 'pending'
+            added_pending += 1
+            logger.warning(
+                f"  [PENDING-REGEX] '{value}' — содержит regex-метасимволы, "
+                f"требуется ручной review. Reason: {reason}"
+            )
+        else:
+            status = 'approved'
             added += 1
             logger.info(f"  Новое правило: '{value}' — {reason}")
+
+        cur.execute(
+            """
+            INSERT INTO km_filter_rules
+              (rule_type, target, value, reason, added_by, approval_status, is_active)
+            VALUES ('junk_word', 'all', %s, %s, 'llm_reviewer', %s, %s)
+            """,
+            (value, reason, status, status == 'approved'),
+        )
 
     for rule in remove_rules:
         value = rule.get('value', '').lower().strip()
@@ -416,6 +513,11 @@ def apply_new_rules(conn, new_rules, remove_rules):
 
     conn.commit()
     cur.close()
+    if skipped_whitelist or skipped_history or added_pending:
+        logger.info(
+            f"  Защита от FP: +approved={added}, +pending={added_pending}, "
+            f"skip_whitelist={skipped_whitelist}, skip_history={skipped_history}"
+        )
     return added, removed
 
 

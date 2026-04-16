@@ -84,6 +84,28 @@
 - Контекст для service_down — журнал 50 строк (≤15KB) + 5 коммитов; для plan-триггеров — компактный JSON
 - TG-сообщения через тот же endpoint и ADMIN_USER_ID, что и `watchdog.send_alert`
 
+## Follow-up — фикс auto-approve в review_knowledge.py
+
+После daily-отчёта пользователь сообщил о ложных авто-апрувах: `wireguard` и `файл зарплаты` помечены как junk. Расследование выявило **6 FP-правил** (id 190 vpn, 195/211/222 — regex по зарплате/договорам, 216/218 wireguard, 224 файл зарплаты).
+
+**Корневые причины** (`apply_new_rules`):
+1. дедуп только по `is_active=true` — отключённое правило можно re-add; LLM так и сделал с wireguard
+2. любое предложение LLM сразу `approval_status='approved'`
+3. нет защиты доменно-критичных терминов (IT, HR, finance, legal)
+
+**Реализован 3-слойный фикс** (review_knowledge.py):
+- Слой 1 — `SAFE_SUBSTRINGS` whitelist (~50 терминов: vpn/wireguard/ssh/.../зарплат/оклад/договор/банк/...). При совпадении — лог `[SKIP-WHITELIST]`, не вставлять.
+- Слой 2 — history-check без фильтра по is_active. Если в БД уже есть запись с этим value — `[SKIP-HISTORY]`.
+- Слой 3 — regex-метасимволы (`[`, `\d`, `.*`, и т.п.) → `approval_status='pending'` + `is_active=false`, в лог `[PENDING-REGEX]`. Plain word → старое поведение (`approved`/`is_active=true`).
+- Бонус — в `REVIEW_SYSTEM_PROMPT` добавлен явный список «никогда не предлагай как junk_word: IT/HR/финансы/legal».
+
+Self-test 8 кейсов прошёл (все 6 FP блокируются, 3 легитимных мусорных слова пропущены).
+
+**Деактивированы вручную (UPDATE):**
+- id=218 (wireguard), 224 (файл зарплаты) — по первой просьбе пользователя
+- id=190 (vpn), 195, 211, 222 — после расследования, по подтверждению пользователя
+- Всем выставлено `is_active=false`, `false_positive_count++`, `approval_status` оставлен `approved` для аудита
+
 
 
 
