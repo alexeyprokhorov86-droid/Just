@@ -100,8 +100,13 @@ fi
 log "Вызываем claude -p (timeout=${CLAUDE_TIMEOUT_SEC}s) ..."
 CLAUDE_OUT="$(mktemp /tmp/auto_fix_claude_out.XXXXXX)"
 CLAUDE_ERR="$(mktemp /tmp/auto_fix_claude_err.XXXXXX)"
+# Снимаем CLAUDE_CODE_* env vars: если auto_fix.sh запущен ИЗ другой Claude-
+# сессии (или цепочкой), дочерний `claude -p` иначе пытается подключиться к
+# родителю и получает 403 Forbidden. Cron-окружение чистое, но защита нужна
+# для ручных запусков и watchdog (который тоже может быть вызван иначе).
 set +e
-timeout "$CLAUDE_TIMEOUT_SEC" "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
+env -u CLAUDECODE -u CLAUDE_CODE_SSE_PORT -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
+    timeout "$CLAUDE_TIMEOUT_SEC" "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
     --permission-mode acceptEdits \
     --allowedTools "Bash,Edit,Read,Write,Grep,Glob" \
     > "$CLAUDE_OUT" 2> "$CLAUDE_ERR"
