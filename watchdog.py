@@ -3,8 +3,10 @@ Watchdog для мониторинга Telegram Logger Bot.
 Запускается через cron каждые 5 минут.
 """
 
+import json
 import os
 import subprocess
+import time
 import requests
 import psycopg2
 import pathlib
@@ -77,6 +79,68 @@ def restart_service(service_name: str = "telegram-logger") -> bool:
     except Exception as e:
         log(f"Ошибка перезапуска {service_name}: {e}")
         return False
+
+
+AUTO_FIX_SH = str(SCRIPT_DIR / "auto_fix.sh")
+
+
+def trigger_auto_fix_service_down(service_name: str) -> None:
+    """Если обычный рестарт не помог — вызываем автономного Claude-агента.
+
+    Собираем контекст (последние 50 строк journalctl + последние 5 коммитов)
+    и запускаем auto_fix.sh в фоне, чтобы watchdog не блокировал cron-слот.
+    """
+    ctx_path = f"/tmp/watchdog_{service_name}_ctx.json"
+    try:
+        journal = subprocess.run(
+            ["journalctl", "-u", service_name, "-n", "50", "--no-pager"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except Exception as e:
+        journal = f"(journalctl failed: {e})"
+    try:
+        gitlog = subprocess.run(
+            ["git", "log", "-5", "--oneline"],
+            capture_output=True, text=True, timeout=10, cwd=str(SCRIPT_DIR),
+        ).stdout
+    except Exception as e:
+        gitlog = f"(git log failed: {e})"
+    ctx = {
+        "trigger": "service_down",
+        "service": service_name,
+        "journal_tail_50": journal[-15000:],
+        "git_log_5": gitlog,
+        "detected_at": datetime.now().isoformat(),
+    }
+    try:
+        with open(ctx_path, "w") as f:
+            json.dump(ctx, f, ensure_ascii=False)
+    except Exception as e:
+        log(f"Не смог записать контекст {ctx_path}: {e}")
+        return
+    try:
+        bg_log = str(SCRIPT_DIR / "auto_fix_bg.log")
+        subprocess.Popen(
+            f"nohup {AUTO_FIX_SH} service_down {ctx_path} >> {bg_log} 2>&1 &",
+            shell=True, start_new_session=True,
+        )
+        log(f"auto_fix.sh запущен в фоне для service_down/{service_name}")
+    except Exception as e:
+        log(f"Не смог запустить auto_fix.sh: {e}")
+
+
+def restart_with_auto_fix(service_name: str) -> bool:
+    """Расширенный рестарт: обычный → wait 60s → если всё ещё down → auto_fix."""
+    ok = restart_service(service_name)
+    if not ok:
+        trigger_auto_fix_service_down(service_name)
+        return False
+    time.sleep(60)
+    if check_service_running(service_name):
+        return True
+    log(f"Сервис {service_name} всё ещё не active через 60с после restart — вызываем auto_fix")
+    trigger_auto_fix_service_down(service_name)
+    return False
 
 def check_disk_space() -> tuple[bool, int]:
     """Проверяет свободное место на диске. Возвращает (ok, процент_использования)."""
@@ -217,20 +281,20 @@ def main():
         alerts.append("❌ Сервис telegram-logger не запущен!")
         state["restart_count"] = state.get("restart_count", 0) + 1
         skip_stuck_update()
-        if restart_service("telegram-logger"):
+        if restart_with_auto_fix("telegram-logger"):
             alerts.append(f"🔄 telegram-logger перезапущен (перезапусков: {state['restart_count']})")
         else:
-            alerts.append("❌ Не удалось перезапустить telegram-logger!")
+            alerts.append("❌ telegram-logger не поднялся, передан auto_fix")
     else:
         log("✅ telegram-logger запущен")
-    
+
     # 2. Проверяем email-sync
     if not check_service_running("email-sync"):
         alerts.append("❌ Сервис email-sync не запущен!")
-        if restart_service("email-sync"):
+        if restart_with_auto_fix("email-sync"):
             alerts.append("🔄 email-sync перезапущен")
         else:
-            alerts.append("❌ Не удалось перезапустить email-sync!")
+            alerts.append("❌ email-sync не поднялся, передан auto_fix")
     else:
         log("✅ email-sync запущен")
     
