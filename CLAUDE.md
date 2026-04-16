@@ -187,12 +187,15 @@ ls -t .claude/sessions/ | head -3 | xargs -I {} cat .claude/sessions/{}
 Файлы задач в корне репозитория:
 - `TASK_rules_manage.md` — реализация /rules_find и /rules_off в боте
 - `TASK_NOTIFICATIONS.md` — уведомления
+- `TASK_autonomous_agent.md` — автономный Claude-агент (✅ реализовано 2026-04-16)
+- `TASK_qwen_consistency.md` — дисциплина instruction-aware Qwen3 перед Фазой 2
 
 ### Очередь задач (апрель 2026):
-1. **TASK_rules_manage.md** — поиск и деактивация правил фильтрации из бота
-2. **RAG Фаза 2** — переключение на source_chunks (после завершения backfill)
-3. **Qwen3-Reranker-0.6B** — локальный reranker
-4. **Periodic Synthesis для 1С** — автосуммирование продаж/закупок/производства в km_facts
+1. **TASK_qwen_consistency.md** — изоляция legacy e5, smoke-тест, pre-switch checklist (BLOCKER для Фазы 2)
+2. **RAG Фаза 2** — переключение на source_chunks.embedding_v2 (после backfill ~17.04 17:00 + Qwen consistency)
+3. **TASK_rules_manage.md** — поиск и деактивация правил фильтрации из бота
+4. **Qwen3-Reranker-0.6B** — локальный reranker
+5. **Periodic Synthesis для 1С** — автосуммирование продаж/закупок/производства в km_facts
 
 ### Backlog:
 - Дедупликация km_facts (embedding similarity в review_knowledge.py)
