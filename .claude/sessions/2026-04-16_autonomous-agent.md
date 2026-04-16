@@ -46,7 +46,43 @@
 - `sudo resize2fs /dev/vda2` → online-grow ext4
 - Результат: `/` теперь 118GB / 54GB used / 60GB avail = **48%** (было 80%)
 
-### Финал — git, dry-run, лог
+### Финал — git, dry-run, лог ✅
+- Коммит `be3713b` — feat: автономный Claude-агент для self-healing
+- Изменения: 8 файлов / +1178 / -5
+- `git push` → main (e8357f0..be3713b)
+- Dry-run `auto_fix.sh --dry-run pending_rules` отработал: rate-check 0/2, промпт 6094 байт, запись `dry_run` (id=1) в auto_fix_log
+
+## Итого создано/изменено
+
+### Новые файлы
+- `auto_fix.sh` — главный скрипт (rate-limit → claude -p → health-check → auto-revert → TG)
+- `auto_fix_helper.py` — Python-helpers (psycopg2, парсинг summary, TG)
+- `auto_agent_cron.py` — 5 плановых триггеров (pending_rules, sync_1c_error, disk_high, embeddings_stalled, json_parse_errors)
+- `create_auto_fix_log.sql` — DDL таблицы auto_fix_log + индекс
+- `.claude/AUTO_AGENT_RULES.md` — whitelist/blacklist/лимиты для агента
+- `.claude/auto_sessions/` — папка для логов отдельных вызовов claude -p
+
+### Изменённые файлы
+- `watchdog.py` — добавлены `trigger_auto_fix_service_down()` и `restart_with_auto_fix()`; для telegram-logger и email-sync теперь вызывается расширенная логика (restart → wait 60s → если down → auto_fix.sh в фоне)
+
+### Инфраструктура
+- БД: создана таблица `auto_fix_log` + индекс `idx_auto_fix_trigger_time`
+- Cron (admin): добавлена строка `0 * * * * auto_agent_cron.py >> auto_agent.log`
+- Root-диск расширен: `/dev/vda2` 72GB → 118GB через `growpart` + `resize2fs` (online, без размонтирования). Использование `/` упало с 80% → 48%
+
+## Незавершённое / Что наблюдать
+
+- Первый плановый запуск cron: ближайший `:00` после установки. В `~/telegram_logger_bot/auto_agent.log` будет видно, какие триггеры сработают
+- Если ни один триггер не сработает за час — проверить, что cron вообще выполнился: `grep "auto_agent_cron start" auto_agent.log`
+- Auto-revert НЕ срабатывает для плановых триггеров (нет TARGET_SERVICE) — если агент закоммитит что-то странное, видно в `auto_fix_log.git_commit_sha` и `git log`, откатить вручную
+- `daily_report.py` — пока не интегрирован блок "Auto-fix за сутки" из ТЗ (раздел "После деплоя", п.2). Сделать после первой недели наблюдений
+
+## Заметки
+
+- `claude -p` в headless-режиме использует OAuth Max-подписку пользователя (admin). Если sub истечёт — фиксы перестанут работать, alert придёт со status=`failed`
+- Промпт ~6KB — в основном правила (AUTO_AGENT_RULES.md, ~3KB). Можно ужать, если будет дорого по токенам
+- Контекст для service_down — журнал 50 строк (≤15KB) + 5 коммитов; для plan-триггеров — компактный JSON
+- TG-сообщения через тот же endpoint и ADMIN_USER_ID, что и `watchdog.send_alert`
 
 
 
