@@ -1469,6 +1469,44 @@ def _resolve_period(period_str):
 # АНАЛИТИКА 1С
 # =============================================================================
 
+def _format_qty_with_unit(qty, weight, weight_unit) -> str:
+    """
+    Форматирует количество с единицей измерения из nomenclature.
+    Примеры:
+        qty=10000, weight=1.0, unit='кг'  → '10 000 кг'
+        qty=1200,  weight=0.4, unit='кг'  → '1 200 ед. × 0.4 кг = 480 кг'
+        qty=50,    weight=None            → '50 ед.'
+    """
+    if qty is None:
+        return "0 ед."
+    qty_fmt = f"{qty:,.3f}".replace(",", " ").rstrip("0").rstrip(".")
+    if not weight_unit:
+        return f"{qty_fmt} ед."
+    w = float(weight or 0)
+    if abs(w - 1.0) < 1e-6:
+        # Единица = 1 {weight_unit}: quantity уже в {weight_unit}
+        return f"{qty_fmt} {weight_unit}"
+    if w > 0:
+        total = float(qty) * w
+        total_fmt = f"{total:,.0f}".replace(",", " ")
+        return f"{qty_fmt} ед. × {w:g} {weight_unit} = {total_fmt} {weight_unit}"
+    return f"{qty_fmt} ед."
+
+
+def _format_volume_row(verb, nom, qty, rub, weight, weight_unit,
+                        first_date, last_date, docs,
+                        rub_label="сумма", docs_label="документ(ов)") -> str:
+    """Общий форматтер content-строки для purchases/sales/production."""
+    qty_str = _format_qty_with_unit(qty, weight, weight_unit)
+    rub_s = f"{rub:,.0f}".replace(",", " ") if rub else "0"
+    period_s = f"{first_date}..{last_date}" if first_date and last_date else ""
+    return (
+        f"{verb} '{nom}': {qty_str}, {rub_label} {rub_s} руб., "
+        f"{docs} {docs_label}"
+        + (f", период {period_s}" if period_s else "")
+    )
+
+
 def search_1c_analytics(analytics_type, keywords="", period_date=None,
                          period_end=None, entities=None, limit=20):
     """Агрегированные запросы по данным 1С."""
@@ -1637,34 +1675,32 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
             if analytics_type == "purchases_by_nomenclature":
                 try:
                     q = """
-                        SELECT nomenclature_name,
-                               SUM(quantity) AS qty,
-                               SUM(sum_total) AS rub,
-                               MIN(doc_date) AS first_date,
-                               MAX(doc_date) AS last_date,
-                               COUNT(DISTINCT doc_number) AS docs
-                        FROM mart_purchases
+                        SELECT mp.nomenclature_name,
+                               SUM(mp.quantity) AS qty,
+                               SUM(mp.sum_total) AS rub,
+                               MIN(mp.doc_date) AS first_date,
+                               MAX(mp.doc_date) AS last_date,
+                               COUNT(DISTINCT mp.doc_number) AS docs,
+                               MAX(n.weight) AS w,
+                               MAX(n.weight_unit) AS wu
+                        FROM mart_purchases mp
+                        LEFT JOIN nomenclature n ON n.name = mp.nomenclature_name
                         WHERE 1=1
                     """
                     params = []
                     if period_date:
-                        q += " AND doc_date >= %s"; params.append(period_date)
+                        q += " AND mp.doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND doc_date <= %s"; params.append(period_end)
+                        q += " AND mp.doc_date <= %s"; params.append(period_end)
                     for kw in (clean_keywords(keywords) or [])[:3]:
-                        q += " AND nomenclature_name ILIKE %s"; params.append(f"%{kw}%")
-                    q += " GROUP BY nomenclature_name ORDER BY qty DESC NULLS LAST LIMIT %s"
+                        q += " AND mp.nomenclature_name ILIKE %s"; params.append(f"%{kw}%")
+                    q += " GROUP BY mp.nomenclature_name ORDER BY qty DESC NULLS LAST LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
 
                     for row in cur.fetchall():
-                        nom, qty, rub, fd, ld, docs = row
-                        qty_s = f"{qty:.0f}" if qty else "0"
-                        rub_s = f"{rub:,.0f}".replace(",", " ") if rub else "0"
-                        content = (
-                            f"Закуплено '{nom}': {qty_s} ед., {rub_s} руб., "
-                            f"{docs} документ(ов), период {fd}..{ld}"
-                        )
+                        nom, qty, rub, fd, ld, docs, w, wu = row
+                        content = _format_volume_row("Закуплено", nom, qty, rub, w, wu, fd, ld, docs)
                         results.append({
                             "source": "1С: ЗАКУПКИ ПО НОМЕНКЛАТУРЕ",
                             "date": ld.strftime("%d.%m.%Y") if ld else "",
@@ -1677,33 +1713,34 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
             if analytics_type == "sales_by_nomenclature":
                 try:
                     q = """
-                        SELECT nomenclature_name,
-                               SUM(quantity) AS qty,
-                               SUM(sum_with_vat) AS rub,
-                               MIN(doc_date) AS first_date,
-                               MAX(doc_date) AS last_date,
-                               COUNT(DISTINCT doc_number) AS docs
-                        FROM mart_sales
-                        WHERE doc_type = 'Реализация'
+                        SELECT ms.nomenclature_name,
+                               SUM(ms.quantity) AS qty,
+                               SUM(ms.sum_with_vat) AS rub,
+                               MIN(ms.doc_date) AS first_date,
+                               MAX(ms.doc_date) AS last_date,
+                               COUNT(DISTINCT ms.doc_number) AS docs,
+                               MAX(n.weight) AS w,
+                               MAX(n.weight_unit) AS wu
+                        FROM mart_sales ms
+                        LEFT JOIN nomenclature n ON n.name = ms.nomenclature_name
+                        WHERE ms.doc_type = 'Реализация'
                     """
                     params = []
                     if period_date:
-                        q += " AND doc_date >= %s"; params.append(period_date)
+                        q += " AND ms.doc_date >= %s"; params.append(period_date)
                     if period_end:
-                        q += " AND doc_date <= %s"; params.append(period_end)
+                        q += " AND ms.doc_date <= %s"; params.append(period_end)
                     for kw in (clean_keywords(keywords) or [])[:3]:
-                        q += " AND nomenclature_name ILIKE %s"; params.append(f"%{kw}%")
-                    q += " GROUP BY nomenclature_name ORDER BY rub DESC NULLS LAST LIMIT %s"
+                        q += " AND ms.nomenclature_name ILIKE %s"; params.append(f"%{kw}%")
+                    q += " GROUP BY ms.nomenclature_name ORDER BY rub DESC NULLS LAST LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
 
                     for row in cur.fetchall():
-                        nom, qty, rub, fd, ld, docs = row
-                        qty_s = f"{qty:.0f}" if qty else "0"
-                        rub_s = f"{rub:,.0f}".replace(",", " ") if rub else "0"
-                        content = (
-                            f"Продано '{nom}': {qty_s} ед., выручка {rub_s} руб., "
-                            f"{docs} реализаций, период {fd}..{ld}"
+                        nom, qty, rub, fd, ld, docs, w, wu = row
+                        content = _format_volume_row(
+                            "Продано", nom, qty, rub, w, wu, fd, ld, docs,
+                            rub_label="выручка", docs_label="реализаций",
                         )
                         results.append({
                             "source": "1С: ПРОДАЖИ ПО НОМЕНКЛАТУРЕ",
@@ -1718,7 +1755,8 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                 try:
                     q = """
                         SELECT n.name AS nom, w.name AS warehouse,
-                               SUM(sb.quantity) AS qty, SUM(sb.in_shipment) AS in_ship
+                               SUM(sb.quantity) AS qty, SUM(sb.in_shipment) AS in_ship,
+                               MAX(n.weight) AS w, MAX(n.weight_unit) AS wu
                         FROM c1_stock_balance sb
                         JOIN nomenclature n ON n.id::text = sb.nomenclature_key
                         LEFT JOIN c1_warehouses w ON w.ref_key = sb.warehouse_key
@@ -1732,11 +1770,13 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     cur.execute(q, params)
 
                     for row in cur.fetchall():
-                        nom, wh, qty, in_ship = row
-                        qty_s = f"{qty:.3f}".rstrip("0").rstrip(".") if qty else "0"
-                        ship_s = f" (в пути: {in_ship:.0f})" if in_ship and in_ship > 0 else ""
+                        nom, wh, qty, in_ship, w, wu = row
+                        unit_str = _format_qty_with_unit(qty, w, wu)
+                        ship_s = ""
+                        if in_ship and in_ship > 0:
+                            ship_s = f" (в пути: {_format_qty_with_unit(in_ship, w, wu)})"
                         content = (
-                            f"Остаток '{nom}' на складе '{wh or '?'}': {qty_s} ед.{ship_s}"
+                            f"Остаток '{nom}' на складе '{wh or '?'}': {unit_str}{ship_s}"
                         )
                         results.append({
                             "source": "1С: ОСТАТКИ НА СКЛАДЕ",
@@ -1755,7 +1795,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                                SUM(mp.sum_total) AS rub,
                                MIN(mp.doc_date) AS first_date,
                                MAX(mp.doc_date) AS last_date,
-                               COUNT(DISTINCT mp.doc_number) AS docs
+                               COUNT(DISTINCT mp.doc_number) AS docs,
+                               MAX(n.weight) AS w,
+                               MAX(n.weight_unit) AS wu
                         FROM mart_production mp
                         LEFT JOIN nomenclature n ON n.id::text = mp.nomenclature_key
                         WHERE 1=1
@@ -1772,12 +1814,10 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     cur.execute(q, params)
 
                     for row in cur.fetchall():
-                        nom, qty, rub, fd, ld, docs = row
-                        qty_s = f"{qty:.0f}" if qty else "0"
-                        rub_s = f"{rub:,.0f}".replace(",", " ") if rub else "0"
-                        content = (
-                            f"Произведено '{nom or '?'}': {qty_s} ед., сумма {rub_s} руб., "
-                            f"{docs} документ(ов), период {fd}..{ld}"
+                        nom, qty, rub, fd, ld, docs, w, wu = row
+                        content = _format_volume_row(
+                            "Произведено", nom or "?", qty, rub, w, wu, fd, ld, docs,
+                            rub_label="сумма",
                         )
                         results.append({
                             "source": "1С: ПРОИЗВОДСТВО ПО НОМЕНКЛАТУРЕ",
@@ -2522,18 +2562,26 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
 {(web_results or "")[:1500]}
 
 ПРАВИЛА:
-1) Используй только факты из evidence. Не придумывай.
-2) Каждый утверждаемый тезис обязан иметь ссылку в формате [n], где n — номер evidence.
-3) Если данных недостаточно — явно напиши "Недостаточно данных" и что именно нужно уточнить.
-4) Предпочитай конкретику: суммы, даты, документы, имена.
-5) Не делай тезисов без ссылки [n].
-6) Если вопрос про свежие события — делай приоритет на самых новых доказательствах.
+1) Используй только факты из evidence. Не придумывай. Каждый тезис — со ссылкой [n].
+2) Отвечай как живой коллега, а не как базой данных. Прямо и конкретно.
+3) Единицы измерения: в evidence от 1С обычно уже указаны единицы (кг, шт, руб).
+   Если в тексте написано "10 000 кг" — так и пиши в ответе. Не спрашивай "что значит
+   ед.", если единица явно указана в evidence. Для сырья по умолчанию кг, для готовой
+   продукции — штуки (если не указано иное — можно предположить, но отметить это).
+4) "Недостаточно данных" пиши ТОЛЬКО если не хватает основного ответа на вопрос.
+   Не выводи как риск уточнения, которые не меняют ответа (детализация поставщиков,
+   возможные корректировки, сроки годности — только если спросили).
+5) Конкретика > общие формулировки: суммы, даты, документы, имена.
+6) Если вопрос про свежие события — приоритет самым новым доказательствам.
+7) Если в evidence есть цифра-ответ и ед.изм. — сформулируй по-человечески:
+   "Купили 10 тонн муки на 255 тыс ₽ — один раз, 15 февраля" лучше чем
+   "Было закуплено 10000 ед. муки на 255000 руб."
 
 ФОРМАТ ОТВЕТА:
-- Краткий вывод (1-2 предложения)
-- Ключевые факты (маркированный список, каждый пункт с [n])
-- Что не найдено/риски (если есть)
-- Источники (список [n] -> краткое описание)
+- Краткий ответ (1-2 предложения, по-человечески, с главной цифрой/фактом и ссылкой [n])
+- Детали (маркированный список только если есть что добавить к краткому ответу; каждый пункт [n])
+- Риски/пробелы (ТОЛЬКО если реально не хватает чего-то важного для ответа)
+- Источники (список [n] — краткое описание)
 
 СПИСОК ИСТОЧНИКОВ:
 {sources_map if sources_map else "Нет"}
