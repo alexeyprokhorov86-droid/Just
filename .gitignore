@@ -15,7 +15,16 @@ backups/
 *.1
 *.bak
 *.backup
+*.backup_*
+*.py.[0-9]*
 *.old
+
+# Временные отчёты / логи в корне
+bom_report_*.txt
+sync_log*.txt
+
+# Claude Code runtime
+.claude/auto_sessions/
 
 # Python
 __pycache__/
