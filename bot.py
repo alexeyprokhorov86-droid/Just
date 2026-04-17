@@ -1922,21 +1922,27 @@ async def handle_admin_role_reply(update: Update, context: ContextTypes.DEFAULT_
 # ============================================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
+    """Обработчик команды /start. Поддерживает deep link /start element."""
     if update.message.chat.type == "private":
+        # Deep link: /start element → сразу выдать данные Element X
+        payload = context.args[0] if context.args else ""
+        if payload == "element":
+            # Делегируем в element_command
+            await element_command(update, context)
+            return
+
         await update.message.reply_text(
-            "👋 Привет! Я бот для логирования сообщений.\n\n"
-            "📝 Сохраняю все сообщения в базу данных\n"
-            "🖼 Анализирую документы через AI с учётом контекста чата\n"
-            "👥 Учитываю роли участников\n"
-            "🔍 Поддерживаю поиск по истории\n\n"
+            "👋 Привет! Я корпоративный бот компании Фрумелад.\n\n"
+            "📝 Сохраняю сообщения в базу знаний\n"
+            "🖼 Анализирую документы через AI\n"
+            "🔍 Отвечаю на вопросы по базе знаний\n\n"
             "Команды:\n"
+            "/element - данные для входа в Element X\n"
+            "/rooms - переотправить приглашения в комнаты Element\n"
+            "/search <запрос> - поиск по базе знаний\n"
             "/roles - показать пользователей без ролей\n"
             "/stats - статистика чата\n"
-            "/search <запрос> - поиск по сообщениям\n"
-            "/analysis - настройка рассылки полного анализа документов\n"
-            "/rules - управление правилами фильтрации (админ)\n\n"
-            "Добавь меня в групповой чат!"
+            "/analysis - настройка рассылки анализа документов"
         )
     else:
         await update.message.reply_text(
@@ -3445,49 +3451,502 @@ async def element_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
 
 
-async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневное напоминание в рабочих чатах о переходе на Element X."""
+async def rooms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /rooms — переотправить приглашения в Matrix-комнаты."""
+    user_id = update.effective_user.id
+
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Напишите /rooms в личных сообщениях.")
+        return
+
+    import requests as req
+
+    MATRIX_URL = os.environ.get("MATRIX_URL", "http://localhost:8008")
+    MATRIX_ADMIN_USER = os.environ["MATRIX_ADMIN_USER"]
+    MATRIX_ADMIN_PASSWORD = os.environ["MATRIX_ADMIN_PASSWORD"]
+    SPACE_ROOM_ID = "!hRnxoPZwyiPRobHsCy:frumelad.ru"
+    TG_TO_MATRIX_NAME = {
+        "Руководство": "Руководство (bridged)",
+        "Фрумелад (НБ) Кадровые задачи по IT и 1С": "Фрумелад (НФ) Кадровые задачи по IT и 1С",
+    }
+    WORK_ROOMS = {
+        "Бухгалтерия Фрумелад/НФ", "Руководство (bridged)", "Производство",
+        "Априори & Фрумелад/НФ", "Секретариат", "HR-Фрумелад/НФ",
+        "Фрумелад задачи на разработку BSG", "Торты Отгрузки",
+        "Фрумелад поддержка BSG", "Дизайн упаковки Кондитерская Прохорова",
+        "Новые продукты и конкуренты", "БЗ Производство Chat", "БЗ Производство",
+        "БЗ R&D", "БЗ R&D Chat", "БЗ Бухгалтерия", "БЗ Бухгалтерия Chat",
+        "БЗ Закупки Chat", "БЗ Склад", "БЗ Склад Chat",
+        "Подбор Персонала Внешний", "Отчеты по аутсорсингу",
+        "R&D ~ общая рабочая группа",
+        "KELIN - кондитерская Прохорова", "БЗ инструкции производство",
+        "Закупки", "Закупки - Упаковка", "Продажи на ярды",
+        "Склад - Производство",
+        "Фрумелад (НФ) Кадровые задачи по IT и 1С",
+        "Производство Кондитерская Прохорова", "HR Фрумелад",
+    }
+
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        cur.execute(
+            "SELECT matrix_id FROM matrix_user_mapping WHERE telegram_user_id = %s",
+            (user_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            await update.message.reply_text("Ваш аккаунт Element X не найден. Обратитесь к администратору.")
+            cur.close(); conn.close()
+            return
+        matrix_id = row[0]
+
+        # Get user's TG chats
         cur.execute("""
-            SELECT telegram_name, telegram_username 
-            FROM matrix_user_mapping 
-            WHERE joined_at IS NULL
+            SELECT m.chat_title FROM tg_user_roles ur
+            JOIN tg_chats_metadata m ON m.chat_id = ur.chat_id
+            WHERE ur.user_id = %s AND ur.is_active = true
+        """, (user_id,))
+        tg_chats = [r[0] for r in cur.fetchall()]
+        cur.close(); conn.close()
+
+        # Matrix login
+        ms = req.Session()
+        ms.trust_env = False
+        login_resp = ms.post(f"{MATRIX_URL}/_matrix/client/v3/login", json={
+            "type": "m.login.password",
+            "user": MATRIX_ADMIN_USER,
+            "password": MATRIX_ADMIN_PASSWORD,
+        }, timeout=10).json()
+        if "access_token" not in login_resp:
+            await update.message.reply_text("Ошибка подключения к Matrix. Попробуйте позже.")
+            return
+        token = login_resp["access_token"]
+        mh = {"Authorization": f"Bearer {token}"}
+
+        # Get rooms
+        room_map = {}
+        _from = 0
+        while True:
+            rr = ms.get(f"{MATRIX_URL}/_synapse/admin/v1/rooms", headers=mh,
+                        params={"limit": 100, "from": _from}, timeout=15).json()
+            for r in rr.get("rooms", []):
+                name = r.get("name")
+                if name and name in WORK_ROOMS:
+                    room_map[name] = r["room_id"]
+            if len(rr.get("rooms", [])) < 100:
+                break
+            _from += 100
+
+        # Space invite
+        space_members = set(ms.get(
+            f"{MATRIX_URL}/_synapse/admin/v1/rooms/{SPACE_ROOM_ID}/members",
+            headers=mh, timeout=10
+        ).json().get("members", []))
+
+        invited_rooms = []
+        already_in = []
+
+        if matrix_id not in space_members:
+            ms.post(f"{MATRIX_URL}/_matrix/client/v3/rooms/{SPACE_ROOM_ID}/invite",
+                    headers=mh, json={"user_id": matrix_id}, timeout=10)
+            invited_rooms.append("Пространство «Фрумелад»")
+
+        # Room invites
+        for chat_title in tg_chats:
+            mn = TG_TO_MATRIX_NAME.get(chat_title, chat_title)
+            if mn not in room_map:
+                continue
+            rid = room_map[mn]
+            members = set(ms.get(
+                f"{MATRIX_URL}/_synapse/admin/v1/rooms/{rid}/members",
+                headers=mh, timeout=10
+            ).json().get("members", []))
+            if matrix_id in members:
+                already_in.append(mn)
+                continue
+            ms.post(f"{MATRIX_URL}/_matrix/client/v3/rooms/{rid}/invite",
+                    headers=mh, json={"user_id": matrix_id}, timeout=10)
+            invited_rooms.append(mn)
+            import time as _time; _time.sleep(0.2)
+
+        if invited_rooms:
+            rooms_list = "\n".join(f"  • {r}" for r in invited_rooms)
+            msg = (
+                f"✅ Приглашения отправлены!\n\n"
+                f"Новые приглашения:\n{rooms_list}\n\n"
+                f"Откройте Element X → раздел «Приглашения» и примите их."
+            )
+            if already_in:
+                msg += f"\n\nВы уже состоите в: {', '.join(already_in[:5])}"
+                if len(already_in) > 5:
+                    msg += f" и ещё {len(already_in) - 5}"
+        else:
+            msg = "✅ Вы уже состоите во всех рабочих комнатах! Ничего отправлять не нужно."
+
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        logger.error(f"rooms_command error: {e}", exc_info=True)
+        await update.message.reply_text("Произошла ошибка. Попробуйте позже.")
+
+
+async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневная проверка миграции на Element X.
+
+    1. Синхронизирует joined_at через Synapse devices API.
+    2. Проверяет membership в Space и комнатах для вошедших.
+    3. Шлёт персональные напоминания в личку бота.
+    4. Шлёт сводный отчёт админу.
+    """
+    import requests as req
+
+    MATRIX_URL = os.environ.get("MATRIX_URL", "http://localhost:8008")
+    MATRIX_ADMIN_USER = os.environ["MATRIX_ADMIN_USER"]
+    MATRIX_ADMIN_PASSWORD = os.environ["MATRIX_ADMIN_PASSWORD"]
+    SPACE_ROOM_ID = "!hRnxoPZwyiPRobHsCy:frumelad.ru"
+    SKIP_MATRIX = {"@bot:frumelad.ru", "@aleksei:frumelad.ru"}
+    TG_TO_MATRIX_NAME = {
+        "Руководство": "Руководство (bridged)",
+        "Фрумелад (НБ) Кадровые задачи по IT и 1С": "Фрумелад (НФ) Кадровые задачи по IT и 1С",
+    }
+    WORK_ROOMS = {
+        "Бухгалтерия Фрумелад/НФ", "Руководство (bridged)", "Производство",
+        "Априори & Фрумелад/НФ", "Секретариат", "HR-Фрумелад/НФ",
+        "Фрумелад задачи на разработку BSG", "Торты Отгрузки",
+        "Фрумелад поддержка BSG", "Дизайн упаковки Кондитерская Прохорова",
+        "Новые продукты и конкуренты", "БЗ Производство Chat", "БЗ Производство",
+        "БЗ R&D", "БЗ R&D Chat", "БЗ Бухгалтерия", "БЗ Бухгалтерия Chat",
+        "БЗ Закупки Chat", "БЗ Склад", "БЗ Склад Chat",
+        "Подбор Персонала Внешний", "Отчеты по аутсорсингу",
+        "R&D ~ общая рабочая группа",
+        "KELIN - кондитерская Прохорова", "БЗ инструкции производство",
+        "Закупки", "Закупки - Упаковка", "Продажи на ярды",
+        "Склад - Производство",
+        "Фрумелад (НФ) Кадровые задачи по IT и 1С",
+        "Производство Кондитерская Прохорова", "HR Фрумелад",
+    }
+
+    try:
+        from proxy_config import get_proxy_url
+        proxy_url = get_proxy_url()
+        proxies = {"https": proxy_url, "http": proxy_url}
+
+        # ── Matrix login ──
+        ms = req.Session()
+        ms.trust_env = False
+        login_resp = ms.post(f"{MATRIX_URL}/_matrix/client/v3/login", json={
+            "type": "m.login.password",
+            "user": MATRIX_ADMIN_USER,
+            "password": MATRIX_ADMIN_PASSWORD,
+        }, timeout=10).json()
+        if "access_token" not in login_resp:
+            logger.error(f"element_reminder: Matrix login failed: {login_resp}")
+            return
+        token = login_resp["access_token"]
+        mh = {"Authorization": f"Bearer {token}"}
+
+        # ── Matrix rooms map ──
+        room_map = {}
+        _from = 0
+        while True:
+            rr = ms.get(f"{MATRIX_URL}/_synapse/admin/v1/rooms", headers=mh,
+                        params={"limit": 100, "from": _from}, timeout=15).json()
+            for r in rr.get("rooms", []):
+                name = r.get("name")
+                if name and name in WORK_ROOMS:
+                    room_map[name] = r["room_id"]
+            if len(rr.get("rooms", [])) < 100:
+                break
+            _from += 100
+
+        space_members = set(ms.get(
+            f"{MATRIX_URL}/_synapse/admin/v1/rooms/{SPACE_ROOM_ID}/members",
+            headers=mh, timeout=10
+        ).json().get("members", []))
+
+        # ── Load mapping from DB ──
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT m.telegram_user_id, m.telegram_name, m.telegram_username,
+                   m.matrix_id, m.matrix_username, m.matrix_password, m.joined_at
+            FROM matrix_user_mapping m
         """)
-        not_joined = cur.fetchall()
+        users = []
+        for row in cur.fetchall():
+            users.append({
+                "tg_uid": row[0], "name": row[1], "username": row[2],
+                "matrix_id": row[3], "mx_user": row[4], "mx_pass": row[5],
+                "joined_at": row[6],
+            })
+
+        # ── Sync joined_at via devices API ──
+        newly_joined = []
+        for u in users:
+            if u["matrix_id"] in SKIP_MATRIX:
+                continue
+            devs = ms.get(
+                f"{MATRIX_URL}/_synapse/admin/v2/users/{u['matrix_id']}/devices",
+                headers=mh, timeout=10
+            ).json()
+            has_devices = len(devs.get("devices", [])) > 0
+            if has_devices and not u["joined_at"]:
+                cur.execute(
+                    "UPDATE matrix_user_mapping SET joined_at = NOW() WHERE telegram_user_id = %s",
+                    (u["tg_uid"],)
+                )
+                u["joined_at"] = True  # mark locally
+                newly_joined.append(u["name"])
+            u["has_devices"] = has_devices
+        conn.commit()
+
+        # ── Get TG chat memberships ──
+        for u in users:
+            cur.execute("""
+                SELECT m.chat_title FROM tg_user_roles ur
+                JOIN tg_chats_metadata m ON m.chat_id = ur.chat_id
+                WHERE ur.user_id = %s AND ur.is_active = true
+            """, (u["tg_uid"],))
+            u["tg_chats"] = [r[0] for r in cur.fetchall()]
         cur.close()
         conn.close()
-        
-        if not not_joined:
-            return
-        
-        mentions = []
-        for name, username in not_joined:
-            if username:
-                mentions.append(f"@{username}")
-            else:
-                mentions.append(name)
-        
-        message = (
-            f"📢 Напоминание: переход на Element X\n\n"
-            f"Ещё не подключились ({len(not_joined)} чел.):\n"
-            f"{', '.join(mentions)}\n\n"
-            f"Напишите мне /element в личку — я отправлю данные для входа."
-        )
-        
-        # Отправляем в Руководство
-        from proxy_config import get_proxy_url
-        import requests as req
-        proxy_url = get_proxy_url()
+
+        # ── Helpers: membership check & invite ──
+        def get_membership(room_id, matrix_user_id):
+            """Return membership state: 'join', 'invite', 'leave', 'ban', or None."""
+            try:
+                r = ms.get(
+                    f"{MATRIX_URL}/_matrix/client/v3/rooms/{room_id}/state/m.room.member/{matrix_user_id}",
+                    headers=mh, timeout=10)
+                if r.status_code == 200:
+                    return r.json().get("membership")
+            except Exception:
+                pass
+            return None
+
+        def send_matrix_invite(room_id, matrix_user_id):
+            """Send Matrix room invite. Returns True on success."""
+            r = ms.post(
+                f"{MATRIX_URL}/_matrix/client/v3/rooms/{room_id}/invite",
+                headers=mh, json={"user_id": matrix_user_id}, timeout=10)
+            return r.status_code in (200, 403)
+
+        # ── Check room membership for logged-in users ──
+        room_members_cache = {}
+        invites_sent = 0
+        import time as _time
+        for u in users:
+            if u["matrix_id"] in SKIP_MATRIX:
+                continue
+            u["in_space"] = u["matrix_id"] in space_members
+            u["missing_rooms"] = []
+            if not u.get("has_devices"):
+                continue
+
+            # Space invite if needed
+            if not u["in_space"]:
+                ms_state = get_membership(SPACE_ROOM_ID, u["matrix_id"])
+                if ms_state not in ("join", "invite"):
+                    send_matrix_invite(SPACE_ROOM_ID, u["matrix_id"])
+                    invites_sent += 1
+                    _time.sleep(0.2)
+
+            for chat_title in u["tg_chats"]:
+                mn = TG_TO_MATRIX_NAME.get(chat_title, chat_title)
+                if mn not in room_map:
+                    continue
+                rid = room_map[mn]
+                if rid not in room_members_cache:
+                    room_members_cache[rid] = set(ms.get(
+                        f"{MATRIX_URL}/_synapse/admin/v1/rooms/{rid}/members",
+                        headers=mh, timeout=10
+                    ).json().get("members", []))
+                if u["matrix_id"] in room_members_cache[rid]:
+                    continue
+
+                # Not a member — check state, send invite if needed
+                ms_state = get_membership(rid, u["matrix_id"])
+                if ms_state == "invite":
+                    u["missing_rooms"].append(mn)
+                elif ms_state in ("leave", None):
+                    ok = send_matrix_invite(rid, u["matrix_id"])
+                    if ok:
+                        u["missing_rooms"].append(mn)
+                        invites_sent += 1
+                    _time.sleep(0.2)
+
+        # ── Send personal reminders ──
+        sent_personal = 0
+
+        for u in users:
+            if u["matrix_id"] in SKIP_MATRIX:
+                continue
+            tg_uid = u["tg_uid"]
+            name = u["name"]
+
+            if not u.get("has_devices"):
+                # Не вошёл — напоминание с инструкцией
+                msg = (
+                    f"👋 {name}, напоминаю о переходе на Element X!\n\n"
+                    f"Ваш аккаунт готов. Для входа:\n"
+                    f"1. Скачайте Element X:\n"
+                    f"   • Android: play.google.com/store/apps/details?id=io.element.android.x\n"
+                    f"   • iPhone: apps.apple.com/app/element-x/id1672254904\n"
+                    f"2. Нажмите «Изменить сервер» → введите: frumelad.ru\n"
+                    f"3. Логин: {u['mx_user']}\n"
+                    f"4. Пароль: напишите /element — я отправлю\n\n"
+                    f"Все рабочие чаты уже ждут вас в пространстве «Фрумелад»."
+                )
+                try:
+                    resp = req.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        json={"chat_id": tg_uid, "text": msg, "disable_web_page_preview": True},
+                        proxies=proxies, timeout=15
+                    ).json()
+                    if resp.get("ok"):
+                        sent_personal += 1
+                    else:
+                        u["_cant_send"] = True
+                        logger.info(f"element_reminder: не удалось отправить {name} ({tg_uid}): {resp.get('description', '')}")
+                except Exception as e:
+                    u["_cant_send"] = True
+                    logger.warning(f"element_reminder: ошибка отправки {name}: {e}")
+
+            elif u.get("missing_rooms"):
+                # Вошёл, приглашения отправлены/висят — напоминаем
+                rooms_list = "\n".join(f"  • {r}" for r in u["missing_rooms"])
+                space_note = ""
+                if not u.get("in_space"):
+                    space_note = "\n\n⚠️ Также примите приглашение в пространство «Фрумелад» — в нём собраны все рабочие комнаты."
+                msg = (
+                    f"👋 {name}, вы уже в Element X — отлично!\n\n"
+                    f"Вам отправлены приглашения в комнаты:\n"
+                    f"{rooms_list}\n\n"
+                    f"Откройте Element X → раздел «Приглашения» и примите их, "
+                    f"чтобы не пропускать рабочие обсуждения.{space_note}\n\n"
+                    f"Если приглашения не видно — напишите /rooms, и я отправлю заново."
+                )
+                try:
+                    resp = req.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        json={"chat_id": tg_uid, "text": msg, "disable_web_page_preview": True},
+                        proxies=proxies, timeout=15
+                    ).json()
+                    if resp.get("ok"):
+                        sent_personal += 1
+                    else:
+                        u["_cant_send"] = True
+                        logger.info(f"element_reminder: не удалось отправить {name} ({tg_uid}): {resp.get('description', '')}")
+                except Exception as e:
+                    u["_cant_send"] = True
+                    logger.warning(f"element_reminder: ошибка отправки {name}: {e}")
+
+        # ── Group messages with inline button for unreachable users ──
+        cant_reach = [u for u in users if u.get("_cant_send") and u["matrix_id"] not in SKIP_MATRIX]
+        group_msgs_sent = 0
+        if cant_reach:
+            # Group unreachable users by their TG chats
+            from collections import defaultdict
+            chat_to_users = defaultdict(list)
+            conn2 = get_db_connection()
+            cur2 = conn2.cursor()
+            for u in cant_reach:
+                cur2.execute(
+                    "SELECT chat_id FROM tg_user_roles WHERE user_id = %s AND is_active = true",
+                    (u["tg_uid"],)
+                )
+                for (cid,) in cur2.fetchall():
+                    chat_to_users[cid].append(u)
+            cur2.close()
+            conn2.close()
+
+            # Send one message per group with inline button
+            sent_chats = set()
+            for chat_id, group_users in chat_to_users.items():
+                if chat_id in sent_chats:
+                    continue
+                # Deduplicate users across chats
+                names_in_group = []
+                for u in group_users:
+                    if u.get("username"):
+                        names_in_group.append(f"@{u['username']}")
+                    else:
+                        names_in_group.append(u["name"])
+
+                keyboard = {"inline_keyboard": [[{
+                    "text": "📱 Получить данные для Element X",
+                    "url": "https://t.me/AI_FRUM_NF_bot?start=element"
+                }]]}
+                group_msg = (
+                    f"📢 Element X — корпоративный мессенджер\n\n"
+                    f"Ещё не подключились: {', '.join(names_in_group)}\n\n"
+                    f"Нажмите кнопку ниже — я отправлю вам данные для входа в личном сообщении."
+                )
+                try:
+                    resp = req.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text": group_msg,
+                            "reply_markup": keyboard,
+                            "disable_web_page_preview": True,
+                        },
+                        proxies=proxies, timeout=15
+                    ).json()
+                    if resp.get("ok"):
+                        group_msgs_sent += 1
+                        sent_chats.add(chat_id)
+                except Exception as e:
+                    logger.warning(f"element_reminder: group msg to {chat_id} failed: {e}")
+
+        # ── Admin report ──
+        total = len([u for u in users if u["matrix_id"] not in SKIP_MATRIX])
+        joined = len([u for u in users if u.get("has_devices") and u["matrix_id"] not in SKIP_MATRIX])
+        not_joined = total - joined
+        with_missing = len([u for u in users if u.get("has_devices") and u.get("missing_rooms") and u["matrix_id"] not in SKIP_MATRIX])
+        all_ok = len([u for u in users if u.get("has_devices") and not u.get("missing_rooms") and u["matrix_id"] not in SKIP_MATRIX])
+
+        report_lines = [
+            f"📊 Element X — статус миграции",
+            f"",
+            f"✅ Подключились полностью: {all_ok}",
+            f"⚠️ Подключились, не все комнаты: {with_missing}",
+            f"❌ Не вошли: {not_joined}",
+            f"📨 Личных напоминаний отправлено: {sent_personal}",
+            f"🔗 Matrix-приглашений отправлено: {invites_sent}",
+            f"💬 Сообщений в группы (с кнопкой): {group_msgs_sent}",
+        ]
+
+        if newly_joined:
+            report_lines.append(f"\n🆕 Новые подключения: {', '.join(newly_joined)}")
+
+        if with_missing > 0:
+            report_lines.append(f"\n⚠️ Не все комнаты приняты:")
+            for u in users:
+                if u.get("has_devices") and u.get("missing_rooms") and u["matrix_id"] not in SKIP_MATRIX:
+                    rooms_str = ", ".join(u["missing_rooms"])
+                    report_lines.append(f"  • {u['name']}: {rooms_str}")
+
+        if not_joined > 0:
+            report_lines.append(f"\n❌ Не вошли ({not_joined}):")
+            names = []
+            for u in users:
+                if not u.get("has_devices") and u["matrix_id"] not in SKIP_MATRIX:
+                    n = f"@{u['username']}" if u.get("username") else u["name"]
+                    names.append(n)
+            report_lines.append(f"  {', '.join(names)}")
+
+        admin_report = "\n".join(report_lines)
         req.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": -1003596439983, "text": message},
-            proxies={"https": proxy_url, "http": proxy_url},
-            timeout=30
+            json={"chat_id": ADMIN_USER_ID, "text": admin_report, "disable_web_page_preview": True},
+            proxies=proxies, timeout=30
         )
+
+        logger.info(f"element_reminder: total={total}, joined={joined}, not_joined={not_joined}, missing_rooms={with_missing}, sent={sent_personal}")
+
     except Exception as e:
-        logger.error(f"element_reminder error: {e}")
+        logger.error(f"element_reminder error: {e}", exc_info=True)
 
 
 def main():
@@ -3561,6 +4020,7 @@ def main():
     application.add_handler(CommandHandler("rules_find", rules_find_command))
     application.add_handler(CommandHandler("rules_off", rules_off_command))
     application.add_handler(CommandHandler("element", element_command))
+    application.add_handler(CommandHandler("rooms", rooms_command))
 
     # Notifications
     application.add_handler(get_notify_conversation_handler())
