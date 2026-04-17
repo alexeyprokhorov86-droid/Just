@@ -162,17 +162,33 @@ def parse_json_response(text):
 
 
 def get_unfilled_nomenclature(conn):
-    """Получить номенклатуру сырья без заполненных БЖУ."""
+    """
+    Получить номенклатуру сырья без заполненных БЖУ, исключая:
+    - уже отправленные технологу (sent/awaiting_input/written/pending)
+    - отклонённые в последние 30 дней (rejected)
+    - поставленные на defer (defer_until в будущем или ≤30 дней назад)
+    Это рушит цикл ежедневных поисков через платные LLM на одни и те же позиции.
+    """
     cur = conn.cursor()
     placeholders = ','.join(['%s'] * len(SYRYE_TYPE_IDS))
     cur.execute(f"""
-        SELECT id, name 
-        FROM nomenclature 
-        WHERE type_id IN ({placeholders})
-          AND is_folder = false
-          AND (protein IS NULL OR protein = 0)
-          AND (calories IS NULL OR calories = 0)
-        ORDER BY name
+        SELECT n.id, n.name
+        FROM nomenclature n
+        WHERE n.type_id IN ({placeholders})
+          AND n.is_folder = false
+          AND (n.protein IS NULL OR n.protein = 0)
+          AND (n.calories IS NULL OR n.calories = 0)
+          AND NOT EXISTS (
+            SELECT 1 FROM nutrition_requests nr
+            WHERE nr.nom_id = n.id
+              AND (
+                nr.status IN ('sent','awaiting_input','written','pending')
+                OR (nr.status = 'rejected' AND nr.updated_at > now() - interval '30 days')
+                OR (nr.defer_until IS NOT NULL AND nr.defer_until > now())
+                OR (nr.status = 'auto_deferred' AND nr.updated_at > now() - interval '30 days')
+              )
+          )
+        ORDER BY n.name
     """, SYRYE_TYPE_IDS)
     result = cur.fetchall()
     cur.close()
@@ -434,7 +450,7 @@ def main(dry_run=False, limit=None):
                 if type_row and str(type_row[0]) not in SKIP_TECHNOLOGIST_TYPES:
                     cur.execute("""
                         INSERT INTO nutrition_requests (nom_id, nom_name, status, search_data, assigned_to, assigned_name)
-                        VALUES (%s, %s, 'pending', %s, 
+                        VALUES (%s, %s, 'pending', %s,
                             (SELECT user_id FROM tg_user_roles WHERE role ILIKE '%%главн%%технолог%%' LIMIT 1),
                             (SELECT first_name FROM tg_user_roles WHERE role ILIKE '%%главн%%технолог%%' LIMIT 1)
                         )
@@ -442,7 +458,20 @@ def main(dry_run=False, limit=None):
                     """, (str(nom_id), name, json.dumps(final_data, ensure_ascii=False)))
                     conn.commit()
                 else:
-                    print(f"  ⏭ Проработка/опытное — не отправляем технологу")
+                    # Проработка/опытное — технологу не шлём, но помечаем запись
+                    # как auto_deferred на 30 дней, чтобы не перебирать каждый день.
+                    cur.execute("""
+                        INSERT INTO nutrition_requests
+                          (nom_id, nom_name, status, search_data, defer_until)
+                        VALUES (%s, %s, 'auto_deferred', %s, now() + interval '30 days')
+                        ON CONFLICT (nom_id) DO UPDATE
+                          SET status = 'auto_deferred',
+                              search_data = EXCLUDED.search_data,
+                              defer_until = now() + interval '30 days',
+                              updated_at = now()
+                    """, (str(nom_id), name, json.dumps(final_data, ensure_ascii=False)))
+                    conn.commit()
+                    print(f"  ⏭ Проработка/опытное — auto_deferred на 30 дней")
                 cur.close()
             except Exception as e:
                 print(f"  DB error: {e}")
