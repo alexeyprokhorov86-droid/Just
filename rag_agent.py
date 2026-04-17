@@ -2784,6 +2784,109 @@ def build_evidence_context(evidence_items: list) -> str:
 # ГЕНЕРАЦИЯ ОТВЕТА (GPT-4.1)
 # =============================================================================
 
+def _fixate_answer_as_source_chunk(question: str, answer: str,
+                                     evidence_items: list, meta: dict) -> None:
+    """
+    Сохраняет удачный RAG-ответ в source_documents + source_chunks (Qwen3).
+    Критерии:
+    - evaluator признал ответ хорошим
+    - retry_count ≤ 1 (одно escalation — ещё ок)
+    - в evidence есть хотя бы 1 источник из "1С:..." (иначе менее надёжно)
+    - этот вопрос ещё не зафиксирован (dedup по хэшу вопроса)
+
+    Source_chunk попадает в search_source_chunks на следующем запросе и
+    retrieval подхватит его через Qwen3 cosine.
+    """
+    try:
+        evaluator = meta.get("evaluator") or {}
+        if not evaluator.get("good", False):
+            return
+        if meta.get("retry_count", 0) > 1:
+            return
+        has_1c = any("1С" in (ev.get("source", "") or "") for ev in (evidence_items or []))
+        if not has_1c:
+            return
+        q_norm = (question or "").strip()
+        if len(q_norm) < 15 or len(q_norm) > 500:
+            return
+
+        import hashlib
+        q_hash = hashlib.md5(q_norm.lower().encode()).hexdigest()[:16]
+        source_ref = f"rag:{q_hash}"
+
+        # Очистка ответа от служебных блоков (карта evidence, внешние ссылки)
+        clean_answer = re.sub(r"\n+📎 Источники.*?(?=\n\n|\Z)", "", answer, flags=re.DOTALL)
+        clean_answer = re.sub(r"\n+🌐 Внешние ссылки.*?(?=\n\n|\Z)", "", clean_answer, flags=re.DOTALL)
+        clean_answer = clean_answer.strip()
+        if len(clean_answer) > 2500:
+            clean_answer = clean_answer[:2500]
+
+        body = f"Вопрос: {q_norm}\n\nОтвет: {clean_answer}"
+
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                # Dedup: не создаём второй раз тот же вопрос
+                cur.execute(
+                    "SELECT id FROM source_documents WHERE source_ref = %s LIMIT 1",
+                    (source_ref,),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    return
+
+                cur.execute(
+                    """
+                    INSERT INTO source_documents
+                      (source_kind, source_ref, title, body_text, doc_date,
+                       language, is_deleted, confidence, meta, created_at, updated_at)
+                    VALUES
+                      ('rag_answer', %s, %s, %s, now()::date, 'ru', false, 0.95,
+                       %s::jsonb, now(), now())
+                    RETURNING id
+                    """,
+                    (
+                        source_ref,
+                        q_norm[:200],
+                        body,
+                        json.dumps({
+                            "retry_count": meta.get("retry_count", 0),
+                            "model": meta.get("model_used"),
+                            "evidence_count": len(evidence_items or []),
+                        }, ensure_ascii=False),
+                    ),
+                )
+                doc_id = cur.fetchone()[0]
+
+                try:
+                    from chunkers.embedder import embed_document_v2
+                    emb = embed_document_v2(body[:2000])
+                except Exception as e:
+                    logger.warning(f"fixate: embed_document_v2 failed: {e}")
+                    conn.rollback()
+                    return
+                if not emb:
+                    conn.rollback()
+                    return
+                emb_str = "[" + ",".join(str(x) for x in emb) + "]"
+
+                cur.execute(
+                    """
+                    INSERT INTO source_chunks
+                      (document_id, chunk_no, chunk_text, embedding_v2,
+                       chunk_type, source_kind, confidence, importance_score, created_at)
+                    VALUES (%s, 0, %s, %s::vector, 'rag_answer', 'rag_answer', 0.95, 0.9, now())
+                    """,
+                    (doc_id, body[:2000], emb_str),
+                )
+                conn.commit()
+                logger.info(f"RAG answer fixated: doc_id={doc_id}, ref={source_ref}")
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"fixate_answer failed: {e}")
+
+
 def _call_answerer(prompt: str, model: str = "openai/gpt-4.1",
                     max_tokens: int = 1800, timeout: int = 60) -> str:
     """Один вызов LLM для генерации ответа. Raises RuntimeError на ошибке."""
@@ -3640,6 +3743,13 @@ async def process_rag_query(question, chat_context="", user_info: dict = None):
     generation_time_ms = int((time.time() - gen_start) * 1000)
 
     answer_eval = gen_meta.get("evaluator") or {}
+
+    # === Фиксация ответа в source_chunks (Фаза 4.1) ===
+    # Ранний retrieval на повторных вопросах — через Qwen3 HNSW.
+    try:
+        _fixate_answer_as_source_chunk(question, response, evidence_results, gen_meta)
+    except Exception as e:
+        logger.warning(f"fixate wrapper: {e}")
 
     # === Логирование ===
     _log_rag_query({
