@@ -229,9 +229,10 @@ def build_synthesis_facts() -> list:
             # === ПЛАН-ФАКТ ЗА ПРОШЛУЮ НЕДЕЛЮ ===
             try:
                 cur.execute(
+                    # %% — psycopg2 парсит % как placeholder, двойной экранирует.
                     """
                     SELECT "Неделя", "Заказы (план)", "Ордера (факт)",
-                           "Отклонение", "Выполнение %"
+                           "Отклонение", "Выполнение %%"
                     FROM v_plan_fact_weekly
                     WHERE "Неделя" >= %s
                     ORDER BY "Неделя" DESC

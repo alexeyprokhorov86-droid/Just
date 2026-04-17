@@ -3556,20 +3556,32 @@ async def process_rag_query(question, chat_context="", user_info: dict = None,
     if not user_info:
         user_info = {}
 
-    # === Шаг 0: Reply-chain контекст ===
-    # Если пользователь реплайнул на ответ бота, prev_context содержит
-    # предыдущий Q/A. Встраиваем в chat_context для Router'а и в prompt Answerer'а.
+    # === Шаг 0: Reply-chain контекст (поддержка deep chain до корня) ===
     if prev_context and isinstance(prev_context, dict):
-        prev_q = str(prev_context.get("question") or "").strip()[:500]
-        prev_a = str(prev_context.get("answer") or "").strip()[:1200]
-        if prev_q and prev_a:
+        # Собираем нормализованную цепочку Q/A (от старых к новым)
+        chain = prev_context.get("chain")
+        if chain and isinstance(chain, list):
+            pairs = [(p.get("question") or "", p.get("answer") or "") for p in chain if p]
+        else:
+            # Обратная совместимость: старый формат {"question","answer"}
+            pairs = [(
+                prev_context.get("question") or "",
+                prev_context.get("answer") or "",
+            )]
+        pairs = [(q.strip()[:500], a.strip()[:1200]) for q, a in pairs if q.strip() and a.strip()]
+
+        if pairs:
+            lines = ["[FOLLOW-UP CHAIN] (от старого к новому — текущий вопрос продолжает тему)"]
+            for i, (q, a) in enumerate(pairs, 1):
+                lines.append(f"Q{i}: {q}")
+                lines.append(f"A{i}: {a}")
+            lines.append("[/FOLLOW-UP CHAIN]")
             chat_context = (
-                (chat_context + "\n\n" if chat_context else "")
-                + f"[FOLLOW-UP CONTEXT]\nПредыдущий вопрос: {prev_q}\n"
-                + f"Предыдущий ответ бота: {prev_a}\n"
-                + "Текущий вопрос — уточнение/продолжение темы. Используй этот контекст.\n[/FOLLOW-UP CONTEXT]"
+                (chat_context + "\n\n" if chat_context else "") + "\n".join(lines)
             )
-            logger.info(f"Follow-up chain: prev_q='{prev_q[:80]}'")
+            logger.info(
+                f"Follow-up chain depth={len(pairs)}, root Q: '{pairs[0][0][:60]}'"
+            )
 
     # === Шаг 1: Smart Router ===
     plan = route_query(question, chat_context)

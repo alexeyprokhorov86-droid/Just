@@ -2368,19 +2368,28 @@ async def handle_private_rag(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await context.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     try:
-        # Reply-chain: если пользователь реплайнул на ответ бота — подхватываем
-        # предыдущий Q/A из chat_data (PTB).
+        # Reply-chain deep: ходим до корня цепочки.
+        # Если reply на ответ бота → находим индекс в chat_data → захватываем
+        # ВСЮ историю Q/A от начала до этого индекса (ограничено 5 последними
+        # парами для не раздувания prompt'а).
         prev_context = None
         if message.reply_to_message and message.reply_to_message.from_user \
                 and message.reply_to_message.from_user.is_bot:
             replied_text = (message.reply_to_message.text or "")[:600]
             history = context.chat_data.get("rag_history", [])
-            for h in reversed(history):
-                if h.get("answer", "")[:300] == replied_text[:300] \
-                        or replied_text.startswith(h.get("answer", "")[:200]):
-                    prev_context = {"question": h["question"], "answer": h["answer"]}
-                    logger.info(f"Reply-chain matched prev Q: '{prev_context['question'][:60]}'")
+            matched_idx = None
+            for i in range(len(history) - 1, -1, -1):
+                h = history[i]
+                ans = (h.get("answer", "") or "")[:300]
+                if ans == replied_text[:300] or replied_text.startswith(ans[:200]):
+                    matched_idx = i
                     break
+            if matched_idx is not None:
+                chain = history[: matched_idx + 1][-5:]  # последние 5 пар цепочки
+                prev_context = {"chain": chain}
+                logger.info(
+                    f"Reply-chain matched: {len(chain)} pairs in chain (root Q: '{chain[0]['question'][:60]}')"
+                )
 
         response = await process_rag_query(question, "", user_info={
             "user_id": message.from_user.id,
@@ -2433,18 +2442,25 @@ async def handle_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     try:
-        # Reply-chain (как в личке)
+        # Reply-chain deep (как в личке)
         prev_context = None
         if message.reply_to_message and message.reply_to_message.from_user \
                 and message.reply_to_message.from_user.is_bot:
             replied_text = (message.reply_to_message.text or "")[:600]
             history = context.chat_data.get("rag_history", [])
-            for h in reversed(history):
-                if h.get("answer", "")[:300] == replied_text[:300] \
-                        or replied_text.startswith(h.get("answer", "")[:200]):
-                    prev_context = {"question": h["question"], "answer": h["answer"]}
-                    logger.info(f"Reply-chain (mention) matched prev Q: '{prev_context['question'][:60]}'")
+            matched_idx = None
+            for i in range(len(history) - 1, -1, -1):
+                h = history[i]
+                ans = (h.get("answer", "") or "")[:300]
+                if ans == replied_text[:300] or replied_text.startswith(ans[:200]):
+                    matched_idx = i
                     break
+            if matched_idx is not None:
+                chain = history[: matched_idx + 1][-5:]
+                prev_context = {"chain": chain}
+                logger.info(
+                    f"Reply-chain (mention) matched: {len(chain)} pairs in chain"
+                )
 
         response = await process_rag_query(question, "", user_info={
             "user_id": message.from_user.id,
