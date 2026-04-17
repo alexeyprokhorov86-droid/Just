@@ -799,6 +799,8 @@ def search_source_chunks(query: str, limit: int = 30, min_similarity: float = 0.
     results = []
     try:
         with conn.cursor() as cur:
+            # fetch_limit больше, чем нужно — чтобы после dedup осталось достаточно
+            fetch_limit = min(limit * 5, 200)
             cur.execute("""
                 SELECT
                     sc.id, sc.chunk_text, sc.chunk_type, sc.source_kind,
@@ -812,12 +814,20 @@ def search_source_chunks(query: str, limit: int = 30, min_similarity: float = 0.
                   AND (sd.is_deleted IS NULL OR sd.is_deleted = false)
                 ORDER BY sc.embedding_v2 <=> %s::vector
                 LIMIT %s
-            """, (emb_str, emb_str, limit))
+            """, (emb_str, emb_str, fetch_limit))
 
+            seen_content = set()  # content-based dedup против повторяющихся email
             for row in cur.fetchall():
+                if len(results) >= limit:
+                    break
                 sim = float(row[12]) if row[12] is not None else 0.0
                 if sim < min_similarity:
                     continue
+                content_text = row[1] or ""
+                content_key = content_text[:300].strip().lower()
+                if content_key in seen_content:
+                    continue
+                seen_content.add(content_key)
                 source_kind = row[3] or "unknown"
                 results.append({
                     "source": f"source_chunks:{source_kind}",
@@ -3234,18 +3244,35 @@ A: {{"query_type":"mixed","steps":[{{"source":"1С_ANALYTICS","analytics_type":"
 - если период не шаблонный — возвращай диапазон YYYY-MM-DD..YYYY-MM-DD напрямую, напр. "с 1 июня по 15 июля 2025" = "2025-06-01..2025-07-15"
 """
         
-        response = requests.post(
-            f"{ROUTERAI_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "openai/gpt-4.1",  # upgrade с -mini: маршрутизация требует полноценной модели
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 2000,  # место для подробного reasoning + steps
-                "temperature": 0,
-            },
-            timeout=(5, 45),  # Router может думать дольше при сложных вопросах
-        )
-        
+        # 3 попытки с exponential backoff при таймауте/5xx
+        response = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    f"{ROUTERAI_BASE_URL}/chat/completions",
+                    headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": "openai/gpt-4.1",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 2000,
+                        "temperature": 0,
+                    },
+                    timeout=(5, 45),
+                )
+                if response.status_code >= 500:
+                    last_err = f"HTTP {response.status_code}"
+                    time.sleep(2 ** attempt)  # 1s, 2s, 4s
+                    continue
+                break
+            except (requests.Timeout, requests.ConnectionError) as e:
+                last_err = str(e)
+                logger.warning(f"Router attempt {attempt + 1} failed: {e}")
+                time.sleep(2 ** attempt)
+        if response is None or response.status_code >= 500:
+            logger.error(f"Router failed after 3 attempts: {last_err}")
+            return _default_plan(question)
+
         result = response.json()
         if "choices" in result:
             content = result["choices"][0]["message"]["content"].strip()
