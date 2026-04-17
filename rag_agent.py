@@ -1509,6 +1509,157 @@ def _resolve_period(period_str):
 # АНАЛИТИКА 1С
 # =============================================================================
 
+# ============================================================
+# Text-to-SQL fallback (Фаза 3): Claude Opus 4.7 + safe read-only runner
+# ============================================================
+
+_SQL_BLACKLIST = re.compile(
+    r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|GRANT|REVOKE|CREATE|COPY|MERGE|CALL|EXECUTE|DO|VACUUM|ANALYZE|REINDEX|LOCK|REFRESH)\b",
+    re.IGNORECASE,
+)
+_SQL_START = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+
+
+def _run_safe_sql(sql: str, timeout_sec: int = 15) -> tuple:
+    """
+    Выполняет SELECT/WITH в read-only транзакции с timeout'ом.
+
+    Безопасность:
+    - Только SELECT/WITH в начале
+    - Blacklist ключевых слов DDL/DML
+    - SET LOCAL TRANSACTION READ ONLY внутри транзакции
+    - statement_timeout ограничивает время
+    - auto-LIMIT 200 если не указан
+
+    Returns: (rows, column_names)
+    Raises RuntimeError на нарушениях безопасности / SQL ошибках.
+    """
+    sql_clean = sql.strip().rstrip(";").strip()
+    if not _SQL_START.match(sql_clean):
+        raise RuntimeError("SQL должен начинаться с SELECT или WITH")
+    if _SQL_BLACKLIST.search(sql_clean):
+        raise RuntimeError("SQL содержит запрещённое ключевое слово (DDL/DML)")
+    if ";" in sql_clean:
+        raise RuntimeError("SQL не должен содержать ';' (только один statement)")
+    if not re.search(r"\bLIMIT\s+\d+\s*$", sql_clean, re.IGNORECASE):
+        sql_clean = sql_clean + " LIMIT 200"
+
+    conn = get_db_connection()
+    try:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL TRANSACTION READ ONLY")
+            cur.execute(f"SET LOCAL statement_timeout = {int(timeout_sec * 1000)}")
+            cur.execute(sql_clean)
+            rows = cur.fetchall()
+            cols = [d.name for d in cur.description] if cur.description else []
+        conn.rollback()
+        return rows, cols
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+_SQL_SCHEMA_HINT = """Схема БД (PostgreSQL, кондитерская компания "Фрумелад" + "НФ/Новэл Фуд"):
+
+-- Materialized views (обновляются каждые 10 мин) — ПРЕДПОЧТИТЕЛЬНЫ для аналитики:
+
+mart_sales (продажи, денормализованные):
+  id, doc_date DATE, doc_number, doc_type ('Реализация'/'Возврат от покупателя'),
+  client_name, consignee_name, nomenclature_name, nomenclature_type,
+  quantity NUMERIC, price, sum_with_vat, sum_without_vat,
+  year, month, week_start DATE, year_month TEXT (YYYY-MM)
+
+mart_purchases (закупки):
+  id, doc_date DATE, doc_number, contractor_name,
+  nomenclature_name, quantity, price, sum_total,
+  year, month, year_month
+
+mart_production (производство):
+  id, doc_date, doc_number, department_key, nomenclature_key,
+  quantity, price, sum_total, year_month
+  → для nomenclature.name нужен JOIN nomenclature ON id::text = nomenclature_key
+
+mart_customer_orders (заказы клиентов), mart_supplier_orders (заказы поставщикам) — похожая структура.
+
+-- Справочники:
+
+nomenclature: id UUID, name, article, weight NUMERIC, weight_unit ('кг'/'г'/'шт'), full_name
+  — для JOIN с c1_* и mart_production используй n.id::text = <nomenclature_key>
+  — для JOIN с mart_sales/purchases используй n.name = nomenclature_name
+
+c1_warehouses: ref_key, name, warehouse_type, is_folder
+
+c1_stock_balance: warehouse_key, nomenclature_key, quantity, in_shipment
+  JOIN: nomenclature ON id::text = nomenclature_key; c1_warehouses ON ref_key = warehouse_key
+
+c1_employees: ref_key, last_name, first_name, middle_name
+v_current_staff: актуальный штат
+
+-- Полезные views:
+
+v_plan_fact_weekly: "Неделя" DATE, "Заказы (план)", "Ордера (факт)", "Передачи ФМ", "Отклонение", "Выполнение %"
+v_consumption_vs_purchases_monthly: period TEXT (YYYY-MM), nom_name, consumed, purchased, diff
+v_sales_adjusted: скорректированные продажи (с учётом возвратов):
+  effective_date, actual_date, client_name, nomenclature_name, quantity, price, sum_with_vat
+
+-- Дополнительно есть c1_purchases, c1_purchase_items, c1_sales_plan, c1_production_items — обычно mart-views закрывают.
+
+-- База знаний (для бизнес-вопросов типа "что мы решили о X"):
+km_facts, km_decisions, km_tasks, km_policies — text+embedding. Для них используй retrieval, не SQL.
+"""
+
+
+def _generate_sql_via_llm(question: str, entities: dict = None,
+                           period_date=None, period_end=None) -> str:
+    """
+    LLM (Claude Opus 4.7) пишет SQL по бизнес-вопросу.
+    Возвращает готовый SELECT (без ';' и markdown).
+    """
+    entities = entities or {}
+    extras = []
+    if period_date:
+        extras.append(f"Период начало: {period_date}")
+    if period_end:
+        extras.append(f"Период конец: {period_end}")
+    if entities.get("clients"):
+        extras.append(f"Клиенты (ILIKE match): {entities['clients']}")
+    if entities.get("suppliers"):
+        extras.append(f"Поставщики (ILIKE match): {entities['suppliers']}")
+    if entities.get("products"):
+        extras.append(f"Номенклатура (ILIKE match): {entities['products']}")
+    if entities.get("warehouses"):
+        extras.append(f"Склады (ILIKE match): {entities['warehouses']}")
+
+    prompt = f"""Ты — SQL-ассистент. Сгенерируй ОДИН безопасный SELECT-запрос, отвечающий на бизнес-вопрос.
+
+{_SQL_SCHEMA_HINT}
+
+ВОПРОС: {question}
+
+КОНТЕКСТ:
+{chr(10).join(extras) if extras else '(нет дополнительных сущностей или периода)'}
+
+ПРАВИЛА:
+- ТОЛЬКО SELECT или WITH (никаких INSERT/UPDATE/DELETE/DDL)
+- ILIKE '%...%' для текстовых фильтров (клиент, поставщик, номенклатура)
+- Даты — через doc_date >= 'YYYY-MM-DD' AND doc_date < 'YYYY-MM-DD'
+- Агрегаты (SUM, COUNT, AVG) + GROUP BY для аналитики
+- ORDER BY для осмысленной сортировки (revenue DESC, qty DESC, date DESC)
+- LIMIT (≤ 50 строк для аналитики, ≤ 200 для детальной выборки)
+- Один запрос, БЕЗ ';' в конце
+- Используй mart_* вместо c1_* где возможно
+
+Верни ТОЛЬКО SQL, без пояснений и markdown-блоков:"""
+
+    sql_text = _call_answerer(prompt, "anthropic/claude-opus-4.7", max_tokens=800, timeout=60)
+    sql_text = re.sub(r'^```(?:sql)?\s*', '', sql_text.strip())
+    sql_text = re.sub(r'\s*```$', '', sql_text)
+    return sql_text.strip()
+
+
 def _format_qty_with_unit(qty, weight, weight_unit) -> str:
     """
     Форматирует количество с единицей измерения из nomenclature.
@@ -1891,6 +2042,43 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                         })
                 except Exception as e:
                     logger.debug(f"production_by_nomenclature: {e}")
+
+            if analytics_type == "custom_sql":
+                # Text-to-SQL через Claude Opus 4.7: LLM пишет SQL по вопросу.
+                # Используется когда стандартные *_by_nomenclature / top_* не
+                # покрывают. Router должен класть текст вопроса в keywords.
+                try:
+                    question_for_sql = (keywords or "").strip()
+                    if not question_for_sql:
+                        logger.warning("custom_sql: пустой keywords — пропуск")
+                    else:
+                        sql = _generate_sql_via_llm(
+                            question_for_sql, entities,
+                            period_date=period_date, period_end=period_end,
+                        )
+                        logger.info(f"custom_sql generated: {sql[:250]}")
+                        rows, cols = _run_safe_sql(sql, timeout_sec=15)
+                        logger.info(f"custom_sql: {len(rows)} строк")
+                        for row in rows[:limit]:
+                            parts = []
+                            for i, v in enumerate(row):
+                                if v is None:
+                                    continue
+                                label = cols[i] if i < len(cols) else f"col{i}"
+                                s = str(v)
+                                if len(s) > 80:
+                                    s = s[:77] + "..."
+                                parts.append(f"{label}: {s}")
+                            content = "; ".join(parts)
+                            results.append({
+                                "source": "1С: КАСТОМНЫЙ SQL",
+                                "date": "",
+                                "content": content,
+                                "type": "analytics_custom_sql",
+                                "sql": sql,
+                            })
+                except Exception as e:
+                    logger.warning(f"custom_sql failed: {e}")
 
             if analytics_type == "plan_vs_fact":
                 try:
@@ -2822,6 +3010,7 @@ def route_query(question, chat_context=""):
 - stock_balance — текущие ОСТАТКИ номенклатуры X на складах. Для "остатки муки", "сколько сахара на складе".
 - production_by_nomenclature — СКОЛЬКО произведено номенклатуры X за период (mart_production). Для "сколько тортов Медовик произвели в феврале".
 - plan_vs_fact — недельный план/факт (v_plan_fact_weekly). Для "план/факт за март", "выполнение плана".
+- custom_sql — универсальный text-to-SQL через Claude Opus 4.7 (дорого, медленно). Использовать ТОЛЬКО когда никакой из *_by_nomenclature/top_*/stock_balance/plan_vs_fact не подходит. Типичные кейсы: "средний чек клиента X", "динамика продаж помесячно за год", "маржинальность SKU", "сравнение двух периодов", "расход vs закупки по категориям", агрегаты по 2+ сущностям одновременно. В keywords клади полную формулировку вопроса на русском (не ключевые слова).
 
 ВАЖНО: если в вопросе есть конкретное название товара/сырья И слова количества/суммы/остатка — используй *_by_nomenclature или stock_balance с keywords = название номенклатуры.
 
@@ -2880,6 +3069,13 @@ A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_typ
 # План-факт
 Q: "Выполнение плана за март"
 A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"plan_vs_fact","keywords":""}}],"period":"march"}}
+
+# Кастомный SQL (когда стандартные tools не подходят)
+Q: "Средний чек продаж клиенту Магнит за 2 квартал 2025?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Средний чек продаж клиенту Магнит за 2 квартал 2025"}}],"entities":{{"clients":["Магнит"]}},"period":"q2_2025"}}
+
+Q: "Какие SKU выросли в продажах больше всего между январём и мартом 2026?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Какие SKU выросли в продажах больше всего между январём и мартом 2026? Сравни sum_with_vat помесячно."}}],"period":"2026-01-01..2026-03-31"}}
 
 # Конкретные документы
 Q: "По какой цене покупали муку в последний раз?"
