@@ -716,33 +716,41 @@ def search_knowledge(query: str, limit: int = 30) -> list:
     from embedding_service_e5 import create_query_embedding
     query_embedding = create_query_embedding(query)
     emb_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
-    
+
     conn = get_db_connection()
+    conn.autocommit = True  # ошибка в одной таблице не должна ронять остальные
     results = []
-    
+
+    # (table, text_col, type_col, has_verification_status)
+    # km_decisions не имеет verification_status и *_type; используем scope_type.
+    # km_tasks имеет status (не task_type).
+    # km_policies имеет scope_type + verification_status.
     tables = [
-        ("km_facts", "fact_text", "fact_type"),
-        ("km_decisions", "decision_text", "decision_type"),
-        ("km_tasks", "task_text", "task_type"),
-        ("km_policies", "policy_text", "policy_type"),
+        ("km_facts", "fact_text", "fact_type", True),
+        ("km_decisions", "decision_text", "scope_type", False),
+        ("km_tasks", "task_text", "status", True),
+        ("km_policies", "policy_text", "scope_type", True),
     ]
-    
+
     per_table = max(limit // len(tables), 5)
-    
+
     try:
         with conn.cursor() as cur:
-            for table, text_col, type_col in tables:
+            for table, text_col, type_col, has_verif in tables:
                 try:
+                    where_verif = (
+                        "verification_status NOT IN ('rejected', 'duplicate') AND "
+                        if has_verif else ""
+                    )
                     cur.execute(f"""
                         SELECT id, {text_col}, {type_col}, confidence, created_at,
                                1 - (embedding <=> %s::vector) as similarity
                         FROM {table}
-                        WHERE verification_status NOT IN ('rejected', 'duplicate')
-                          AND embedding IS NOT NULL
+                        WHERE {where_verif}embedding IS NOT NULL
                         ORDER BY embedding <=> %s::vector
                         LIMIT %s
                     """, (emb_str, emb_str, per_table))
-                    
+
                     for row in cur.fetchall():
                         sim = float(row[5]) if row[5] else 0
                         if sim < 0.3:
@@ -835,6 +843,53 @@ def search_source_chunks(query: str, limit: int = 30, min_similarity: float = 0.
         f"'{query[:50]}'"
     )
     return results
+
+
+def search_unified(query: str, limit: int = 30) -> list:
+    """
+    Гибридный поиск: km_* (legacy e5) + source_chunks (Qwen3) + dedup + opt rerank.
+
+    Логика:
+    1) Параллельно search_knowledge (km_facts/decisions/tasks/policies через e5)
+       и search_source_chunks (source_chunks.embedding_v2 через Qwen3 HNSW).
+    2) Дедуп по первым 200 символам content (режет повторы между km_* и
+       source_chunks:km_* — дистиллированные факты часто дублируются).
+    3) Если USE_RERANKER=true → пересортировка через Qwen3-Reranker; иначе
+       сортировка по исходному cosine similarity.
+
+    Вызывается из основного RAG pipeline когда USE_EMBEDDING_V2=true.
+    По данным A/B на 10 фикс-вопросах Qwen3 выигрывает 6/10, дополняет 2/10.
+    """
+    km_results = search_knowledge(query, limit=limit)
+    sc_results = search_source_chunks(query, limit=limit)
+
+    seen = set()
+    unique = []
+    for r in km_results + sc_results:
+        content = (r.get("content", "") or "").strip().lower()
+        key = content[:200]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(r)
+
+    use_reranker = os.getenv("USE_RERANKER", "false").lower() == "true"
+    if use_reranker and unique:
+        try:
+            from chunkers.reranker import rerank
+            unique = rerank(query, unique, top_k=limit)
+        except Exception as e:
+            logger.warning(f"search_unified rerank failed: {e}")
+            unique.sort(key=lambda x: x.get("similarity", 0), reverse=True)
+    else:
+        unique.sort(key=lambda x: x.get("similarity", 0), reverse=True)
+
+    logger.info(
+        f"search_unified: km={len(km_results)} sc={len(sc_results)} "
+        f"→ uniq={len(unique)} → top={min(limit, len(unique))} "
+        f"(reranker={'on' if use_reranker else 'off'})"
+    )
+    return unique[:limit]
 
 
 def search_source_chunks_reranked(
@@ -2751,7 +2806,10 @@ async def process_rag_query(question, chat_context="", user_info: dict = None):
             logger.info(f"Step [{source}]: {len(results)} результатов")
         
         elif source == "KNOWLEDGE":
-            results = search_knowledge(step_keywords, limit=30)
+            if os.getenv("USE_EMBEDDING_V2", "false").lower() == "true":
+                results = search_unified(step_keywords, limit=30)
+            else:
+                results = search_knowledge(step_keywords, limit=30)
             db_results.extend(results)
             logger.info(f"Step [{source}]: {len(results)} результатов")
     
