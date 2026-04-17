@@ -2327,6 +2327,174 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         except:
             pass  # Не падаем если не можем отправить алерт
 
+async def rag_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /rag_stats — мониторинг RAG за период (только админ).
+    Показывает: запросы за 24ч, escalation%, модели, latency, evidence.
+    """
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Команда только для админа.")
+        return
+
+    try:
+        args = context.args or []
+        hours = 24
+        if args and args[0].isdigit():
+            hours = max(1, min(int(args[0]), 24 * 7))
+
+        conn = get_db_connection()
+        lines = [f"📊 <b>RAG stats за последние {hours}ч</b>\n"]
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*), AVG(response_time_ms)::int, AVG(evidence_count)::numeric(5,1)
+                   FROM rag_query_log
+                   WHERE created_at > now() - (%s || ' hours')::interval""",
+                (hours,),
+            )
+            total, avg_ms, avg_ev = cur.fetchone()
+            if not total:
+                lines.append("Запросов не было.")
+            else:
+                lines.append(f"Всего запросов: <b>{total}</b>")
+                lines.append(f"Средняя latency: {avg_ms or 0} мс")
+                lines.append(f"Среднее evidence: {avg_ev or 0}")
+                lines.append("")
+
+                cur.execute(
+                    """SELECT COALESCE(answer_model, '—') AS model,
+                              COUNT(*) AS cnt,
+                              AVG(response_time_ms)::int AS ms,
+                              SUM((answer_retry_count > 0)::int) AS escalated
+                       FROM rag_query_log
+                       WHERE created_at > now() - (%s || ' hours')::interval
+                       GROUP BY 1 ORDER BY 2 DESC""",
+                    (hours,),
+                )
+                lines.append("<b>По моделям:</b>")
+                for model, cnt, ms, esc in cur.fetchall():
+                    pct = (cnt / total) * 100
+                    lines.append(f"  • {model}: {cnt} ({pct:.0f}%), ~{ms}мс, escal={esc or 0}")
+                lines.append("")
+
+                cur.execute(
+                    """SELECT primary_intent, COUNT(*)
+                       FROM rag_query_log
+                       WHERE created_at > now() - (%s || ' hours')::interval
+                         AND primary_intent IS NOT NULL
+                       GROUP BY 1 ORDER BY 2 DESC LIMIT 7""",
+                    (hours,),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    lines.append("<b>Топ intent:</b>")
+                    for intent, cnt in rows:
+                        lines.append(f"  • {intent}: {cnt}")
+                    lines.append("")
+
+                cur.execute(
+                    """SELECT COUNT(*) FILTER (WHERE evaluator_sufficient = false),
+                              COUNT(*) FILTER (WHERE answer_eval_good = false),
+                              COUNT(*) FILTER (WHERE error IS NOT NULL)
+                       FROM rag_query_log
+                       WHERE created_at > now() - (%s || ' hours')::interval""",
+                    (hours,),
+                )
+                ev_ins, ans_bad, errs = cur.fetchone()
+                lines.append("<b>Качество:</b>")
+                lines.append(f"  • pre-answer insufficient: {ev_ins or 0}")
+                lines.append(f"  • post-answer bad: {ans_bad or 0}")
+                lines.append(f"  • ошибок: {errs or 0}")
+                lines.append("")
+
+                cur.execute(
+                    """SELECT LEFT(answer_eval_issues, 120) AS issues, COUNT(*)
+                       FROM rag_query_log
+                       WHERE created_at > now() - (%s || ' hours')::interval
+                         AND answer_eval_issues IS NOT NULL
+                         AND answer_eval_issues <> ''
+                       GROUP BY 1 ORDER BY 2 DESC LIMIT 5""",
+                    (hours,),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    lines.append("<b>Топ причин escalation:</b>")
+                    for iss, cnt in rows:
+                        lines.append(f"  • [{cnt}] {iss[:100]}")
+
+        conn.close()
+        await update.message.reply_html("\n".join(lines))
+
+    except Exception as e:
+        logger.error(f"rag_stats error: {e}", exc_info=True)
+        await update.message.reply_text(f"Ошибка: {e}")
+
+
+# ============================================================
+# Reply-chain в БД (переживает рестарт бота)
+# ============================================================
+
+def _store_bot_chain_entry(chat_id: int, bot_message_id: int, user_message_id: int,
+                            user_id: int, question: str, answer: str,
+                            parent_bot_message_id: int = None):
+    """Сохраняет пару Q/A в bot_message_chain для последующего подъёма цепочки."""
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO bot_message_chain
+                   (chat_id, bot_message_id, user_message_id, user_id,
+                    question, answer, parent_bot_message_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (chat_id, bot_message_id) DO NOTHING""",
+                (chat_id, bot_message_id, user_message_id, user_id,
+                 question[:4000], answer[:8000], parent_bot_message_id),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"_store_bot_chain_entry: {e}")
+
+
+def _fetch_chain_from_db(chat_id: int, bot_message_id: int, max_depth: int = 5) -> list:
+    """
+    Рекурсивно поднимает цепочку Q/A от указанного bot_message_id к корню
+    (через parent_bot_message_id). Возвращает список пар от старой к новой.
+    """
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH RECURSIVE chain AS (
+                    SELECT chat_id, bot_message_id, parent_bot_message_id,
+                           question, answer, created_at, 0 AS depth
+                    FROM bot_message_chain
+                    WHERE chat_id = %s AND bot_message_id = %s
+
+                    UNION ALL
+
+                    SELECT b.chat_id, b.bot_message_id, b.parent_bot_message_id,
+                           b.question, b.answer, b.created_at, c.depth + 1
+                    FROM bot_message_chain b
+                    JOIN chain c
+                      ON b.chat_id = c.chat_id
+                     AND b.bot_message_id = c.parent_bot_message_id
+                    WHERE c.depth < %s
+                )
+                SELECT question, answer
+                FROM chain
+                ORDER BY created_at ASC
+                """,
+                (chat_id, bot_message_id, max_depth),
+            )
+            rows = cur.fetchall()
+        conn.close()
+        return [{"question": r[0] or "", "answer": r[1] or ""} for r in rows]
+    except Exception as e:
+        logger.warning(f"_fetch_chain_from_db: {e}")
+        return []
+
+
 # ============================================================
 # RAG АГЕНТ В ЛИЧНЫХ СООБЩЕНИЯХ
 # ============================================================
@@ -2368,27 +2536,20 @@ async def handle_private_rag(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await context.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     try:
-        # Reply-chain deep: ходим до корня цепочки.
-        # Если reply на ответ бота → находим индекс в chat_data → захватываем
-        # ВСЮ историю Q/A от начала до этого индекса (ограничено 5 последними
-        # парами для не раздувания prompt'а).
+        # Reply-chain deep (БД версия, переживает рестарт бота).
         prev_context = None
+        parent_bot_msg_id = None
         if message.reply_to_message and message.reply_to_message.from_user \
                 and message.reply_to_message.from_user.is_bot:
-            replied_text = (message.reply_to_message.text or "")[:600]
-            history = context.chat_data.get("rag_history", [])
-            matched_idx = None
-            for i in range(len(history) - 1, -1, -1):
-                h = history[i]
-                ans = (h.get("answer", "") or "")[:300]
-                if ans == replied_text[:300] or replied_text.startswith(ans[:200]):
-                    matched_idx = i
-                    break
-            if matched_idx is not None:
-                chain = history[: matched_idx + 1][-5:]  # последние 5 пар цепочки
-                prev_context = {"chain": chain}
+            parent_bot_msg_id = message.reply_to_message.message_id
+            chain_from_db = _fetch_chain_from_db(
+                message.chat.id, parent_bot_msg_id, max_depth=5
+            )
+            if chain_from_db:
+                prev_context = {"chain": chain_from_db}
                 logger.info(
-                    f"Reply-chain matched: {len(chain)} pairs in chain (root Q: '{chain[0]['question'][:60]}')"
+                    f"Reply-chain (DB) depth={len(chain_from_db)}, "
+                    f"root Q: '{chain_from_db[0]['question'][:60]}'"
                 )
 
         response = await process_rag_query(question, "", user_info={
@@ -2399,18 +2560,29 @@ async def handle_private_rag(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "chat_type": "private",
         }, prev_context=prev_context)
 
-        # Сохраняем Q/A в историю для будущих reply
-        hist = context.chat_data.setdefault("rag_history", [])
-        hist.append({"question": question, "answer": response})
-        context.chat_data["rag_history"] = hist[-10:]  # последние 10
-
-        # Отправляем ответ
+        # Отправляем ответ + сохраняем reference в БД для reply-chain
+        sent_messages = []
         if len(response) > 4000:
             parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
             for part in parts:
-                await message.reply_text(part)
+                sent = await message.reply_text(part)
+                sent_messages.append(sent)
         else:
-            await message.reply_text(response)
+            sent = await message.reply_text(response)
+            sent_messages.append(sent)
+
+        # Сохраняем в bot_message_chain для будущих reply.
+        # Берём первое отправленное сообщение как "якорь" цепочки.
+        if sent_messages:
+            _store_bot_chain_entry(
+                chat_id=message.chat.id,
+                bot_message_id=sent_messages[0].message_id,
+                user_message_id=message.message_id,
+                user_id=message.from_user.id,
+                question=question,
+                answer=response,
+                parent_bot_message_id=parent_bot_msg_id,
+            )
 
         logger.info(f"RAG ответ в личку: {len(response)} символов (follow-up={prev_context is not None})")
 
@@ -2442,24 +2614,19 @@ async def handle_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     try:
-        # Reply-chain deep (как в личке)
+        # Reply-chain deep (БД версия)
         prev_context = None
+        parent_bot_msg_id = None
         if message.reply_to_message and message.reply_to_message.from_user \
                 and message.reply_to_message.from_user.is_bot:
-            replied_text = (message.reply_to_message.text or "")[:600]
-            history = context.chat_data.get("rag_history", [])
-            matched_idx = None
-            for i in range(len(history) - 1, -1, -1):
-                h = history[i]
-                ans = (h.get("answer", "") or "")[:300]
-                if ans == replied_text[:300] or replied_text.startswith(ans[:200]):
-                    matched_idx = i
-                    break
-            if matched_idx is not None:
-                chain = history[: matched_idx + 1][-5:]
-                prev_context = {"chain": chain}
+            parent_bot_msg_id = message.reply_to_message.message_id
+            chain_from_db = _fetch_chain_from_db(
+                message.chat.id, parent_bot_msg_id, max_depth=5
+            )
+            if chain_from_db:
+                prev_context = {"chain": chain_from_db}
                 logger.info(
-                    f"Reply-chain (mention) matched: {len(chain)} pairs in chain"
+                    f"Reply-chain (mention, DB) depth={len(chain_from_db)}"
                 )
 
         response = await process_rag_query(question, "", user_info={
@@ -2470,16 +2637,26 @@ async def handle_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "chat_type": message.chat.type,
         }, prev_context=prev_context)
 
-        hist = context.chat_data.setdefault("rag_history", [])
-        hist.append({"question": question, "answer": response})
-        context.chat_data["rag_history"] = hist[-10:]
-
+        sent_messages = []
         if len(response) > 4000:
             parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
             for part in parts:
-                await message.reply_text(part)
+                sent = await message.reply_text(part)
+                sent_messages.append(sent)
         else:
-            await message.reply_text(response)
+            sent = await message.reply_text(response)
+            sent_messages.append(sent)
+
+        if sent_messages:
+            _store_bot_chain_entry(
+                chat_id=message.chat.id,
+                bot_message_id=sent_messages[0].message_id,
+                user_message_id=message.message_id,
+                user_id=message.from_user.id,
+                question=question,
+                answer=response,
+                parent_bot_message_id=parent_bot_msg_id,
+            )
 
         logger.info(f"RAG ответ отправлен: {len(response)} символов (follow-up={prev_context is not None})")
         
@@ -4068,6 +4245,7 @@ def main():
     application.add_handler(CommandHandler("rules_off", rules_off_command))
     application.add_handler(CommandHandler("element", element_command))
     application.add_handler(CommandHandler("rooms", rooms_command))
+    application.add_handler(CommandHandler("rag_stats", rag_stats_command))
 
     # Notifications
     application.add_handler(get_notify_conversation_handler())
