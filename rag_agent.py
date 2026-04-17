@@ -1639,6 +1639,24 @@ v_sales_adjusted: скорректированные продажи (с учёт
 
 -- Дополнительно есть c1_purchases, c1_purchase_items, c1_sales_plan, c1_production_items — обычно mart-views закрывают.
 
+-- Email переписка:
+email_messages: id, message_id, thread_id, mailbox_id, folder,
+  direction ('inbound'/'outbound'), from_address, to_addresses text[], cc_addresses text[],
+  subject, subject_normalized, body_text, body_html, has_attachments, attachment_count,
+  received_at TIMESTAMP, processed_at, category
+  — поля времени: received_at (НЕ sent_at, которой НЕТ).
+  — для поиска адреса в to/cc: array_to_string(to_addresses, ',') ILIKE '%X%'
+  — from_address это plain varchar
+
+email_threads: id, subject, first_at, last_at, status
+email_attachments: id, message_id (FK на email_messages), filename, content_text, media_kind
+
+-- Telegram чаты:
+tg_chat_<id>_<name>: id, timestamp, user_id, message (text), from_user_name, message_type
+  (таблицы динамические, по одной на чат; имена через information_schema.tables)
+tg_chats_metadata: chat_id, chat_title, table_name
+tg_user_roles: user_id, first_name, username, role (ILIKE '%технолог%' и т.п.), chat_id, is_active
+
 -- База знаний (для бизнес-вопросов типа "что мы решили о X"):
 km_facts, km_decisions, km_tasks, km_policies — text+embedding. Для них используй retrieval, не SQL.
 """
@@ -3236,6 +3254,14 @@ A: {{"query_type":"chat_search","steps":[{{"source":"EMAIL","keywords":"мере
 
 Q: "С каких пор мы работаем с Магнитом?"
 A: {{"query_type":"chat_search","steps":[{{"source":"EMAIL","keywords":"Магнит"}},{{"source":"CHATS","keywords":"Магнит"}}],"entities":{{"clients":["Магнит"]}}}}
+
+# Поиск КОНТАКТОВ (email-адресов) клиента/поставщика — ЧЕРЕЗ custom_sql
+# (обычный retrieval не найдёт адреса, нужен SELECT DISTINCT по from/to).
+Q: "С какими контактами ВкусВилл велась переписка?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Найди все уникальные email-адреса с домена vkusvill, с которыми наши сотрудники (домен totsamiy.com) вели переписку: SELECT DISTINCT email-адрес, количество писем, диапазон дат. Искать по from_address, to_addresses, cc_addresses (все с ILIKE %vkusvill%)."}}],"entities":{{"clients":["ВкусВилл"]}}}}
+
+Q: "Кто у Магнита наш основной контакт?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Найди основные email-контакты Магнита по количеству писем: SELECT from_address, COUNT(*) FROM email_messages WHERE from_address ILIKE %magnit% GROUP BY 1 ORDER BY 2 DESC LIMIT 10."}}],"entities":{{"clients":["Магнит"]}}}}
 
 КРИТИЧНО:
 - Если в вопросе есть название товара + "сколько/объём/купили/продали/произвели" →
