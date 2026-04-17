@@ -1692,8 +1692,15 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                         q += " AND mp.doc_date >= %s"; params.append(period_date)
                     if period_end:
                         q += " AND mp.doc_date <= %s"; params.append(period_end)
-                    for kw in (clean_keywords(keywords) or [])[:3]:
+                    kw_set = set((clean_keywords(keywords) or [])[:3])
+                    for kw in kw_set:
                         q += " AND mp.nomenclature_name ILIKE %s"; params.append(f"%{kw}%")
+                    # products из entities как fallback если Router не положил в keywords
+                    for pr in (entities or {}).get("products", [])[:3]:
+                        if pr and pr.lower() not in " ".join(kw_set).lower():
+                            q += " AND mp.nomenclature_name ILIKE %s"; params.append(f"%{pr}%")
+                    for sup in (entities or {}).get("suppliers", [])[:3]:
+                        q += " AND mp.contractor_name ILIKE %s"; params.append(f"%{sup}%")
                     q += " GROUP BY mp.nomenclature_name ORDER BY qty DESC NULLS LAST LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -1730,8 +1737,15 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                         q += " AND ms.doc_date >= %s"; params.append(period_date)
                     if period_end:
                         q += " AND ms.doc_date <= %s"; params.append(period_end)
-                    for kw in (clean_keywords(keywords) or [])[:3]:
+                    kw_set = set((clean_keywords(keywords) or [])[:3])
+                    for kw in kw_set:
                         q += " AND ms.nomenclature_name ILIKE %s"; params.append(f"%{kw}%")
+                    for pr in (entities or {}).get("products", [])[:3]:
+                        if pr and pr.lower() not in " ".join(kw_set).lower():
+                            q += " AND ms.nomenclature_name ILIKE %s"; params.append(f"%{pr}%")
+                    for cl in (entities or {}).get("clients", [])[:3]:
+                        q += " AND (ms.client_name ILIKE %s OR ms.consignee_name ILIKE %s)"
+                        params.append(f"%{cl}%"); params.append(f"%{cl}%")
                     q += " GROUP BY ms.nomenclature_name ORDER BY rub DESC NULLS LAST LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -1763,8 +1777,14 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                         WHERE sb.quantity > 0
                     """
                     params = []
-                    for kw in (clean_keywords(keywords) or [])[:3]:
+                    kw_set = set((clean_keywords(keywords) or [])[:3])
+                    for kw in kw_set:
                         q += " AND n.name ILIKE %s"; params.append(f"%{kw}%")
+                    for pr in (entities or {}).get("products", [])[:3]:
+                        if pr and pr.lower() not in " ".join(kw_set).lower():
+                            q += " AND n.name ILIKE %s"; params.append(f"%{pr}%")
+                    for wh_name in (entities or {}).get("warehouses", [])[:3]:
+                        q += " AND w.name ILIKE %s"; params.append(f"%{wh_name}%")
                     q += " GROUP BY n.name, w.name ORDER BY qty DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -1809,6 +1829,10 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                         q += " AND mp.doc_date <= %s"; params.append(period_end)
                     for kw in (clean_keywords(keywords) or [])[:3]:
                         q += " AND n.name ILIKE %s"; params.append(f"%{kw}%")
+                    # products из entities — дополнительный фильтр (если Router указал продукт, но не вставил в keywords)
+                    for pr in (entities or {}).get("products", [])[:3]:
+                        if pr and (not keywords or pr.lower() not in (keywords or "").lower()):
+                            q += " AND n.name ILIKE %s"; params.append(f"%{pr}%")
                     q += " GROUP BY n.name ORDER BY qty DESC NULLS LAST LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -2664,11 +2688,82 @@ def route_query(question, chat_context=""):
 2. Какие источники данных нужны
 3. Какие ключевые слова использовать для поиска
 
-РАССУЖДАЙ: например "НДС" → бухгалтерия → чаты с "бухгалтерия" и "априори" в названии.
-"Сколько муки купили в феврале 2026?" → 1С_ANALYTICS с analytics_type=purchases_by_nomenclature, keywords="мука", period=february. Без чатов.
-"Остатки сахара на складе" → 1С_ANALYTICS с analytics_type=stock_balance, keywords="сахар".
-"Сколько Медовика продали в марте?" → 1С_ANALYTICS sales_by_nomenclature, keywords="медовик", period=march.
-"Закупки сахара" (без "сколько") → 1С_SEARCH с keywords="сахар" + чат "закупки".
+ЭТАЛОННЫЕ ПРИМЕРЫ (изучи и следуй этим паттернам):
+
+# Количественные вопросы по номенклатуре (товар + период + количество/сумма)
+Q: "Сколько муки мы купили в феврале 2026?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"purchases_by_nomenclature","keywords":"мука"}}],"entities":{{"products":["мука"]}},"period":"february"}}
+
+Q: "Сколько сахара закупили за последний месяц?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"purchases_by_nomenclature","keywords":"сахар"}}],"entities":{{"products":["сахар"]}},"period":"month"}}
+
+Q: "Сколько тортов Медовик произвели в марте?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"production_by_nomenclature","keywords":"медовик"}}],"entities":{{"products":["медовик"]}},"period":"march"}}
+
+Q: "Сколько Наполеона продали в первом квартале?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"sales_by_nomenclature","keywords":"наполеон"}}],"entities":{{"products":["наполеон"]}},"period":"quarter"}}
+
+Q: "Выручка по пирожным за апрель"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"sales_by_nomenclature","keywords":"пирожн"}}],"period":"april"}}
+
+# Остатки (текущее состояние склада)
+Q: "Остатки сахара на складе?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"stock_balance","keywords":"сахар"}}],"entities":{{"products":["сахар"]}}}}
+
+Q: "Сколько муки на складе СЫРЬЯ?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"stock_balance","keywords":"мука"}}],"entities":{{"products":["мука"],"warehouses":["СЫРЬЯ"]}}}}
+
+Q: "Остатки упаковки по складу УПАКОВКИ"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"stock_balance","keywords":"упаковк"}}],"entities":{{"products":["упаковка"],"warehouses":["УПАКОВКИ"]}}}}
+
+# С конкретным клиентом или поставщиком
+Q: "Что мы продали клиенту Дикси за 4 квартал 2025?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"sales_by_nomenclature","keywords":""}}],"entities":{{"clients":["Дикси"]}},"period":"quarter"}}
+
+Q: "Что купили у ИП Кутабаевой в марте?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"purchases_by_nomenclature","keywords":""}}],"entities":{{"suppliers":["Кутабаева"]}},"period":"march"}}
+
+# Топы
+Q: "Топ 5 поставщиков за март 2026 по сумме"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"top_suppliers","keywords":""}}],"period":"march"}}
+
+Q: "Топ 10 клиентов за прошлый год"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"top_clients","keywords":""}}],"period":"year"}}
+
+Q: "Самые продаваемые товары за квартал"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"top_products","keywords":""}}],"period":"quarter"}}
+
+# План-факт
+Q: "Выполнение плана за март"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"plan_vs_fact","keywords":""}}],"period":"march"}}
+
+# Конкретные документы
+Q: "По какой цене покупали муку в последний раз?"
+A: {{"query_type":"search","steps":[{{"source":"1С_SEARCH","keywords":"мука"}}],"entities":{{"products":["мука"]}},"period":"2weeks"}}
+
+# Чаты / переписка / процесс / решение
+Q: "Как решили вопрос по доп соглашению с Магнит?"
+A: {{"query_type":"chat_search","steps":[{{"source":"CHATS","keywords":"магнит доп соглашение"}},{{"source":"EMAIL","keywords":"магнит соглашение"}},{{"source":"KNOWLEDGE","keywords":"магнит соглашение"}}],"entities":{{"clients":["Магнит"]}}}}
+
+Q: "Что в бухгалтерии обсуждали про НДС?"
+A: {{"query_type":"chat_search","target_chats":["tg_chat_1003492830147_buhgalteriya_frumelad_nf","tg_chat_apriori_frumelad_nf"],"steps":[{{"source":"CHATS","keywords":"ндс"}}]}}
+
+Q: "Кто отвечает за качество упаковки?"
+A: {{"query_type":"lookup","steps":[{{"source":"KNOWLEDGE","keywords":"упаковка ответственный"}}]}}
+
+# Смешанный (количество + обсуждения)
+Q: "Сколько муки купили в феврале и что обсуждали по поставщикам?"
+A: {{"query_type":"mixed","steps":[{{"source":"1С_ANALYTICS","analytics_type":"purchases_by_nomenclature","keywords":"мука"}},{{"source":"CHATS","keywords":"мука поставщик"}}],"entities":{{"products":["мука"]}},"period":"february"}}
+
+КРИТИЧНО:
+- Если в вопросе есть название товара + "сколько/объём/купили/продали/произвели" →
+  1С_ANALYTICS с *_by_nomenclature (НЕ 1С_SEARCH, НЕ только CHATS)
+- Если "остатки"/"остаток"/"запас" → stock_balance
+- Если "топ N"/"лучшие"/"самые" → top_*
+- Если есть название клиента (ИП, ООО, название сети) → entities.clients + sales_*
+- Если есть название поставщика → entities.suppliers + purchases_*
+- Если есть название склада → entities.warehouses + stock_balance
+- CHATS/EMAIL — ТОЛЬКО когда вопрос о переписке/решении/обсуждении
 
 Верни ТОЛЬКО JSON без markdown:
 {{"query_type": "analytics|search|lookup|chat_search|web|mixed",
@@ -2697,8 +2792,13 @@ def route_query(question, chat_context=""):
         response = requests.post(
             f"{ROUTERAI_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "openai/gpt-4.1-mini", "messages": [{"role": "user", "content": prompt}], "max_tokens": 800, "temperature": 0},
-            timeout=(5, 15)
+            json={
+                "model": "openai/gpt-4.1",  # upgrade с -mini: маршрутизация требует полноценной модели
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 2000,  # место для подробного reasoning + steps
+                "temperature": 0,
+            },
+            timeout=(5, 45),  # Router может думать дольше при сложных вопросах
         )
         
         result = response.json()
