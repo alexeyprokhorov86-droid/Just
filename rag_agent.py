@@ -766,6 +766,77 @@ def search_knowledge(query: str, limit: int = 30) -> list:
     logger.info(f"search_knowledge: {len(results)} результатов по запросу '{query[:50]}'")
     return results[:limit]
 
+
+def search_source_chunks(query: str, limit: int = 30, min_similarity: float = 0.3) -> list:
+    """
+    Поиск по source_chunks через Qwen3 embedding_v2 (HNSW индекс).
+
+    В отличие от search_knowledge (km_*, дистиллированные факты на e5), эта
+    функция возвращает сырые документные чанки: telegram-сообщения, email,
+    matrix-события, 1С-документы. Формат результатов совместим с
+    search_knowledge для объединения в общий RAG pipeline.
+
+    Активируется через .env `USE_EMBEDDING_V2=true` (в вызывающем коде).
+    """
+    from chunkers.embedder import embed_query_v2
+
+    query_vec = embed_query_v2(query)
+    if query_vec is None:
+        logger.warning("search_source_chunks: embed_query_v2 вернул None")
+        return []
+
+    emb_str = "[" + ",".join(str(x) for x in query_vec) + "]"
+
+    conn = get_db_connection()
+    results = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    sc.id, sc.chunk_text, sc.chunk_type, sc.source_kind,
+                    sc.confidence, sc.created_at, sc.chunk_date,
+                    sd.title, sd.doc_date, sd.author_name, sd.channel_name,
+                    sd.source_ref,
+                    1 - (sc.embedding_v2 <=> %s::vector) AS similarity
+                FROM source_chunks sc
+                LEFT JOIN source_documents sd ON sd.id = sc.document_id
+                WHERE sc.embedding_v2 IS NOT NULL
+                  AND (sd.is_deleted IS NULL OR sd.is_deleted = false)
+                ORDER BY sc.embedding_v2 <=> %s::vector
+                LIMIT %s
+            """, (emb_str, emb_str, limit))
+
+            for row in cur.fetchall():
+                sim = float(row[12]) if row[12] is not None else 0.0
+                if sim < min_similarity:
+                    continue
+                source_kind = row[3] or "unknown"
+                results.append({
+                    "source": f"source_chunks:{source_kind}",
+                    "source_type": "source_chunks",
+                    "content": row[1],
+                    "type": row[2] or source_kind,
+                    "confidence": float(row[4]) if row[4] is not None else 0.5,
+                    "similarity": sim,
+                    "created_at": str(row[5]) if row[5] else "",
+                    "chunk_date": str(row[6]) if row[6] else "",
+                    "title": row[7] or "",
+                    "doc_date": str(row[8]) if row[8] else "",
+                    "author": row[9] or "",
+                    "channel": row[10] or "",
+                    "source_ref": row[11] or "",
+                    "search_type": "vector_v2",
+                })
+    finally:
+        conn.close()
+
+    logger.info(
+        f"search_source_chunks: {len(results)} результатов по запросу "
+        f"'{query[:50]}'"
+    )
+    return results
+
+
 def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list = None,
                               time_context: dict = None) -> list:
     """SQL-поиск по Telegram чатам с time-aware scoring и keyword expansion."""
