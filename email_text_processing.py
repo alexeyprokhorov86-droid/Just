@@ -121,13 +121,29 @@ def clean_email_text(text: str) -> str:
             break
         out.append(ln)
 
-    # 3) Обрезаем по подписи
+    # 3) Обрезаем по подписи — НО сохраняем сам маркер + следующие 5 строк.
+    # В них лежит ФИО, должность, телефон, email — критично для поиска
+    # "кто контакт Магнита", "ФИО менеджера Дикси" и т.п.
     out2: List[str] = []
+    signature_mode = False
+    sig_kept = 0
+    SIG_KEEP_LINES = 6  # маркер + 5 содержательных строк
     for ln in out:
         s = ln.strip()
-        if any(re.match(p, s, flags=re.IGNORECASE) for p in _SIGNATURE_MARKERS):
-            break
-        out2.append(ln)
+        if not signature_mode and any(
+            re.match(p, s, flags=re.IGNORECASE) for p in _SIGNATURE_MARKERS
+        ):
+            signature_mode = True
+            out2.append(ln)
+            sig_kept = 1
+            continue
+        if signature_mode:
+            if sig_kept >= SIG_KEEP_LINES:
+                break
+            out2.append(ln)
+            sig_kept += 1
+        else:
+            out2.append(ln)
 
     # 4) Убираем дисклеймеры (грубо: если встретили — отрезаем)
     final: List[str] = []

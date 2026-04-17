@@ -1648,6 +1648,18 @@ email_messages: id, message_id, thread_id, mailbox_id, folder,
   — для поиска адреса в to/cc: array_to_string(to_addresses, ',') ILIKE '%X%'
   — from_address это plain varchar
 
+  ⚡ ВАЖНО для вопросов "кто контакт / ФИО / менеджер":
+  body_text содержит ПОЛНЫЙ исходный текст письма, включая ПОДПИСЬ автора
+  (ФИО, должность, телефон, email). В подписи обычно есть "С уважением,"
+  и затем 2-5 строк с персональной информацией.
+  Для извлечения подписи используй:
+    substring(body_text FROM '(?s)С уважением[,!][^\n]*\n([^|]{20,500}?)(?:\n\n|$)')
+  Или включай body_text в результат и Answerer выделит ФИО в ответе.
+  Предпочитай outbound письма (direction='outbound') — они содержат ПОЛНУЮ
+  подпись отправителя, а inbound могут быть cut'нутыми нашим клиентом.
+  Также исключай служебные адреса: noreply@, no-reply@, svc_*, *service*,
+  edi@, pretenz*, accounting@ — они не содержат персон.
+
 email_threads: id, subject, first_at, last_at, status
 email_attachments: id, message_id (FK на email_messages), filename, content_text, media_kind
 
@@ -3255,13 +3267,16 @@ A: {{"query_type":"chat_search","steps":[{{"source":"EMAIL","keywords":"мере
 Q: "С каких пор мы работаем с Магнитом?"
 A: {{"query_type":"chat_search","steps":[{{"source":"EMAIL","keywords":"Магнит"}},{{"source":"CHATS","keywords":"Магнит"}}],"entities":{{"clients":["Магнит"]}}}}
 
-# Поиск КОНТАКТОВ (email-адресов) клиента/поставщика — ЧЕРЕЗ custom_sql
-# (обычный retrieval не найдёт адреса, нужен SELECT DISTINCT по from/to).
+# Поиск КОНТАКТОВ (email-адресов + ФИО) клиента/поставщика — ЧЕРЕЗ custom_sql.
+# Обычный retrieval не найдёт ни список адресов, ни ФИО из подписей.
 Q: "С какими контактами ВкусВилл велась переписка?"
-A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Найди все уникальные email-адреса с домена vkusvill, с которыми наши сотрудники (домен totsamiy.com) вели переписку: SELECT DISTINCT email-адрес, количество писем, диапазон дат. Искать по from_address, to_addresses, cc_addresses (все с ILIKE %vkusvill%)."}}],"entities":{{"clients":["ВкусВилл"]}}}}
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Найди все уникальные email-адреса с домена vkusvill, с которыми велась переписка. SELECT DISTINCT email-адрес, COUNT писем, диапазон дат. Искать в from_address, to_addresses, cc_addresses (ILIKE %vkusvill%). Исключи служебные адреса (noreply, no-reply, service, svc_, edi@, pretenz, accounting)."}}],"entities":{{"clients":["ВкусВилл"]}}}}
 
-Q: "Кто у Магнита наш основной контакт?"
-A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Найди основные email-контакты Магнита по количеству писем: SELECT from_address, COUNT(*) FROM email_messages WHERE from_address ILIKE %magnit% GROUP BY 1 ORDER BY 2 DESC LIMIT 10."}}],"entities":{{"clients":["Магнит"]}}}}
+Q: "Кто у Магнита наш основной контакт / байер / категорийщик?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Найди ФИО и должности КЛИЕНТСКИХ контактов Магнита (НЕ служебных адресов). Включи from_address, subject и body_text в SELECT для последних 20 писем от персональных адресов magnit.ru (исключи noreply/no-reply/svc_/edi@/pretenz/accounting). Ответу нужен не только список адресов, но и ФИО из подписей в body_text (обычно после 'С уважением,'). SELECT from_address, subject, LEFT(body_text, 1500) FROM email_messages WHERE from_address ILIKE '%magnit%' AND from_address NOT ILIKE '%noreply%' AND from_address NOT ILIKE '%no-reply%' AND from_address NOT ILIKE '%svc_%' AND from_address NOT ILIKE '%edi@%' AND from_address NOT ILIKE '%service%' ORDER BY received_at DESC LIMIT 30."}}],"entities":{{"clients":["Магнит"]}}}}
+
+Q: "С кем из Дикси переписывались в 2025 году?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Найди ФИО контактных лиц Дикси за 2025 год (январь-декабрь). Читай body_text для извлечения подписей. SELECT from_address, subject, LEFT(body_text, 1500) FROM email_messages WHERE (from_address ILIKE '%dixy%' OR from_address ILIKE '%dicy%') AND received_at BETWEEN '2025-01-01' AND '2025-12-31' AND from_address NOT ILIKE '%noreply%' AND from_address NOT ILIKE '%no-reply%' AND from_address NOT ILIKE '%svc_%' AND from_address NOT ILIKE '%edi@%' ORDER BY received_at DESC LIMIT 30. В ответе верни список ФИО с должностями и email."}}],"entities":{{"clients":["Дикси"]}},"period":"2025-01-01..2025-12-31"}}
 
 КРИТИЧНО:
 - Если в вопросе есть название товара + "сколько/объём/купили/продали/произвели" →
