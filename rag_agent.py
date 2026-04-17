@@ -51,9 +51,9 @@ EMAIL_VECTOR_MIN_SCORE = 0.55
 TELEGRAM_SQL_MIN_SCORE = 0.55
 EMAIL_SQL_MIN_SCORE = 0.42
 
-EVIDENCE_MAX_ITEMS = 12
+EVIDENCE_MAX_ITEMS = 16
 EVIDENCE_QUOTAS = {
-    "analytics": 3,
+    "analytics": 10,  # top_* / *_by_nomenclature часто возвращают 10-20 строк — не резать
     "1c": 4,
     "chat": 3,
     "email": 3,
@@ -61,11 +61,11 @@ EVIDENCE_QUOTAS = {
 }
 
 INTENT_EVIDENCE_QUOTAS = {
-    "staffing": {"chat": 6, "email": 2, "1c": 1, "analytics": 0, "other": 1},
-    "documents": {"chat": 6, "email": 2, "1c": 1, "analytics": 0, "other": 1},
-    "finance": {"chat": 3, "email": 4, "1c": 4, "analytics": 2, "other": 1},
-    "production": {"chat": 4, "email": 2, "1c": 4, "analytics": 2, "other": 1},
-    "procurement": {"chat": 4, "email": 2, "1c": 4, "analytics": 2, "other": 1},
+    "staffing": {"chat": 6, "email": 2, "1c": 1, "analytics": 1, "other": 1},
+    "documents": {"chat": 6, "email": 2, "1c": 1, "analytics": 1, "other": 1},
+    "finance": {"chat": 3, "email": 4, "1c": 4, "analytics": 10, "other": 1},
+    "production": {"chat": 3, "email": 2, "1c": 4, "analytics": 10, "other": 1},
+    "procurement": {"chat": 3, "email": 2, "1c": 4, "analytics": 10, "other": 1},
 }
 
 
@@ -1444,7 +1444,47 @@ def _resolve_period(period_str):
     
     if period_str in simple_map:
         return simple_map[period_str], None
-    
+
+    # Конкретные кварталы: q1_2025, q4_2025, q2_2026 и т.п.
+    m = re.match(r"^q([1-4])_(\d{4})$", period_str.lower().strip())
+    if m:
+        q_num = int(m.group(1))
+        y = int(m.group(2))
+        q_start_month = (q_num - 1) * 3 + 1
+        q_end_month = q_num * 3
+        q_start = date(y, q_start_month, 1)
+        if q_end_month == 12:
+            q_end = date(y, 12, 31)
+        else:
+            q_end = date(y, q_end_month + 1, 1) - timedelta(days=1)
+        return q_start, q_end
+
+    # Конкретные месяцы с годом: january_2025, march_2026 и т.п.
+    m = re.match(r"^([a-z]+)_(\d{4})$", period_str.lower().strip())
+    if m:
+        months_map = {
+            'january': 1, 'february': 2, 'march': 3, 'april': 4,
+            'may': 5, 'june': 6, 'july': 7, 'august': 8,
+            'september': 9, 'october': 10, 'november': 11, 'december': 12
+        }
+        if m.group(1) in months_map:
+            mn = months_map[m.group(1)]
+            y = int(m.group(2))
+            first_day = date(y, mn, 1)
+            if mn == 12:
+                last_day = date(y, 12, 31)
+            else:
+                last_day = date(y, mn + 1, 1) - timedelta(days=1)
+            return first_day, last_day
+
+    # Прямые даты: period_str = "2025-10-01..2025-12-31"
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$", period_str.strip())
+    if m:
+        try:
+            return date.fromisoformat(m.group(1)), date.fromisoformat(m.group(2))
+        except ValueError:
+            pass
+
     months = {
         'january': 1, 'february': 2, 'march': 3, 'april': 4,
         'may': 5, 'june': 6, 'july': 7, 'august': 8,
@@ -1519,13 +1559,13 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
             if analytics_type in ("top_clients", "sales_summary"):
                 try:
                     q = """
-                        SELECT client_name, 
+                        SELECT client_name,
                                COUNT(*) as positions,
                                SUM(sum_with_vat) as revenue,
                                MIN(doc_date) as first_date,
                                MAX(doc_date) as last_date,
                                COUNT(DISTINCT doc_number) as docs_count
-                        FROM sales 
+                        FROM mart_sales
                         WHERE doc_type = 'Реализация'
                     """
                     params = []
@@ -1566,7 +1606,7 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                                SUM(sum_with_vat) as revenue,
                                AVG(price) as avg_price,
                                COUNT(DISTINCT client_name) as clients_count
-                        FROM sales
+                        FROM mart_sales
                         WHERE doc_type = 'Реализация'
                     """
                     params = []
@@ -1606,20 +1646,20 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                                SUM(sum_total) as total_sum,
                                COUNT(DISTINCT nomenclature_name) as products_count,
                                MAX(doc_date) as last_date
-                        FROM purchase_prices
+                        FROM mart_purchases
+                        WHERE 1=1
                     """
                     params = []
                     if period_date:
-                        q += " WHERE doc_date >= %s"; params.append(period_date)
+                        q += " AND doc_date >= %s"; params.append(period_date)
                     if period_end:
                         q += " AND doc_date <= %s"; params.append(period_end)
                     if entities and entities.get("suppliers"):
-                        prefix = " AND " if period_date else " WHERE "
                         supp_filters = []
                         for supp in entities["suppliers"]:
                             supp_filters.append("contractor_name ILIKE %s")
                             params.append(f"%{supp}%")
-                        q += prefix + "(" + " OR ".join(supp_filters) + ")"
+                        q += " AND (" + " OR ".join(supp_filters) + ")"
                     q += " GROUP BY contractor_name ORDER BY total_sum DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -2718,7 +2758,7 @@ A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_typ
 
 # С конкретным клиентом или поставщиком
 Q: "Что мы продали клиенту Дикси за 4 квартал 2025?"
-A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"sales_by_nomenclature","keywords":""}}],"entities":{{"clients":["Дикси"]}},"period":"quarter"}}
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"sales_by_nomenclature","keywords":""}}],"entities":{{"clients":["Дикси"]}},"period":"q4_2025"}}
 
 Q: "Что купили у ИП Кутабаевой в марте?"
 A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"purchases_by_nomenclature","keywords":""}}],"entities":{{"suppliers":["Кутабаева"]}},"period":"march"}}
@@ -2771,7 +2811,7 @@ A: {{"query_type":"mixed","steps":[{{"source":"1С_ANALYTICS","analytics_type":"
 "target_chats": ["tg_chat_xxx", "tg_chat_yyy"],
 "steps": [{{"source": "1С_ANALYTICS|1С_SEARCH|CHATS|EMAIL|WEB", "action": "описание", "analytics_type": "тип|null", "keywords": "слова через пробел"}}],
 "entities": {{"clients": [], "products": [], "suppliers": []}},
-"period": "today|yesterday|week|2weeks|month|quarter|half_year|year|january|...|december|null",
+"period": "today|yesterday|week|2weeks|month|quarter|half_year|year|january..december|q1_2025|q2_2025|q3_2025|q4_2025|q1_2026|january_2025|YYYY-MM-DD..YYYY-MM-DD|null",
 "keywords": "основные ключевые слова"}}
 
 ПРАВИЛА:
@@ -2786,7 +2826,9 @@ A: {{"query_type":"mixed","steps":[{{"source":"1С_ANALYTICS","analytics_type":"
 - Для вопросов про внутренние правила, решения, процессы, задачи — добавляй KNOWLEDGE
 - KNOWLEDGE хорош для "что было решено", "как мы делаем X", "кто отвечает за Y"
 - Минимум 2-3 шага, keywords — существительные без запятых
-- period: "за 2 недели" = "2weeks", "в январе" = "january", "недавно"/"в последний раз" = "2weeks"
+- period: "за 2 недели" = "2weeks", "в январе" = "january" (если без года, подразумевается ближайший прошедший), "недавно"/"в последний раз" = "2weeks"
+- period с КОНКРЕТНЫМ годом: "в январе 2025" = "january_2025", "4 квартал 25" = "q4_2025", "Q2 2026" = "q2_2026"
+- если период не шаблонный — возвращай диапазон YYYY-MM-DD..YYYY-MM-DD напрямую, напр. "с 1 июня по 15 июля 2025" = "2025-06-01..2025-07-15"
 """
         
         response = requests.post(
