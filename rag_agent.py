@@ -837,6 +837,30 @@ def search_source_chunks(query: str, limit: int = 30, min_similarity: float = 0.
     return results
 
 
+def search_source_chunks_reranked(
+    query: str,
+    retrieve_limit: int = 30,
+    top_k: int = 5,
+    min_similarity: float = 0.3,
+) -> list:
+    """
+    Retrieval + rerank: embedding_v2 cosine top-N → Qwen3-Reranker top-K.
+
+    retrieve_limit: сколько взять из HNSW (рекомендовано 20-30)
+    top_k:          сколько оставить после reranker (рекомендовано 3-10)
+
+    Добавляет в каждый result поле `rerank_score` (P(yes) ∈ [0,1]).
+    Активируется через .env USE_RERANKER=true (проверяет вызывающий код).
+    """
+    from chunkers.reranker import rerank
+
+    retrieved = search_source_chunks(query, limit=retrieve_limit, min_similarity=min_similarity)
+    if not retrieved:
+        return []
+    reranked = rerank(query, retrieved, text_key="content", top_k=top_k)
+    return reranked
+
+
 def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list = None,
                               time_context: dict = None) -> list:
     """SQL-поиск по Telegram чатам с time-aware scoring и keyword expansion."""
