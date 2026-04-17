@@ -2596,10 +2596,100 @@ def build_evidence_context(evidence_items: list) -> str:
 # ГЕНЕРАЦИЯ ОТВЕТА (GPT-4.1)
 # =============================================================================
 
+def _call_answerer(prompt: str, model: str = "openai/gpt-4.1",
+                    max_tokens: int = 1800, timeout: int = 60) -> str:
+    """Один вызов LLM для генерации ответа. Raises RuntimeError на ошибке."""
+    response = requests.post(
+        f"{ROUTERAI_BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+        },
+        timeout=timeout,
+    )
+    result = response.json()
+    if "choices" not in result:
+        raise RuntimeError(f"answerer {model}: {result.get('error', result)}")
+    return result["choices"][0]["message"]["content"]
+
+
+def evaluate_answer_quality(question: str, answer: str, evidence_items: list) -> dict:
+    """
+    Post-answer critique на gpt-4.1. Проверяет наличие прямого ответа, 1С-источников
+    для количественных вопросов, корректность цитирований.
+    Возвращает {"good": bool, "reasoning": str, "issues": [str]}.
+    """
+    if not ROUTERAI_API_KEY or not answer or len(answer) < 20:
+        return {"good": True, "reasoning": "evaluator skipped", "issues": []}
+
+    sources_short = "\n".join(
+        f"[{i.get('evidence_id','?')}] {i.get('citation','')}"
+        for i in evidence_items[:12]
+    )
+    has_1c_evidence = any(
+        (i.get("source", "") or "").startswith("1С") for i in evidence_items
+    )
+
+    prompt = f"""Оцени качество ответа RAG-агента по бизнес-вопросу.
+
+ВОПРОС: {question}
+
+ОТВЕТ АГЕНТА:
+{answer[:3000]}
+
+ИСТОЧНИКИ EVIDENCE ({len(evidence_items)} шт, 1С-данные доступны: {has_1c_evidence}):
+{sources_short}
+
+КРИТЕРИИ ХОРОШЕГО ОТВЕТА:
+1) Есть прямой ответ (цифра/имя/факт/дата), не "недостаточно данных" на основной вопрос
+2) Если вопрос количественный (сколько/объём/остаток/сумма/топ/выручка) — ДОЛЖЕН быть хотя бы 1 источник из "1С:..."
+3) Каждый ключевой тезис имеет ссылку [n]
+4) Отвечает по-человечески, а не сухо перечисляет
+5) "Риски/пробелы" не написаны про мелочи (ед.изм. если они ясны из контекста, детализация не спрошенного)
+
+Верни ТОЛЬКО JSON без markdown:
+{{"good": true|false, "reasoning": "краткое объяснение оценки", "issues": ["список конкретных проблем если есть"]}}"""
+
+    try:
+        response = requests.post(
+            f"{ROUTERAI_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "openai/gpt-4.1",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 400,
+                "temperature": 0,
+            },
+            timeout=30,
+        )
+        result = response.json()
+        if "choices" not in result:
+            logger.warning(f"evaluate_answer_quality: {result}")
+            return {"good": True, "reasoning": "evaluator http error", "issues": []}
+        content = result["choices"][0]["message"]["content"].strip()
+        content = re.sub(r'^```(?:json)?\s*', '', content)
+        content = re.sub(r'\s*```$', '', content)
+        parsed = json.loads(content)
+        logger.info(
+            f"AnswerEval: good={parsed.get('good')}, "
+            f"reason={(parsed.get('reasoning') or '')[:100]}"
+        )
+        return parsed
+    except Exception as e:
+        logger.warning(f"evaluate_answer_quality error: {e}")
+        return {"good": True, "reasoning": f"evaluator exc: {e}", "issues": []}
+
+
 def generate_response(question, db_results, web_results, web_citations=None, chat_context=""):
-    """Генерация grounded-ответа с обязательными ссылками на evidence."""
+    """Генерация grounded-ответа с обязательными ссылками на evidence.
+    Возвращает tuple (text, meta) где meta = {retry_count, model_used, evaluator}.
+    """
+    meta = {"retry_count": 0, "model_used": "openai/gpt-4.1", "evaluator": {}}
     if not ROUTERAI_API_KEY:
-        return "API ключ не настроен"
+        return "API ключ не настроен", meta
     try:
         evidence_items = db_results or []
         if evidence_items and "evidence_id" not in evidence_items[0]:
@@ -2652,22 +2742,36 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
 
 Ответ:"""
 
-        response = requests.post(
-            f"{ROUTERAI_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {ROUTERAI_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "openai/gpt-4.1",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1800,
-                "temperature": 0
-            },
-            timeout=60
-        )
-        result = response.json()
-        if "choices" not in result:
-            return "Ошибка генерации"
+        # Попытка 1: gpt-4.1
+        try:
+            response_text = _call_answerer(prompt, "openai/gpt-4.1", max_tokens=1800, timeout=60)
+            meta["model_used"] = "openai/gpt-4.1"
+        except Exception as e:
+            logger.error(f"answerer gpt-4.1: {e}")
+            return f"Ошибка генерации: {e}", meta
 
-        response_text = result["choices"][0]["message"]["content"]
+        # Post-answer evaluator → escalation
+        quality = evaluate_answer_quality(question, response_text, evidence_items)
+        meta["evaluator"] = quality
+        if not quality.get("good", True):
+            issues = quality.get("issues") or [quality.get("reasoning", "")]
+            logger.info(f"Escalation: answer weak ({issues[:2]}), retry with Claude Opus 4.7")
+            escalate_prompt = (
+                prompt
+                + "\n\n⚠️ ЗАМЕЧАНИЯ к предыдущему ответу (исправь их):\n- "
+                + "\n- ".join(str(i)[:200] for i in issues[:5])
+                + "\nПерепиши ответ с учётом этих замечаний. Тот же формат, те же источники [n]."
+            )
+            try:
+                escalated = _call_answerer(
+                    escalate_prompt, "anthropic/claude-opus-4.7",
+                    max_tokens=3000, timeout=180
+                )
+                response_text = escalated
+                meta["model_used"] = "anthropic/claude-opus-4.7"
+                meta["retry_count"] = 1
+            except Exception as e:
+                logger.warning(f"Claude Opus escalation failed: {e} — keeping gpt-4.1 answer")
 
         # Гарантированно добавляем карту источников внизу, даже если LLM её не вывел
         if sources_map:
@@ -2678,9 +2782,9 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
             for i, url in enumerate(web_citations[:5], 1):
                 response_text += f"\n{i}. {url}"
 
-        return response_text
+        return response_text, meta
     except Exception as e:
-        return f"Ошибка: {e}"
+        return f"Ошибка: {e}", meta
 
 
 # =============================================================================
@@ -3332,10 +3436,14 @@ async def process_rag_query(question, chat_context="", user_info: dict = None):
 
     search_time_ms = int((time.time() - start_time) * 1000) - router_time_ms
 
-    # === Шаг 5: Генерация ответа (GPT-4.1) ===
+    # === Шаг 5: Генерация ответа (gpt-4.1 → escalate Claude Opus 4.7 если слабо) ===
     gen_start = time.time()
-    response = generate_response(question, evidence_results, web_results, web_citations, chat_context)
+    response, gen_meta = generate_response(
+        question, evidence_results, web_results, web_citations, chat_context
+    )
     generation_time_ms = int((time.time() - gen_start) * 1000)
+
+    answer_eval = gen_meta.get("evaluator") or {}
 
     # === Логирование ===
     _log_rag_query({
@@ -3353,7 +3461,7 @@ async def process_rag_query(question, chat_context="", user_info: dict = None):
         "evidence_count": len(evidence_results),
         "evidence_sources": json.dumps(source_counts),
         "evaluator_sufficient": evaluation.get("sufficient", True),
-        "retry_count": 0,
+        "retry_count": gen_meta.get("retry_count", 0),
         "rerank_applied": len(db_results) > 12,
         "response_length": len(response),
         "response_time_ms": int((time.time() - start_time) * 1000),
@@ -3362,6 +3470,10 @@ async def process_rag_query(question, chat_context="", user_info: dict = None):
         "generation_time_ms": generation_time_ms,
         "web_search_used": bool(web_results),
         "error": None,
+        "answer_model": gen_meta.get("model_used"),
+        "answer_retry_count": gen_meta.get("retry_count", 0),
+        "answer_eval_good": answer_eval.get("good") if answer_eval else None,
+        "answer_eval_issues": "; ".join(answer_eval.get("issues", [])[:5]) if answer_eval else None,
     })
 
     return response
@@ -3380,7 +3492,8 @@ def _log_rag_query(data: dict):
                     evidence_count, evidence_sources, evaluator_sufficient,
                     retry_count, rerank_applied, response_length,
                     response_time_ms, router_time_ms, search_time_ms,
-                    generation_time_ms, web_search_used, error
+                    generation_time_ms, web_search_used, error,
+                    answer_model, answer_retry_count, answer_eval_good, answer_eval_issues
                 ) VALUES (
                     %(user_id)s, %(username)s, %(first_name)s, %(chat_id)s, %(chat_type)s,
                     %(question)s, %(primary_intent)s, %(detected_intents)s,
@@ -3388,7 +3501,8 @@ def _log_rag_query(data: dict):
                     %(evidence_count)s, %(evidence_sources)s, %(evaluator_sufficient)s,
                     %(retry_count)s, %(rerank_applied)s, %(response_length)s,
                     %(response_time_ms)s, %(router_time_ms)s, %(search_time_ms)s,
-                    %(generation_time_ms)s, %(web_search_used)s, %(error)s
+                    %(generation_time_ms)s, %(web_search_used)s, %(error)s,
+                    %(answer_model)s, %(answer_retry_count)s, %(answer_eval_good)s, %(answer_eval_issues)s
                 )
             """, data)
         conn.commit()
