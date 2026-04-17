@@ -109,9 +109,10 @@ COMMENT ON COLUMN source_chunks.embedding_v2 IS
 - [ ] HNSW индекс на `embedding_v2` создан
 - [ ] `tests/check_embedding_consistency.py` проходит, doc×query
       similarity > 0.85
-- [ ] Шаги 1-4 этой задачи реализованы и закоммичены
-- [ ] Grep по репо `create_query_embedding` показывает только legacy
-      пути (km_*, embeddings table)
+- [x] Шаги 1-4 этой задачи реализованы и закоммичены (2026-04-17)
+- [x] Grep по репо `create_query_embedding` показывает только legacy
+      пути (km_*, embeddings table) — 2026-04-17 после переименования
+      осталась только rag_agent.py:716 внутри `search_knowledge` для km_facts/decisions/tasks/policies
 - [ ] A/B сравнение качества: 20 фиксированных вопросов прогнать
       через старый RAG (e5) и новый (qwen) — top-5 hits, ручная оценка
       relevance

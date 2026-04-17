@@ -1,6 +1,14 @@
 """
-Сервис для создания и поиска векторных эмбеддингов.
-Использует intfloat/multilingual-e5-base для русского языка.
+LEGACY: intfloat/multilingual-e5-base для русского языка.
+
+Используется ТОЛЬКО для:
+  - km_facts / km_decisions / km_tasks / km_policies (distillation pipeline)
+  - embeddings table (старый индекс по telegram_messages / email_messages)
+  - reindex_emails.py
+
+Для source_chunks.embedding_v2 НЕ применять — там Qwen3-Embedding-0.6B.
+Каноническая точка входа для Qwen3: chunkers.embedder.embed_query_v2().
+См. TASK_qwen_consistency.md.
 """
 
 import os

@@ -1,6 +1,9 @@
 """
 Embedder — Qwen3-Embedding-0.6B для генерации embeddings чанков.
-Используется ТОЛЬКО через build_chunks_v2.py (старый e5-base остаётся в embedding_service.py).
+Используется через build_chunks_v2.py (индексация документов) и
+embed_query_v2() ниже (retrieval). Старый e5-base изолирован в
+embedding_service_e5.py и применяется только для legacy km_* и
+embeddings table.
 """
 import logging
 import time
@@ -17,6 +20,21 @@ _model = None  # singleton
 # Обрезка текста до ~512 токенов (~2000 символов для русского).
 # Qwen3 поддерживает 8192, но длинные тексты сильно замедляют CPU inference.
 MAX_TEXT_CHARS = 1000
+
+# ------------------------------------------------------------
+# Prompts в Qwen/Qwen3-Embedding-0.6B (config_sentence_transformers.json,
+# snapshot c54f2e6... от 2026-04-17):
+#   prompts = {
+#     "query":    "Instruct: Given a web search query, retrieve relevant
+#                  passages that answer the query\nQuery:",
+#     "document": ""  # пустой префикс для документов
+#   }
+#   default_prompt_name = null   # ⚠️ ВАЖНО: без явного prompt_name префикс
+#                                  НЕ добавляется, текст кодируется как document.
+#                                  Всегда указывать prompt_name="query" для поиска.
+# Qwen3 асимметрична: query ≠ document → смешивать модели нельзя (см.
+# TASK_qwen_consistency). Проверить дрифт: tests/check_embedding_consistency.py
+# ------------------------------------------------------------
 
 
 def load_model(backend: str = "torch"):
@@ -120,3 +138,42 @@ class Embedder:
         if isinstance(emb, np.ndarray):
             return emb[0].tolist()
         return emb[0].tolist()
+
+
+# ============================================================
+# Public API для внешних модулей (rag_agent, bot и т.д.)
+# ============================================================
+
+_shared_embedder: Optional["Embedder"] = None
+
+
+def _get_shared_embedder() -> "Embedder":
+    """Lazy singleton shared Embedder — модель грузится один раз на процесс."""
+    global _shared_embedder
+    if _shared_embedder is None:
+        _shared_embedder = Embedder()
+    return _shared_embedder
+
+
+def embed_query_v2(text: str) -> Optional[List[float]]:
+    """
+    Каноническое query-encoding для source_chunks.embedding_v2.
+
+    Использовать ВЕЗДЕ при поиске по embedding_v2 (Qwen3-Embedding-0.6B,
+    prompt_name="query"). НИКОГДА не вызывать через legacy
+    embedding_service_e5.create_query_embedding — там другая модель
+    (intfloat/multilingual-e5-base), вектора несовместимы по геометрии
+    несмотря на совпадение размерности 1024.
+
+    Returns: list[float] длины 1024 (L2-normalized), или None если encode упал.
+    """
+    return _get_shared_embedder().embed_query(text)
+
+
+def embed_document_v2(text: str) -> Optional[List[float]]:
+    """
+    Каноническое document-encoding для source_chunks.embedding_v2.
+
+    Используется в build_chunks_v2 / build_source_chunks. prompt_name="document".
+    """
+    return _get_shared_embedder().embed_single(text)

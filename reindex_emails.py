@@ -4,7 +4,7 @@ import pathlib
 from dotenv import load_dotenv
 import psycopg2
 
-from embedding_service import index_email_chunk
+from embedding_service_e5 import index_email_chunk
 from email_text_processing import build_email_chunks
 
 # env

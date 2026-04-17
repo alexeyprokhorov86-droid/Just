@@ -34,7 +34,7 @@ ROUTERAI_BASE_URL = os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1")
 
 # Импорт векторного поиска
 try:
-    from embedding_service import vector_search, vector_search_weighted, index_telegram_message
+    from embedding_service_e5 import vector_search, vector_search_weighted, index_telegram_message
     VECTOR_SEARCH_ENABLED = True
     logger.info("Векторный поиск включен")
 except ImportError:
@@ -713,7 +713,7 @@ def _group_messages(messages: list, window_minutes: int = 3) -> list:
 
 def search_knowledge(query: str, limit: int = 30) -> list:
     """Поиск по базе знаний: km_facts, km_decisions, km_tasks, km_policies."""
-    from embedding_service import create_query_embedding
+    from embedding_service_e5 import create_query_embedding
     query_embedding = create_query_embedding(query)
     emb_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
     

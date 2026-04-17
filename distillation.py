@@ -9,7 +9,7 @@ import os
 import time
 import requests
 from dotenv import load_dotenv
-from embedding_service import create_embedding
+from embedding_service_e5 import create_embedding
 
 load_dotenv('/home/admin/telegram_logger_bot/.env')
 
