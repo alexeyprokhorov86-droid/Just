@@ -8,7 +8,7 @@
 ## Стек
 
 - **VPS**: 95.174.92.209 (Ubuntu 22.04, Cloud.ru)
-- **БД**: PostgreSQL 16 + pgvector в Docker (`knowledge_db`, сеть `kb_network`, IP 172.20.0.2)
+- **БД**: PostgreSQL 15 + pgvector 0.8.1 в Docker (image `pgvector/pgvector:pg15`, `shm_size: 2gb`, сеть `kb_network`, IP 172.20.0.2). docker-compose.yml лежит в `/home/admin/knowledge-base/` (НЕ в корне репо!)
 - **Database**: `knowledge_base`, user: `knowledge`, credentials в `.env`
 - **Metabase**: Docker (172.20.0.3, порт 3000)
 - **Matrix/Synapse**: Docker (порт 8008 внутри, 443/8448 снаружи), homeserver `matrix.frumelad.ru`
@@ -16,26 +16,43 @@
 - **Прокси**: Amsterdam SOCKS5 (порт 1080), Helsinki SOCKS5 (порт 1081)
 - **HTTP-прокси**: Privoxy на порту 8118 (проксирует через SOCKS5 1080)
 - **Python**: основной язык, все скрипты в этой директории
-- **AI**: GPT-4.1-mini через RouterAI (prompt caching ~89%)
+- **AI модели (RouterAI)**:
+  - Answerer: `openai/gpt-4.1` (default), escalation на `anthropic/claude-opus-4.7` если evaluator говорит "слабо"
+  - Router: `openai/gpt-4.1` с 20 few-shot примерами + 3 retry
+  - Text-to-SQL (custom_sql): `anthropic/claude-opus-4.7`
+  - Embeddings: `Qwen/Qwen3-Embedding-0.6B` (1024-dim, HNSW `idx_sc_embedding_v2`)
+  - Reranker: `Qwen/Qwen3-Reranker-0.6B` (native Causal LM API, batch_size=1)
+  - Флаги в `.env`: `USE_EMBEDDING_V2=true`, `USE_RERANKER=true`
 
 ## Структура кода
 
 ```
-~/telegram_logger_bot/     ← этот репозиторий (origin: Just.git на GitHub)
-├── bot.py                 — основной Telegram бот (RAG-агент)
-├── rag_agent.py           — RAG pipeline (роутер, retrieval, ответы)
-├── company_context.py     — контекст компании для AI-промптов
-├── sync_1c_full.py        — синхронизация данных из 1С OData
-├── run_sync.sh            — обёртка для cron-запуска sync
-├── build_source_chunks.py — чанкинг документов + embeddings
-├── distill_*.py           — дистилляция km_facts/decisions/tasks/policies
-├── matrix_auto_invite.py  — приглашение сотрудников в Matrix
-├── matrix_listener.py     — ingestion Matrix → source_documents
-├── email_sync.py          — синхронизация 81 почтового ящика
-├── nutrition_bot.py        — бот для запроса КБЖУ данных
-├── bom_*.py               — BOM Exploder (v2, версионирование)
-├── .env                   — ВСЕ credentials (НЕ коммитить!)
-└── docker-compose.yml     — конфиг Docker (PostgreSQL + Metabase)
+~/telegram_logger_bot/        ← этот репозиторий (origin: Just.git на GitHub)
+├── bot.py                    — основной Telegram бот (RAG-агент, /rooms, element_reminder)
+├── rag_agent.py              — RAG pipeline (Router + 6 tools + search_unified + evaluator + escalation)
+├── chunkers/
+│   ├── embedder.py           — Qwen3-Embedding-0.6B (embed_query_v2, embed_document_v2)
+│   ├── reranker.py           — Qwen3-Reranker-0.6B (native Causal LM)
+│   └── ...
+├── embedding_service_e5.py   — LEGACY e5-base (только для km_* поиска)
+├── tests/
+│   ├── check_embedding_consistency.py — Qwen3 doc↔query smoke-тест
+│   └── ab_compare_retrieval.py        — 10 вопросов, сравнение веток
+├── company_context.py        — контекст компании для AI-промптов
+├── sync_1c_full.py           — синхронизация данных из 1С OData
+├── synthesize_1c_facts.py    — ежедневный cron → km-like факты в source_chunks
+├── build_source_chunks.py    — чанкинг документов + Qwen3 embeddings
+├── distillation.py           — дистилляция km_facts/decisions/tasks/policies (e5 legacy)
+├── matrix_auto_invite.py     — приглашение сотрудников в Matrix
+├── matrix_listener.py        — ingestion Matrix → source_documents
+├── email_sync.py             — синхронизация 81 почтового ящика
+├── nutrition_bot.py          — бот для запроса КБЖУ данных
+├── bom_*.py                  — BOM Exploder (v2, версионирование)
+├── notifications.py          — /notify, /notify_status, /notify_remind
+├── report_digest_agent.py    — парсер ночных отчётов → auto_fix триггеры
+├── auto_fix.sh, auto_agent_cron.py — автономный Claude-агент self-healing
+├── .env                      — ВСЕ credentials (НЕ коммитить!)
+└── ... (docker-compose.yml живёт в /home/admin/knowledge-base/, не здесь)
 ```
 
 ## Критические правила
@@ -53,9 +70,9 @@
 ## Ключевые таблицы БД
 
 ### Источники данных
-- `source_documents` (256k+) — все документы (telegram, email, matrix)
-- `source_chunks` (11.5k) — чанки с embeddings (HNSW индексы)
-- `embeddings` (469k, legacy) — старые embeddings
+- `source_documents` (~298k) — все документы (telegram, email, matrix, 1с, + новые kind: `rag_answer`, `synthesized_1c`)
+- `source_chunks` (~293k) — чанки, embedding v2 (Qwen3 1024-dim) + HNSW `idx_sc_embedding_v2`
+- `embeddings` (469k, legacy) — старые e5 embeddings для telegram_messages/email_messages
 
 ### Knowledge Management (km_*)
 - `km_facts` (~42k), `km_decisions` (~6.3k), `km_tasks` (~8k), `km_policies` (~2.3k)
@@ -69,9 +86,10 @@
 - `c1_bank_balances` (3 счёта Фрумелад/НФ)
 - `nomenclature` (7,774 записи, вес: ВесЧислитель/ВесЗнаменатель в кг)
 
-### Materialized views (mart_*)
-- `mart_sales` — обновляется каждые 10 мин
-- `mart_customer_orders`, `v_plan_fact_weekly`
+### Materialized views (mart_*) — обновляются каждые 10 мин через cron REFRESH
+- `mart_sales`, `mart_purchases`, `mart_production`, `mart_customer_orders`, `mart_supplier_orders`
+- Используются в Router-driven analytics tools (purchases_by_nomenclature, sales_by_nomenclature, production_by_nomenclature, stock_balance, top_* и т.д.)
+- Views: `v_plan_fact_weekly`, `v_consumption_vs_purchases_monthly`, `v_sales_adjusted`, `v_current_staff`
 
 ### Прочее
 - `bom_expanded` (3,835 строк), `bom_calculations`
@@ -109,12 +127,24 @@ sudo systemctl restart matrix-listener  # Matrix ingestion
 git add -A && git commit -m "описание" && git push
 ```
 
-## Текущие приоритеты (апрель 2026)
+## RAG архитектура (после TASK_rag_quality_v2, апрель 2026)
 
-1. **Фаза 2** — переключение RAG на source_chunks (search_source_chunks в rag_agent.py)
-2. **Фаза 2.5** — смена embedding модели на Qwen3-Embedding-0.6B + reranker
-3. **Хвосты Фазы 6** — cron для matrix_auto_invite.py, iOS ссылка в /element
+1. **Router** (`route_query`, gpt-4.1, 20 few-shot + retry x3) → plan со steps (CHATS/EMAIL/1С_ANALYTICS/1С_SEARCH/WEB/KNOWLEDGE) + entities (clients/suppliers/products/warehouses) + period.
+2. **Tools** (`search_1c_analytics` / `search_1c_data` / `search_telegram_chats` / `search_emails` / `search_unified` для KNOWLEDGE). analytics_type: top_clients/top_products/top_suppliers, sales_summary/purchase_summary/production_summary, *_by_nomenclature, stock_balance, plan_vs_fact, custom_sql.
+3. **search_unified** (при USE_EMBEDDING_V2=true): объединяет km_* (e5) + source_chunks (Qwen3) → dedup → Qwen3-Reranker → top-30.
+4. **Evaluator (pre-answer)** — если evidence мало, retry поиск с расширенными chats/keywords.
+5. **Answerer** (gpt-4.1) — generate с ссылками [n].
+6. **Answer evaluator (post-answer)** — если ответ слабый → **escalation на Claude Opus 4.7**.
+7. **Fixation** — удачные ответы с 1С-источником → source_documents(source_kind='rag_answer') + source_chunks. Повторные похожие вопросы ретривятся мгновенно.
+8. **Reply-chain** — `message.reply_to_message.from_user.is_bot` → prev Q/A из chat_data → передаётся в process_rag_query как prev_context → встраивается в prompt Answerer'а.
+
+## Приоритеты (апрель-май 2026)
+
+1. ✅ **TASK_rag_quality_v2** — Router v2, Evaluator+Escalation, Text-to-SQL, km_fixation, Reply-chain, Periodic Synthesis (Фазы 1-6 готовы 2026-04-17).
+2. **TASK_rules_manage.md** — поиск и деактивация правил фильтрации из бота
+3. Хвосты: matrix_auto_invite.py в cron (✅ уже сделано), iOS ссылка в /element
 4. Мелкие задачи: --invite-rooms прогнать, sync_bank_balances проверить
+5. `v_plan_fact_weekly` в synthesize_1c_facts.py — починить 5-vs-6 колонок
 
 ## Полезные команды
 
@@ -185,21 +215,14 @@ ls -t .claude/sessions/ | head -3 | xargs -I {} cat .claude/sessions/{}
 ## Текущие задачи (обновлять вручную)
 
 Файлы задач в корне репозитория:
-- `TASK_rules_manage.md` — реализация /rules_find и /rules_off в боте
-- `TASK_NOTIFICATIONS.md` — уведомления
-- `TASK_autonomous_agent.md` — автономный Claude-агент (✅ реализовано 2026-04-16)
-- `TASK_qwen_consistency.md` — дисциплина instruction-aware Qwen3 перед Фазой 2
-
-### Очередь задач (апрель 2026):
-1. **TASK_qwen_consistency.md** — изоляция legacy e5, smoke-тест, pre-switch checklist (BLOCKER для Фазы 2)
-2. **RAG Фаза 2** — переключение на source_chunks.embedding_v2 (после backfill ~17.04 17:00 + Qwen consistency)
-3. **TASK_rules_manage.md** — поиск и деактивация правил фильтрации из бота
-4. **Qwen3-Reranker-0.6B** — локальный reranker
-5. **Periodic Synthesis для 1С** — автосуммирование продаж/закупок/производства в km_facts
+- `TASK_autonomous_agent.md` — автономный Claude-агент (✅ 2026-04-16)
+- `TASK_qwen_consistency.md` — дисциплина instruction-aware Qwen3 (✅ 2026-04-17)
+- `TASK_rag_quality_v2.md` — Router v2 + Evaluator + Text-to-SQL + km-fixation + Reply-chain (✅ Фазы 1-6 2026-04-17)
+- `TASK_rules_manage.md` — ⚠️ файл не существует, но фича `/rules_find`/`/rules_off` уже в bot.py
 
 ### Backlog:
 - Дедупликация km_facts (embedding similarity в review_knowledge.py)
 - Бот в Element X (Matrix-транспорт для /search, /analysis)
-- matrix_auto_invite.py в cron
 - sync_bank_balances — проверить деплой
 - .well-known для frumelad.ru
+- Обновить `top_*` analytics tools — использовать флаг fresh данных (v_sales_adjusted для возвратов)
