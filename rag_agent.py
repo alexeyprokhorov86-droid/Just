@@ -2997,7 +2997,7 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
         prompt = f"""{company_profile}
 
 Ты — RAG-агент компании Фрумелад. Отвечай на русском.
-
+{(chat_context + chr(10) + chr(10)) if chat_context else ''}
 ВОПРОС: {question}
 
 ДОКАЗАТЕЛЬСТВА (evidence):
@@ -3512,9 +3512,11 @@ def rerank_results(question: str, results: list, top_k: int = 10) -> list:
 # ОСНОВНОЙ ReAct ЦИКЛ
 # =============================================================================
 
-async def process_rag_query(question, chat_context="", user_info: dict = None):
+async def process_rag_query(question, chat_context="", user_info: dict = None,
+                              prev_context: dict = None):
     """
     ReAct цикл обработки RAG-запроса:
+    0. Если prev_context (reply-chain) — встраиваем предыдущий Q/A в chat_context
     1. Smart Router (выбор чатов + план)
     2. Поиск по источникам
     3. Evaluator (достаточно ли?)
@@ -3526,6 +3528,21 @@ async def process_rag_query(question, chat_context="", user_info: dict = None):
     start_time = time.time()
     if not user_info:
         user_info = {}
+
+    # === Шаг 0: Reply-chain контекст ===
+    # Если пользователь реплайнул на ответ бота, prev_context содержит
+    # предыдущий Q/A. Встраиваем в chat_context для Router'а и в prompt Answerer'а.
+    if prev_context and isinstance(prev_context, dict):
+        prev_q = str(prev_context.get("question") or "").strip()[:500]
+        prev_a = str(prev_context.get("answer") or "").strip()[:1200]
+        if prev_q and prev_a:
+            chat_context = (
+                (chat_context + "\n\n" if chat_context else "")
+                + f"[FOLLOW-UP CONTEXT]\nПредыдущий вопрос: {prev_q}\n"
+                + f"Предыдущий ответ бота: {prev_a}\n"
+                + "Текущий вопрос — уточнение/продолжение темы. Используй этот контекст.\n[/FOLLOW-UP CONTEXT]"
+            )
+            logger.info(f"Follow-up chain: prev_q='{prev_q[:80]}'")
 
     # === Шаг 1: Smart Router ===
     plan = route_query(question, chat_context)

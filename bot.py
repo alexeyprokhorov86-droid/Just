@@ -2368,15 +2368,33 @@ async def handle_private_rag(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await context.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     try:
-        # RAG агент ищет по ВСЕЙ базе данных (без контекста конкретного чата)
+        # Reply-chain: если пользователь реплайнул на ответ бота — подхватываем
+        # предыдущий Q/A из chat_data (PTB).
+        prev_context = None
+        if message.reply_to_message and message.reply_to_message.from_user \
+                and message.reply_to_message.from_user.is_bot:
+            replied_text = (message.reply_to_message.text or "")[:600]
+            history = context.chat_data.get("rag_history", [])
+            for h in reversed(history):
+                if h.get("answer", "")[:300] == replied_text[:300] \
+                        or replied_text.startswith(h.get("answer", "")[:200]):
+                    prev_context = {"question": h["question"], "answer": h["answer"]}
+                    logger.info(f"Reply-chain matched prev Q: '{prev_context['question'][:60]}'")
+                    break
+
         response = await process_rag_query(question, "", user_info={
             "user_id": message.from_user.id,
             "username": message.from_user.username,
             "first_name": message.from_user.first_name,
             "chat_id": message.chat.id,
             "chat_type": "private",
-        })
-        
+        }, prev_context=prev_context)
+
+        # Сохраняем Q/A в историю для будущих reply
+        hist = context.chat_data.setdefault("rag_history", [])
+        hist.append({"question": question, "answer": response})
+        context.chat_data["rag_history"] = hist[-10:]  # последние 10
+
         # Отправляем ответ
         if len(response) > 4000:
             parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
@@ -2384,9 +2402,9 @@ async def handle_private_rag(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await message.reply_text(part)
         else:
             await message.reply_text(response)
-        
-        logger.info(f"RAG ответ в личку: {len(response)} символов")
-        
+
+        logger.info(f"RAG ответ в личку: {len(response)} символов (follow-up={prev_context is not None})")
+
     except Exception as e:
         logger.error(f"Ошибка RAG агента в личном чате: {e}")
         await message.reply_text("Произошла ошибка при обработке запроса. Попробуйте позже.")
@@ -2415,26 +2433,39 @@ async def handle_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
     try:
+        # Reply-chain (как в личке)
+        prev_context = None
+        if message.reply_to_message and message.reply_to_message.from_user \
+                and message.reply_to_message.from_user.is_bot:
+            replied_text = (message.reply_to_message.text or "")[:600]
+            history = context.chat_data.get("rag_history", [])
+            for h in reversed(history):
+                if h.get("answer", "")[:300] == replied_text[:300] \
+                        or replied_text.startswith(h.get("answer", "")[:200]):
+                    prev_context = {"question": h["question"], "answer": h["answer"]}
+                    logger.info(f"Reply-chain (mention) matched prev Q: '{prev_context['question'][:60]}'")
+                    break
 
-        # Обрабатываем RAG запрос
         response = await process_rag_query(question, "", user_info={
             "user_id": message.from_user.id,
             "username": message.from_user.username,
             "first_name": message.from_user.first_name,
             "chat_id": message.chat.id,
             "chat_type": message.chat.type,
-        })
-        
-        # Отправляем ответ
+        }, prev_context=prev_context)
+
+        hist = context.chat_data.setdefault("rag_history", [])
+        hist.append({"question": question, "answer": response})
+        context.chat_data["rag_history"] = hist[-10:]
+
         if len(response) > 4000:
-            # Разбиваем на части
             parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
             for part in parts:
                 await message.reply_text(part)
         else:
             await message.reply_text(response)
-        
-        logger.info(f"RAG ответ отправлен: {len(response)} символов")
+
+        logger.info(f"RAG ответ отправлен: {len(response)} символов (follow-up={prev_context is not None})")
         
     except Exception as e:
         logger.error(f"Ошибка RAG агента: {e}")
