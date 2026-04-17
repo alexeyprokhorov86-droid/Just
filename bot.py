@@ -4355,21 +4355,22 @@ def main():
         nutrition_message_handler
     ), group=1)
     
-    # RAG агент в ЛИЧНЫХ сообщениях (без @упоминания)
+    # RAG агент в ЛИЧНЫХ сообщениях (в т.ч. reply — для follow-up цепочек)
     application.add_handler(MessageHandler(
-        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.REPLY,
+        filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
         handle_private_rag
     ))
 
-    # RAG агент — обработка упоминаний бота (ПЕРЕД log_message!)
+    # RAG агент — обработка упоминаний бота в группах (ПЕРЕД log_message!)
     application.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(r'@\w+'),
         handle_mention
     ))
-    
-    # Обработчик ответов с ролями (в группах и личных сообщениях)
+
+    # Обработчик ответов с ролями — ТОЛЬКО в групповых чатах
+    # (в личке reply обрабатывается через handle_private_rag для follow-up)
     application.add_handler(MessageHandler(
-        filters.TEXT & filters.REPLY & ~filters.COMMAND,
+        filters.TEXT & filters.REPLY & ~filters.COMMAND & filters.ChatType.GROUPS,
         handle_role_assignment
     ))
     
