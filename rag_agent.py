@@ -1631,10 +1631,201 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                         })
                 except Exception as e:
                     logger.debug(f"Ошибка аналитики производства: {e}")
-    
+
+            # ---------- Новые SQL-tools (keyword-driven) ----------
+
+            if analytics_type == "purchases_by_nomenclature":
+                try:
+                    q = """
+                        SELECT nomenclature_name,
+                               SUM(quantity) AS qty,
+                               SUM(sum_total) AS rub,
+                               MIN(doc_date) AS first_date,
+                               MAX(doc_date) AS last_date,
+                               COUNT(DISTINCT doc_number) AS docs
+                        FROM mart_purchases
+                        WHERE 1=1
+                    """
+                    params = []
+                    if period_date:
+                        q += " AND doc_date >= %s"; params.append(period_date)
+                    if period_end:
+                        q += " AND doc_date <= %s"; params.append(period_end)
+                    for kw in (clean_keywords(keywords) or [])[:3]:
+                        q += " AND nomenclature_name ILIKE %s"; params.append(f"%{kw}%")
+                    q += " GROUP BY nomenclature_name ORDER BY qty DESC NULLS LAST LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
+
+                    for row in cur.fetchall():
+                        nom, qty, rub, fd, ld, docs = row
+                        qty_s = f"{qty:.0f}" if qty else "0"
+                        rub_s = f"{rub:,.0f}".replace(",", " ") if rub else "0"
+                        content = (
+                            f"Закуплено '{nom}': {qty_s} ед., {rub_s} руб., "
+                            f"{docs} документ(ов), период {fd}..{ld}"
+                        )
+                        results.append({
+                            "source": "1С: ЗАКУПКИ ПО НОМЕНКЛАТУРЕ",
+                            "date": ld.strftime("%d.%m.%Y") if ld else "",
+                            "content": content,
+                            "type": "analytics_purchases_by_nomenclature",
+                        })
+                except Exception as e:
+                    logger.debug(f"purchases_by_nomenclature: {e}")
+
+            if analytics_type == "sales_by_nomenclature":
+                try:
+                    q = """
+                        SELECT nomenclature_name,
+                               SUM(quantity) AS qty,
+                               SUM(sum_with_vat) AS rub,
+                               MIN(doc_date) AS first_date,
+                               MAX(doc_date) AS last_date,
+                               COUNT(DISTINCT doc_number) AS docs
+                        FROM mart_sales
+                        WHERE doc_type = 'Реализация'
+                    """
+                    params = []
+                    if period_date:
+                        q += " AND doc_date >= %s"; params.append(period_date)
+                    if period_end:
+                        q += " AND doc_date <= %s"; params.append(period_end)
+                    for kw in (clean_keywords(keywords) or [])[:3]:
+                        q += " AND nomenclature_name ILIKE %s"; params.append(f"%{kw}%")
+                    q += " GROUP BY nomenclature_name ORDER BY rub DESC NULLS LAST LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
+
+                    for row in cur.fetchall():
+                        nom, qty, rub, fd, ld, docs = row
+                        qty_s = f"{qty:.0f}" if qty else "0"
+                        rub_s = f"{rub:,.0f}".replace(",", " ") if rub else "0"
+                        content = (
+                            f"Продано '{nom}': {qty_s} ед., выручка {rub_s} руб., "
+                            f"{docs} реализаций, период {fd}..{ld}"
+                        )
+                        results.append({
+                            "source": "1С: ПРОДАЖИ ПО НОМЕНКЛАТУРЕ",
+                            "date": ld.strftime("%d.%m.%Y") if ld else "",
+                            "content": content,
+                            "type": "analytics_sales_by_nomenclature",
+                        })
+                except Exception as e:
+                    logger.debug(f"sales_by_nomenclature: {e}")
+
+            if analytics_type == "stock_balance":
+                try:
+                    q = """
+                        SELECT n.name AS nom, w.name AS warehouse,
+                               SUM(sb.quantity) AS qty, SUM(sb.in_shipment) AS in_ship
+                        FROM c1_stock_balance sb
+                        JOIN nomenclature n ON n.id::text = sb.nomenclature_key
+                        LEFT JOIN c1_warehouses w ON w.ref_key = sb.warehouse_key
+                        WHERE sb.quantity > 0
+                    """
+                    params = []
+                    for kw in (clean_keywords(keywords) or [])[:3]:
+                        q += " AND n.name ILIKE %s"; params.append(f"%{kw}%")
+                    q += " GROUP BY n.name, w.name ORDER BY qty DESC LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
+
+                    for row in cur.fetchall():
+                        nom, wh, qty, in_ship = row
+                        qty_s = f"{qty:.3f}".rstrip("0").rstrip(".") if qty else "0"
+                        ship_s = f" (в пути: {in_ship:.0f})" if in_ship and in_ship > 0 else ""
+                        content = (
+                            f"Остаток '{nom}' на складе '{wh or '?'}': {qty_s} ед.{ship_s}"
+                        )
+                        results.append({
+                            "source": "1С: ОСТАТКИ НА СКЛАДЕ",
+                            "date": "",
+                            "content": content,
+                            "type": "analytics_stock_balance",
+                        })
+                except Exception as e:
+                    logger.debug(f"stock_balance: {e}")
+
+            if analytics_type == "production_by_nomenclature":
+                try:
+                    q = """
+                        SELECT n.name AS nom,
+                               SUM(mp.quantity) AS qty,
+                               SUM(mp.sum_total) AS rub,
+                               MIN(mp.doc_date) AS first_date,
+                               MAX(mp.doc_date) AS last_date,
+                               COUNT(DISTINCT mp.doc_number) AS docs
+                        FROM mart_production mp
+                        LEFT JOIN nomenclature n ON n.id::text = mp.nomenclature_key
+                        WHERE 1=1
+                    """
+                    params = []
+                    if period_date:
+                        q += " AND mp.doc_date >= %s"; params.append(period_date)
+                    if period_end:
+                        q += " AND mp.doc_date <= %s"; params.append(period_end)
+                    for kw in (clean_keywords(keywords) or [])[:3]:
+                        q += " AND n.name ILIKE %s"; params.append(f"%{kw}%")
+                    q += " GROUP BY n.name ORDER BY qty DESC NULLS LAST LIMIT %s"
+                    params.append(limit)
+                    cur.execute(q, params)
+
+                    for row in cur.fetchall():
+                        nom, qty, rub, fd, ld, docs = row
+                        qty_s = f"{qty:.0f}" if qty else "0"
+                        rub_s = f"{rub:,.0f}".replace(",", " ") if rub else "0"
+                        content = (
+                            f"Произведено '{nom or '?'}': {qty_s} ед., сумма {rub_s} руб., "
+                            f"{docs} документ(ов), период {fd}..{ld}"
+                        )
+                        results.append({
+                            "source": "1С: ПРОИЗВОДСТВО ПО НОМЕНКЛАТУРЕ",
+                            "date": ld.strftime("%d.%m.%Y") if ld else "",
+                            "content": content,
+                            "type": "analytics_production_by_nomenclature",
+                        })
+                except Exception as e:
+                    logger.debug(f"production_by_nomenclature: {e}")
+
+            if analytics_type == "plan_vs_fact":
+                try:
+                    q = """
+                        SELECT "Неделя", "Заказы (план)", "Ордера (факт)",
+                               "Передачи ФМ", "Отклонение", "Выполнение %"
+                        FROM v_plan_fact_weekly
+                        WHERE 1=1
+                    """
+                    params = []
+                    if period_date:
+                        q += ' AND "Неделя" >= %s'; params.append(period_date)
+                    if period_end:
+                        q += ' AND "Неделя" <= %s'; params.append(period_end)
+                    q += ' ORDER BY "Неделя" DESC LIMIT %s'
+                    params.append(limit)
+                    cur.execute(q, params)
+
+                    for row in cur.fetchall():
+                        week, plan, fact, transfers, dev, pct = row
+                        plan_s = f"{plan:,.0f}".replace(",", " ") if plan else "0"
+                        fact_s = f"{fact:,.0f}".replace(",", " ") if fact else "0"
+                        pct_s = f"{pct:.1f}%" if pct is not None else "?"
+                        content = (
+                            f"Неделя {week}: план {plan_s}, факт {fact_s}, "
+                            f"передачи ФМ {transfers}, отклонение {dev}, выполнение {pct_s}"
+                        )
+                        results.append({
+                            "source": "1С: ПЛАН-ФАКТ ПО НЕДЕЛЯМ",
+                            "date": week.strftime("%d.%m.%Y") if week else "",
+                            "content": content,
+                            "type": "analytics_plan_vs_fact",
+                        })
+                except Exception as e:
+                    logger.debug(f"plan_vs_fact: {e}")
+
     finally:
         conn.close()
-    
+
     logger.info(f"Аналитика 1С [{analytics_type}]: {len(results)} результатов")
     return results
 
@@ -2398,15 +2589,25 @@ def route_query(question, chat_context=""):
 {chat_list}
 
 ИСТОЧНИКИ ДАННЫХ:
-- 1С_ANALYTICS: агрегированные данные (топ клиентов, суммы продаж, рейтинги товаров, объёмы производства). Для ИТОГОВ, СУММ, РЕЙТИНГОВ.
-- 1С_SEARCH: поиск конкретных документов (заказ, цена товара, закупка). Для КОНКРЕТНЫХ записей.
+- 1С_ANALYTICS: агрегированные SQL-запросы к 1С (суммы, количества, остатки, план/факт). Для вопросов "сколько/объём/выручка/остаток/итого/топ ...".
+- 1С_SEARCH: поиск конкретных документов в 1С (отдельный заказ, цена, закупочный счёт). Для КОНКРЕТНЫХ записей по ключевым словам.
 - CHATS: переписка сотрудников в Telegram.
 - EMAIL: деловая переписка по почте.
 - WEB: интернет-поиск (только внешняя информация).
 - KNOWLEDGE: база знаний компании (факты, решения, задачи, политики). Для вопросов про правила, процессы, решения, кто за что отвечает, что было решено/сделано.
 
-ТИПЫ АНАЛИТИКИ (для 1С_ANALYTICS):
-top_clients, top_products, sales_summary, top_suppliers, production_summary, purchase_summary
+ТИПЫ АНАЛИТИКИ (analytics_type для 1С_ANALYTICS):
+- top_clients / sales_summary — топ клиентов по выручке за период
+- top_products — топ продукции по выручке
+- top_suppliers / purchase_summary — топ поставщиков по суммам
+- production_summary — сводка производства (без фильтра)
+- purchases_by_nomenclature — СКОЛЬКО куплено номенклатуры X за период (mart_purchases; keyword фильтр по названию номенклатуры). Для "сколько муки/сахара/упаковки купили в феврале".
+- sales_by_nomenclature — СКОЛЬКО продано номенклатуры X за период (mart_sales). Для "сколько Медовика продали в марте".
+- stock_balance — текущие ОСТАТКИ номенклатуры X на складах. Для "остатки муки", "сколько сахара на складе".
+- production_by_nomenclature — СКОЛЬКО произведено номенклатуры X за период (mart_production). Для "сколько тортов Медовик произвели в феврале".
+- plan_vs_fact — недельный план/факт (v_plan_fact_weekly). Для "план/факт за март", "выполнение плана".
+
+ВАЖНО: если в вопросе есть конкретное название товара/сырья И слова количества/суммы/остатка — используй *_by_nomenclature или stock_balance с keywords = название номенклатуры.
 
 ВОПРОС: {question}
 
@@ -2416,7 +2617,10 @@ top_clients, top_products, sales_summary, top_suppliers, production_summary, pur
 3. Какие ключевые слова использовать для поиска
 
 РАССУЖДАЙ: например "НДС" → бухгалтерия → чаты с "бухгалтерия" и "априори" в названии.
-"Закупки сахара" → чаты "закупки" + 1С закупочные цены.
+"Сколько муки купили в феврале 2026?" → 1С_ANALYTICS с analytics_type=purchases_by_nomenclature, keywords="мука", period=february. Без чатов.
+"Остатки сахара на складе" → 1С_ANALYTICS с analytics_type=stock_balance, keywords="сахар".
+"Сколько Медовика продали в марте?" → 1С_ANALYTICS sales_by_nomenclature, keywords="медовик", period=march.
+"Закупки сахара" (без "сколько") → 1С_SEARCH с keywords="сахар" + чат "закупки".
 
 Верни ТОЛЬКО JSON без markdown:
 {{"query_type": "analytics|search|lookup|chat_search|web|mixed",
