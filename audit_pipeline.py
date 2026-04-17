@@ -337,6 +337,24 @@ async def fix_tg_media(conn, items):
             file_data, filename, source = await download_file(item, s3, bot)
             if not file_data:
                 errors += 1
+                # Помечаем недоступные файлы чтобы не пытаться снова
+                try:
+                    cur = conn.cursor()
+                    updates = []
+                    if not item['has_analysis']:
+                        updates.append("media_analysis = '[файл недоступен]'")
+                    if not item['has_content']:
+                        updates.append("content_text = '[файл недоступен]'")
+                    if updates:
+                        cur.execute(
+                            f"UPDATE {item['table']} SET {', '.join(updates)} WHERE message_id = %s",
+                            (item['message_id'],)
+                        )
+                        conn.commit()
+                    cur.close()
+                except Exception as mark_err:
+                    logger.warning(f"  Не удалось пометить недоступный файл {item['table']} msg={item['message_id']}: {mark_err}")
+                    conn.rollback()
                 continue
             
             logger.info(f"  [{source}] {item['table']} msg={item['message_id']} ({filename})")
