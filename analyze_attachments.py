@@ -461,7 +461,7 @@ def process_attachment(s3_client, conn, att, extract_only=False):
 
 
 def update_attachment_status(conn, att_id, status, content_text=None, analysis_text=None, model=None, error=None):
-    """Обновить статус вложения в БД."""
+    """Обновить статус вложения в БД + canonicalize при успехе."""
     cur = conn.cursor()
     cur.execute("""
         UPDATE email_attachments SET
@@ -473,6 +473,72 @@ def update_attachment_status(conn, att_id, status, content_text=None, analysis_t
             analysis_error = %s
         WHERE id = %s
     """, (status, content_text, analysis_text, model, error, att_id))
+    conn.commit()
+    if status == 'done':
+        try:
+            insert_email_attachment_to_canonical(conn, att_id)
+        except Exception as e:
+            logger.warning(f"  canonical insert failed for att_id={att_id}: {e}")
+
+
+def insert_email_attachment_to_canonical(conn, att_id: int):
+    """INSERT email_attachment в source_documents (idempotent)."""
+    import json
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT a.id, a.message_id, a.filename, a.content_type, a.size_bytes,
+               a.storage_path, a.analysis_text, a.content_text, a.analysis_model,
+               em.received_at, em.from_address,
+               mb.email AS mailbox_email,
+               sd.id AS parent_source_doc_id
+        FROM email_attachments a
+        JOIN email_messages em ON em.id = a.message_id
+        LEFT JOIN monitored_mailboxes mb ON mb.id = em.mailbox_id
+        LEFT JOIN source_documents sd ON sd.source_kind='email_message'
+                                     AND sd.source_ref = 'email:' || em.id
+        WHERE a.id = %s
+    """, (att_id,))
+    row = cur.fetchone()
+    if not row:
+        return
+    (aid, em_id, filename, ctype, size_b, storage, analysis_t, content_t,
+     model, received_at, from_addr, mailbox_email, parent_sd_id) = row
+
+    parts = []
+    if analysis_t:
+        parts.append(f"[Анализ файла: {filename}]\n{analysis_t}")
+    if content_t:
+        parts.append(f"---ПОЛНЫЙ ТЕКСТ---\n\n{content_t}")
+    body = '\n\n'.join(parts).strip()
+    if not body or len(body) < 25:
+        return
+
+    if ctype and ctype.startswith('image/'): extr = 'vision'
+    elif ctype == 'application/pdf': extr = 'pdf_text'
+    else: extr = 'extract'
+    meta = {
+        'parent_email_id': em_id,
+        'parent_source_doc_id': parent_sd_id,
+        'content_type': ctype or '',
+        'size_bytes': size_b,
+        'storage_path': storage,
+        'analysis_model': model,
+        'extraction_method': extr,
+        'has_extracted_text': bool(content_t),
+        'has_llm_summary': bool(analysis_t),
+    }
+    cur.execute("""
+        INSERT INTO source_documents
+            (source_kind, source_ref, title, body_text, doc_date,
+             author_name, author_ref, channel_ref, channel_name,
+             language, is_deleted, confidence, meta)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (source_kind, source_ref) DO NOTHING
+    """, (
+        'email_attachment', f'email_att:{aid}', filename, body, received_at,
+        from_addr, from_addr, mailbox_email, mailbox_email,
+        'ru', False, 1.0, json.dumps(meta)
+    ))
     conn.commit()
 
 

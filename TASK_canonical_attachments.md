@@ -1,14 +1,32 @@
 # TASK: Canonical layer для вложений и 1С-событий
 
-Статус: в работе. Создан 2026-04-19.
+Статус: в работе. Создан 2026-04-19, обновлён 2026-04-19 (после #1).
 
 ## Контекст
 
 `source_documents` уже работает как canonical layer для текстов мессенджеров (email/telegram/matrix). Но:
-- Email-вложения с LLM-анализом — НЕ в canonical, RAG их не видит
-- TG-вложения частично попадали (был баг — теряли media_analysis или message_text)
+- ✅ ~~Email-вложения с LLM-анализом — НЕ в canonical, RAG их не видит~~ — закрыто #1
+- ✅ ~~TG-вложения частично попадали (был баг — теряли media_analysis или message_text)~~ — закрыто #4
 - Matrix-медиа вообще не индексируется
 - 1С — только 11 синтезированных агрегатов, нет точечных событий
+
+## Сводка прогресса 2026-04-19
+| Пункт | Статус | Детали |
+|---|---|---|
+| #4 TG body composition | ✅ | 838 docs обновлено + 2699 chunks пересозданы |
+| #1 Email attachments | ✅ backfill, ⏳ chunks | 11758 docs в canonical, ~85 мин чанкинг идёт |
+| #5 analyze_tg_media | ✅ запущен | media_analyzer.py + analyze_tg_media_backlog.py, 2261 backlog в фоне (~7h, ~$100-140) |
+| #2 c1_event | ⏳ план | средний приоритет |
+| #6 Matrix media | ⏳ план | низкий |
+| #3 v_messages_unified | ⏳ план | низкий |
+
+## Найденные побочные баги (зафиксированы)
+1. ✅ `build_source_chunks.py` использовал legacy e5 вместо Qwen3 v2 → INSERT в `embedding`, не `embedding_v2`. Все чанки с момента c403107 (17.04) были невидимы для RAG. Фикс в коммите 9dfa1c7.
+2. ✅ `build_source_chunks.py` `generate_embeddings` вызывал `embed_document_v2(t)` в list-comprehension (sequential, 1.3 ch/s). Фикс на `model.embed_batch(texts)` → 35 ch/s, ~27× ускорение.
+3. ✅ `build_source_chunks.py` падал в cron с `fe_sendauth: no password supplied` — добавлен `load_dotenv()`.
+4. Открыто: 855 «осиротевших» TG-документов (source_documents указывают на удалённые tg_chat_* строки) — мини-аудит, чистить ли.
+5. Открыто: 177 411 авто-нотификаций 1С («Уведомление о не выполненных задачах») сидят в `source_documents` без чанков (не нужны для RAG, но засоряют queue в build_source_chunks). **Стоит** добавить в скрипт фильтр `WHERE meta->>'skip_reason' IS NULL OR meta->>'skip_reason' != 'auto_notification'`.
+6. Открыто: после email_reindex 17.04 у 220k email_message в source_documents нет чанков (большинство — те самые auto_notification из п.5). После фильтра реальная очередь будет ~35k.
 
 ## ✅ Пункт 4 — Фикс composition body_text для TG (СДЕЛАНО 2026-04-19)
 
@@ -33,8 +51,23 @@
 
 ---
 
-## Пункт 1 — Email-вложения в canonical (V1)
+## ✅ Пункт 1 — Email-вложения в canonical (СДЕЛАНО 2026-04-19, чанкинг идёт)
 
+**Результат**: 11 758 из 11 760 проанализированных вложений в `source_documents` (kind='email_attachment'). 2 пропущено — слишком короткий body после composition.
+
+### Что сделано
+1. ✅ **Backfill heredoc-ом** — INSERT 11758 attachments с composition `[Анализ файла: {filename}]\n{analysis_text}\n\n---ПОЛНЫЙ ТЕКСТ---\n\n{content_text}`. Метаданные: parent_email_id, parent_source_doc_id, content_type, size_bytes, storage_path, analysis_model, extraction_method, has_extracted_text, has_llm_summary.
+2. ✅ **`analyze_attachments.py`** — добавлена функция `insert_email_attachment_to_canonical(conn, att_id)`. Вызывается из `update_attachment_status` при `status='done'`. Идемпотентная (ON CONFLICT DO NOTHING). Новые вложения попадают в canonical автоматически.
+3. ✅ **`rag_agent.search_unified`** — изменений НЕ потребовалось. `search_source_chunks` ищет по всем source_kind через embedding_v2, новые `email_attachment` чанки автоматически в выдаче.
+4. ⏳ **Чанкинг** — идёт фоном, ~85 минут (35 ch/s × ~3 chunks/doc × 11758 = ~1000 секунд только для email_attachment, но в очереди всего ~60k docs).
+
+### Незакрытое (V1.1)
+- `meta.attachment_ids: [27068, 27073, 27078]` в parent email_message canonical doc — для двусторонней связи письмо↔вложения. UPDATE single batch скрипт.
+- В RAG: если найдено письмо → проверить attachment_ids → подтянуть как сопутствующие. И наоборот: найдено вложение → поднять родительское письмо.
+- `meta.sha256` для дедупа одного файла в нескольких письмах. Сейчас одинаковый PDF, отправленный в 3 письмах = 3 разных canonical-документа. Не блокирующее, но в будущем стоит дедупить в `search_unified` по хэшу.
+- Не канонизированы: 1931 `empty`, 11266 `skip_junk`, 4 `error`, 27 `skip_later` (и подобное) — это правильно.
+
+### Цель оригинальная
 **Цель**: 11 760 проанализированных email-вложений (`email_attachments WHERE analysis_status='done'`) попадают в `source_documents` как `source_kind='email_attachment'`. RAG их видит наравне с письмами.
 
 ### Схема
@@ -106,24 +139,38 @@ INSERT INTO source_documents (
 
 ## Пункт 5 — analyze_tg_media (LLM-анализ медиа в Telegram)
 
-**Цель**: 95% TG-медиа сейчас БЕЗ анализа. На примере чата «Торты Отгрузки»: 2340 медиа, 101 с media_analysis (это сводки за день, не per-photo).
+**Реальные цифры по 48 TG-чатам (2026-04-19)**:
+- 11 847 сообщений всего
+- 4 108 с медиа (35%)
+- 1 699 уже с media_analysis (41% от медиа)
+- **Backlog: 2 409 медиа без анализа**
 
-### Гибридная стратегия
-1. Бесплатный OCR (PaddleOCR / Tesseract) на каждое фото.
-2. Если есть текст (накладная, ТТН, маркировка, рукопись) → LLM-анализ через `gpt-4.1-mini` (дешевле full).
-3. Если текста нет (чистый кузов, абстракт) → пропуск.
-4. Per-photo media_analysis сохранять в `tg_chat_*.media_analysis` (та же колонка).
+Картина оптимистичнее чем казалось — большая часть медиа в активных чатах уже анализируется ботом в момент получения через `download_and_analyze_media` (bot.py:1359). Backlog — преимущественно старые сообщения (до включения этой логики) и Торты-Отгрузки (где per-photo выключен).
 
-### Cron
-- `analyze_tg_media.py --batch 100` каждый час.
-- Обрабатывает `WHERE media_file_id IS NOT NULL AND media_analysis IS NULL`.
+### Что нужно решить сначала (архитектурно)
+- **Какой пайплайн стандартизировать?** Сейчас два:
+  - `bot.py:download_and_analyze_media` — сразу при приёме сообщения (gpt-4.1, max_tokens=4500).
+  - `analyze_attachments.py` — для email-вложений из БД, batch, S3.
+- Логика анализа TG медиа уже есть, нужен только **batch processor** для backlog.
 
-### Стоимость (расчёт для 1 чата 2340 фото)
-- Full vision на всё: $200-400 backfill + ~$1-2/день поток.
-- Гибрид (OCR-фильтр + mini): $50-80 backfill + ~$0.30/день поток. Покрытие важного контента ~80%.
+### План
+1. **`analyze_tg_media_backlog.py`** — однократный скрипт по аналогии с analyze_attachments.
+   - Запрос: `SELECT message_id, message_type, storage_path, media_file_id FROM {tg_chat_*} WHERE media_file_id IS NOT NULL AND media_analysis IS NULL`
+   - Скачивание из S3 по storage_path (как в analyze_attachments).
+   - Использовать ТЕ ЖЕ функции что в bot.py: `analyze_image_with_gpt`, `analyze_pdf_with_gpt` и т.д. (вынести в отдельный модуль `media_analyzer.py` чтобы не дублировать).
+   - UPDATE tg_chat_* SET media_analysis = ..., content_text = ...
+   - Триггер обновления canonical (через canonical_helper.insert_source_document_tg).
+2. **Решение по «Торты Отгрузки»**: per-photo OCR → если есть текст (этикетка, накладная, маркировка) → LLM-анализ; иначе пропуск. Реализовать как опцию `--mode=ocr_filter`.
+3. **Cron**: после обработки backlog уже не нужен, поток покрывается bot.py. Возможно периодический check для пропущенных (раз в сутки).
 
-### Особенно для «Торты Отгрузки»
-Ежедневная сводка остаётся как есть (она дополняет, не заменяет). Per-photo нужен для точечных вопросов типа «когда последний раз отгружали Магниту?», «сколько коробок Наполеона ушло вчера?».
+### Стоимость
+- 2 409 backlog × full vision (gpt-4.1) ~ $40-80 разово.
+- Если включить «Торты Отгрузки» per-photo (~2200 фото) с OCR-фильтром: +$20-40.
+- Поток: уже покрывается bot.py, доп. cost = 0.
+
+### Что оставить как есть
+- bot.py:download_and_analyze_media — рабочий механизм, не трогаем.
+- Сводки за день в Торты-Отгрузки — оставить (они дополняют per-photo).
 
 ---
 
@@ -227,15 +274,56 @@ WHERE source_kind IN ('email_message','telegram_message','matrix_message');
 ## Приоритет внедрения
 
 1. ✅ **#4 Fix TG body_text composition** — сделано 2026-04-19
-2. **#1 Email attachments** — высокий (часто содержание накладной/счёта важнее тела письма)
-3. **#5 analyze_tg_media** — средне-высокий (включая «Торты Отгрузки» в гибридном режиме)
-4. **#2 c1_event** — средний (улучшает точечные 1С-вопросы)
+2. ✅ **#1 Email attachments** — сделано 2026-04-19 (chunks ещё генерируются)
+3. **#5 analyze_tg_media** — следующий: только 2409 backlog, $40-80
+4. **#2 c1_event** — после #5 (улучшает точечные 1С-вопросы)
 5. **#6 Matrix media** — низкий (пока не основной канал)
 6. **#3 v_messages_unified** — низкий (косметика для Metabase)
 
-## После завершения backfill_embeddings_v2 (~17:00-19:00 19.04)
+## ✅ После завершения backfill_embeddings_v2 (сделано 2026-04-19 19:00)
 
-Обязательно перед #1, #5, #6:
-1. CREATE INDEX CONCURRENTLY idx_sc_embedding_v2 ON source_chunks USING hnsw (embedding_v2 vector_cosine_ops) WITH (m=16, ef_construction=64);
-2. Раскомментировать cron build_source_chunks.
-3. Re-index 838 TG-документов из #4 (удалить старые chunks, перегенерить).
+1. ✅ CREATE INDEX CONCURRENTLY idx_sc_embedding_v2 (HNSW, 2GB)
+2. ✅ Раскомментирован cron build_source_chunks (`45 * * * *`)
+3. ✅ Re-index 838 TG-документов из #4 (2699 chunks удалены, регенерированы через Qwen3 v2)
+
+---
+
+## Followup mini-задачи (после основных #5, #2)
+
+### A. 855 «осиротевших» TG canonical-документов
+- `source_documents` ссылаются на `tg_chat_*.message_id`, которого больше нет (старые удалённые сообщения).
+- Решить: оставить как archive, пометить `is_deleted=true`, или удалить.
+- Скрипт-проверка: `SELECT id, channel_ref, source_ref FROM source_documents WHERE source_kind='telegram_message' AND meta->>'has_media'='true' AND id NOT IN (...select where parent exists...)`.
+- 30 минут работы.
+
+### ✅ B. Фильтр auto_notification в build_source_chunks (СДЕЛАНО 2026-04-19)
+- 185 393 авто-нотификаций 1С висели в queue, чанкер тратил время на их выгребание (батч 500 → 0 чанков → exit).
+- Добавлен фильтр в `get_unprocessed_docs`: `AND (sd.meta->>'skip_reason' IS NULL OR sd.meta->>'skip_reason' != 'auto_notification')`.
+- Они остаются в canonical (для архивных SQL-запросов), но в RAG векторный поиск не попадают.
+- Бонус-фикс: `MIN_DOC_LEN=25 → 30` (=MIN_CHUNK_LEN), иначе 904 коротких docs (25-29 символов) вечно висели в queue без надежды попасть в чанки.
+
+### C. Двусторонняя связь email ↔ attachments
+- В `source_documents` (email_message) добавить `meta.attachment_ids: [27068, 27073]` — список FK на email_attachment-документы.
+- Скрипт: `UPDATE source_documents sd SET meta = meta || jsonb_build_object('attachment_ids', (SELECT array_agg(att.id) FROM source_documents att WHERE att.source_kind='email_attachment' AND (att.meta->>'parent_source_doc_id')::int = sd.id))`.
+- Бонус в RAG: `search_unified` находит письмо → подтягивает все вложения как контекст; и наоборот. Реализовать в `rag_agent` post-processing.
+- 1 час работы.
+
+### D. SHA256 дедуп для одинаковых файлов в разных письмах
+- Один PDF, отправленный 3 раза = 3 канонических документа с одинаковым content_text.
+- Добавить `meta.sha256` при insert (или пост-фактум backfill через BashFile.sha256(storage_path content)).
+- В `search_unified` группировать выдачу по sha256, оставляя самый ранний.
+- 2 часа.
+
+### E. XLSX чанкинг по строкам (для V2)
+- Для email_attachment с content_type=excel: текущий чанкинг режет CSV по символам, рвутся строки. Лучше: header + N rows = 1 chunk.
+- Не блокирующее, но улучшит RAG для накладных/спецификаций.
+- 3 часа.
+
+### F. Привязка `analyze_attachments.py` к S3
+- Сейчас работает — в analyze_attachments.py через S3 client. Но нужен мониторинг: сколько `done` vs `pending` за сутки.
+- Добавить в `daily_report.py` строчку «вложения проанализировано: X done, Y pending».
+- 30 минут.
+
+### G. Coverage метрика «вложений в RAG»
+- Дашборд в Metabase: % email_message где `meta.attachment_ids` есть, и сколько из них реально в RAG.
+- 1 час.

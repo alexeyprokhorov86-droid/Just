@@ -33,7 +33,7 @@ CHUNK_SIZE = 500        # символов на чанк
 CHUNK_OVERLAP = 100     # перекрытие
 MIN_CHUNK_LEN = 30      # минимальная длина чанка
 EMBED_BATCH_SIZE = 64   # батч для эмбеддингов
-MIN_DOC_LEN = 25        # минимальная длина документа
+MIN_DOC_LEN = 30        # минимальная длина документа (= MIN_CHUNK_LEN, иначе короткие docs вечно висят в queue)
 
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', '172.20.0.2'),
@@ -121,14 +121,16 @@ def load_embedding_model():
 
 
 def generate_embeddings(model, texts: list) -> list:
-    """Генерирует Qwen3 document embeddings (1024-dim) для списка текстов."""
-    from chunkers.embedder import embed_document_v2
-    return [embed_document_v2(t) for t in texts]
+    """Генерирует Qwen3 document embeddings (1024-dim) пакетно."""
+    return model.embed_batch(texts)
 
 
 def get_unprocessed_docs(conn, batch_size=500):
     """Получает документы без чанков."""
     with conn.cursor() as cur:
+        # Исключаем auto_notification (1С шаблонные «Уведомление о не выполненных задачах»):
+        # 195k штук, шаблонный текст 30-100 символов, в RAG только зашумят выдачу.
+        # Они остаются в canonical для архивных SQL-запросов, но не индексируются.
         cur.execute("""
             SELECT sd.id, sd.body_text, sd.source_kind
             FROM source_documents sd
@@ -136,6 +138,8 @@ def get_unprocessed_docs(conn, batch_size=500):
             WHERE sc.id IS NULL
               AND sd.body_text IS NOT NULL
               AND LENGTH(sd.body_text) >= %s
+              AND (sd.meta->>'skip_reason' IS NULL
+                   OR sd.meta->>'skip_reason' != 'auto_notification')
             ORDER BY sd.id
             LIMIT %s
         """, (MIN_DOC_LEN, batch_size))

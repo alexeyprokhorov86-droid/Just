@@ -48,6 +48,36 @@
 - Коммит: build_source_chunks.py (load_dotenv + Qwen3 v2), canonical_helper.py (TG body composition), CLAUDE.md (логирование сессий), TASK_canonical_attachments.md (новый файл)
 - Дальше по TASK_canonical_attachments.md: #1 email_attachment → #5 analyze_tg_media → #2 c1_event → #6 matrix media → #3 v_messages_unified
 
+## ✅ Пункт #1 Email-вложения в canonical (20:00)
+- [20:00] Backfill heredoc'ом: 11 758 из 11 760 attachments → source_documents (kind='email_attachment'). 2 пропущено (короткий body).
+- [20:05] `analyze_attachments.py` — добавлена `insert_email_attachment_to_canonical()`, вызывается из `update_attachment_status` при status='done'. Идемпотентная.
+- [20:10] `rag_agent.search_unified` — изменений не нужно, search_source_chunks ищет по всем kind через embedding_v2.
+- [20:12] Запустил build_source_chunks --batch 0 (фон) — обнаружил 245k pending в очереди (включая 177k auto_notification 1С — спам, не надо чанковать).
+- [20:15] Найден баг: `generate_embeddings` в build_source_chunks вызывал `embed_document_v2(t)` в list-comprehension (sequential) → 1.3 ch/s. Фикс на `model.embed_batch(texts)` → 35 ch/s, ускорение 27×.
+- [20:18] Перезапустил с фиксом, но запрос `get_unprocessed_docs` (LEFT JOIN 269k×298k) висел 5 мин → kill, перезапуск с `--batch 500`.
+- [20:20] TASK_canonical_attachments.md существенно расширен:
+  - Сводная таблица прогресса
+  - 6 найденных побочных багов с фиксами
+  - Подробности по #1 (✅ сделано, V1.1 followups)
+  - Подробности по #5 с реальными цифрами (2409 backlog, $40-80)
+  - 7 follow-up mini-задач (A. orphans cleanup, B. фильтр auto_notification, C. attachment_ids в email meta, D. SHA256 дедуп, E. XLSX по строкам, F. мониторинг, G. дашборд coverage)
+
+## Изменённые файлы (добавление)
+- `analyze_attachments.py` — функция insert_email_attachment_to_canonical + триггер из update_attachment_status
+- `build_source_chunks.py` — embed_batch() вместо list-comprehension (35× ускорение), MIN_DOC_LEN=30, фильтр auto_notification
+- `TASK_canonical_attachments.md` — расширен с прогрессом, багами, follow-ups
+- `media_analyzer.py` — НОВЫЙ. Facade для функций анализа медиа, re-export из bot.py + has_meaningful_text() (gpt-4.1-mini prefilter, max_tokens=16)
+- `analyze_tg_media_backlog.py` — НОВЫЙ. Backfill media analysis через S3 + LLM. Для Торты-Отгрузки применяется OCR-prefilter.
+- `CLAUDE.md` — добавлен раздел «Дискуссия и несогласие» (не соглашаться сразу при технических заблуждениях, аргументировать).
+- memory `feedback_pushback.md` — то же самое в memory.
+
+## ✅ Пункт #5 analyze_tg_media (20:30)
+- Решение: variant B (LLM-prefilter без install tesseract). Пользователь сначала склонился к A, потом согласился на B после объяснения что LLM-OCR уже работает в pipeline.
+- 2261 pending media (98.7% — Торты-Отгрузки 2233).
+- Backfill запущен в фоне (`bod26dtpv`), batch=5000, ~7h wall, ожидаемая стоимость ~$100-140.
+- OCR-prefilter работает (40% rate в smoke-тесте 5 фото).
+- Чанкер `b73yc73r6` параллельно крутит ~1.5 ch/s, 60k docs очередь.
+
 ## Заметки
 - HNSW мог быть «помечен как built» в логе сессии 17.04, но в БД его нет. На будущее — после CREATE INDEX делать verify через `SELECT indexname FROM pg_indexes WHERE indexname=...`, не доверять только успешному exit.
 - watchdog запускался дважды на самом деле один раз — двойная запись была артефактом print() + log()
