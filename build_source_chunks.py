@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = 500        # символов на чанк
 CHUNK_OVERLAP = 100     # перекрытие
 MIN_CHUNK_LEN = 30      # минимальная длина чанка
-EMBED_BATCH_SIZE = 64   # батч для эмбеддингов
+EMBED_BATCH_SIZE = 32   # батч для эмбеддингов (CPU: >32 → OOM при ~12GB RSS)
 MIN_DOC_LEN = 30        # минимальная длина документа (= MIN_CHUNK_LEN, иначе короткие docs вечно висят в queue)
 
 DB_CONFIG = {
@@ -218,7 +218,7 @@ def main():
 
     total_chunks = 0
     total_docs = 0
-    doc_batch_size = 200  # документов за один проход в БД
+    doc_batch_size = 50  # документов за один проход (меньше = меньше пиковая RAM между коммитами)
 
     while True:
         docs = get_unprocessed_docs(conn, batch_size=doc_batch_size)

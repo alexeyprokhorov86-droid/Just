@@ -53,7 +53,7 @@ MESSENGER_SESSION_GAP_MINUTES = 30
 # Qwen3-Embedding-0.6B (будет настроено позже)
 EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 EMBEDDING_DIM = 1024
-EMBEDDING_BATCH_SIZE = 128
+EMBEDDING_BATCH_SIZE = 32  # CPU inference: 128 валит 12GB RSS → OOM; 32 комфортно в 4GB
 
 # --- Batch processing ---
 DB_BATCH_SIZE = 1000  # rows per INSERT batch

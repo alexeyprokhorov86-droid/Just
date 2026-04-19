@@ -91,3 +91,15 @@
 - «финализировать в конце» — без признака конца сессии
 
 Предложение к CLAUDE.md: добавить чёткие триггеры (перед каждым ответом user, после каждого Edit/Bash-mutator, после 10 мин тишины — финализировать).
+
+## Фикс OOM build_source_chunks (22:30-22:35)
+- [22:00, 22:05] dmesg: два OOM-kill подряд, python RSS 12-13GB (cron.service). Процесс build_source_chunks падал через 5 минут после старта из-за Qwen3 forward pass batch=128 на CPU.
+- [22:33] Фикс: `chunkers/config.py` EMBEDDING_BATCH_SIZE 128→32, `build_source_chunks.py` EMBED_BATCH_SIZE 64→32, doc_batch_size 200→50.
+- [22:33-22:35] Тест `--batch 100`: 89 сек, 100 docs → 121 chunks, пик RAM 4.2GB, без OOM.
+- [22:27] Перезапущен `analyze_tg_media_backlog` (PID 2578815) на 2008 pending в Торты-Отгрузки (идемпотентный resume).
+- Коммит f4ff9da: canonical fixes (email attachments, TG media, build_chunks Qwen3 v2, CLAUDE.md дискуссия).
+
+## Незавершённое
+- Проверить что cron в 22:45 отработает без OOM с новыми batch_size.
+- Backlog TG-Торты продолжает идти (2008→0, ~7h wall, $100-140).
+- По `TASK_canonical_attachments.md`: #2 c1_event, #6 Matrix media, #3 v_messages_unified.
