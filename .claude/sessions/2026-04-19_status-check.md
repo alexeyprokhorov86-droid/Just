@@ -99,7 +99,19 @@
 - [22:27] Перезапущен `analyze_tg_media_backlog` (PID 2578815) на 2008 pending в Торты-Отгрузки (идемпотентный resume).
 - Коммит f4ff9da: canonical fixes (email attachments, TG media, build_chunks Qwen3 v2, CLAUDE.md дискуссия).
 
-## Незавершённое
-- Проверить что cron в 22:45 отработает без OOM с новыми batch_size.
-- Backlog TG-Торты продолжает идти (2008→0, ~7h wall, $100-140).
-- По `TASK_canonical_attachments.md`: #2 c1_event, #6 Matrix media, #3 v_messages_unified.
+## Итог сессии (2026-04-19 22:40)
+
+### Коммиты (3 в main)
+- `9dfa1c7` — TG body composition + build_source_chunks Qwen3 v2 + cron fixes
+- `f4ff9da` — email attachments canonical + analyze_tg_media_backlog (new) + media_analyzer (new) + embed_batch ускорение
+- `e7ae7d2` — OOM fix: batch 128→32, RSS 12GB→4GB
+
+### Фоновые процессы (работают на момент закрытия сессии)
+- `analyze_tg_media_backlog.py` PID 2578815 — прогресс: 402 analyzed / 1932 pending (Торты-Отгрузки). ETA ~5-6h.
+- Cron `45 * * * *` build_source_chunks — следующий запуск в 22:45 с новыми batch_size.
+
+## Незавершённое / Следующие шаги
+- **Мониторинг OOM фикса**: после 22:45 проверить `dmesg | grep oom` что build_source_chunks не падает.
+- **TG-Торты медиа**: дождаться окончания 1932 pending (~утром 20.04).
+- **`TASK_canonical_attachments.md`**: осталось #2 c1_event, #6 Matrix media, #3 v_messages_unified.
+- **Несколько untracked**: `tests/full_rag_battery_result.json` — тестовый артефакт, не коммитили.
