@@ -12,11 +12,15 @@
 import os
 import sys
 import logging
+import pathlib
 import psycopg2
 import psycopg2.extras
 import argparse
 import re
 import fcntl
+from dotenv import load_dotenv
+
+load_dotenv(pathlib.Path(__file__).parent / '.env')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,20 +112,18 @@ def split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CH
 
 
 def load_embedding_model():
-    """Загружает модель эмбеддингов."""
-    from sentence_transformers import SentenceTransformer
-    logger.info("Загружаем модель intfloat/multilingual-e5-base...")
-    model = SentenceTransformer('intfloat/multilingual-e5-base')
+    """Загружает Qwen3-Embedding-0.6B (canonical для source_chunks.embedding_v2)."""
+    from chunkers.embedder import _get_shared_embedder
+    logger.info("Загружаем Qwen3-Embedding-0.6B...")
+    embedder = _get_shared_embedder()
     logger.info("Модель загружена")
-    return model
+    return embedder
 
 
 def generate_embeddings(model, texts: list) -> list:
-    """Генерирует эмбеддинги для списка текстов."""
-    # e5 модели требуют префикс passage: для индексации
-    prefixed = [f"passage: {t[:512]}" for t in texts]
-    embeddings = model.encode(prefixed, normalize_embeddings=True, batch_size=EMBED_BATCH_SIZE)
-    return embeddings.tolist()
+    """Генерирует Qwen3 document embeddings (1024-dim) для списка текстов."""
+    from chunkers.embedder import embed_document_v2
+    return [embed_document_v2(t) for t in texts]
 
 
 def get_unprocessed_docs(conn, batch_size=500):
@@ -175,7 +177,7 @@ def process_batch(conn, model, docs):
 
         psycopg2.extras.execute_values(
             cur,
-            """INSERT INTO source_chunks (document_id, chunk_no, chunk_text, embedding, token_count)
+            """INSERT INTO source_chunks (document_id, chunk_no, chunk_text, embedding_v2, token_count)
                VALUES %s ON CONFLICT DO NOTHING""",
             insert_data,
             template="(%s, %s, %s, %s::vector, %s)"

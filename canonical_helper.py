@@ -4,15 +4,19 @@ import json
 
 
 def insert_source_document_tg(cur, table_name: str, chat_title: str, message_data: dict):
-    """Вставка Telegram сообщения в source_documents."""
-    body = message_data.get('content_text') or ''
-    if not body:
-        parts = []
-        if message_data.get('message_text'):
-            parts.append(message_data['message_text'])
-        if message_data.get('media_analysis'):
-            parts.append(message_data['media_analysis'])
-        body = '\n'.join(parts)
+    """Вставка Telegram сообщения в source_documents.
+
+    body_text = подпись пользователя + полный LLM-анализ вложения + сырой extract.
+    Порядок важен: подпись/анализ дают семантику для embedding, content_text — для цитирования.
+    """
+    parts = []
+    if message_data.get('message_text'):
+        parts.append(message_data['message_text'])
+    if message_data.get('media_analysis'):
+        parts.append(f"[Анализ вложения]\n{message_data['media_analysis']}")
+    if message_data.get('content_text'):
+        parts.append(f"[Содержимое файла]\n{message_data['content_text']}")
+    body = '\n\n'.join(parts)
 
     if not body or not body.strip():
         return
