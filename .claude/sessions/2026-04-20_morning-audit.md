@@ -93,7 +93,7 @@
 - Наблюдать `auto_fix_log` завтра в 08:15 — должен отработать на API key
 - c1_event V2: реализовать 4 категории (dispatch_large — с fallback для 42% нематченных строк, inventory_discrepancy, production_issue, staff_change)
 - Hand 1C: доделать `fetch_dispatch_events` через JOIN с customer_order_items + average price fallback
-- `tests/full_rag_battery_result.json` — прогнать полную батарею на обновлённом RAG (теперь c c1_event), сравнить с прошлыми результатами
+- ~~прогнать полную батарею на обновлённом RAG~~ ✅ Сделано 2026-04-20 19:38, результат: 19/30 с 1С (−3 vs 17.04), latency 52.8s (−17%), 0 errors.
 
 ## [18:30] claude_tg_bridge — переход на hook-режим
 - SDK-режим (`claude_runner.py`, ADK subprocess) убран. Причина: Algorithm 403 в subprocess без OAuth, плохая трансляция действий, не совпадает с поведением «увидеть что Claude делает в реальной сессии».
@@ -160,3 +160,34 @@
 - `bot.py` — `_rag_feedback_keyboard(log_id)` генерит кнопки с callback_data `rag_fb:<id>:up|down`; `rag_feedback_callback` на клике UPDATE'ит `rag_query_log.user_feedback/feedback_at` и меняет клавиатуру на «👍 принято». Привязано к handle_private_rag + handle_mention. Кнопки клеятся ТОЛЬКО к последнему чанку, если ответ режется на >4000 символов.
 - Handler зарегистрирован с `pattern=r'^rag_fb:'` до `handle_full_analysis_button` (catch-all).
 - `sudo systemctl restart telegram-logger` (PID 3049725). Smoke-check: python -c "import bot; import rag_agent" → ok. journalctl → "🚀 Бот запущен", никаких ошибок.
+- Алексей валидировал в TG: задал вопрос «сколько в кг продали птички в марте» (ответ 30 831 кг, цифры сверил напрямую в БД — все 7 SKU × pack_weight сошлись до десятых долей), кликнул 👍 под ответом → запись в rag_query_log прилетела. Работает.
+
+## [19:52] Наблюдение: 2-мин gap в RAG latency
+- На первом пост-P0 запросе в личке между `logger.info("RAG answer fixated")` (19:53:38) и HTTP sendMessage (19:55:52) — 134 секунды тишины в journalctl, только getUpdates heartbeat'ы. Что main thread делал — не логируется. Подозрения: новый `_log_rag_query` с RETURNING id + fetchone, либо DB connection saturation из-за параллельного battery.
+- Записал в CLAUDE.md backlog как отдельный P1-пункт с планом расследования.
+- Попутная бага RouterAI 402 Payment Required, убивающая весь review_knowledge.py Step 1 одной секундой (17.04 и 20.04) — тоже в backlog, нужен exponential backoff retry.
+
+## [20:10] Full RAG battery результат (baseline 20.04)
+- Закончен прогон 30 вопросов. Итог сохранён как `tests/full_rag_battery_result.json`, старый 17.04 в `tests/full_rag_battery_result_2026-04-17.json`.
+
+| метрика | 17.04 | 20.04 | Δ |
+|---|---|---|---|
+| с 1С-evidence | 22/30 (73%) | 19/30 (63%) | −3 |
+| ≥3 цитирований | 30/30 | 30/30 | 0 |
+| avg latency | 64.1s | 52.8s | −17% |
+| ошибки | 0 | 0 | — |
+
+- **Регрессии по 1С:** «Остатки глазури», «Продано Магниту в марте», «Купили у ИП Кутабаевой», «Изменение продаж Медовика». **Улучшение:** «Маржинальность Медовика 500г» (из 0 → 1С). 25/30 стабильны.
+- **Интерпретация:** latency −17% — реальный эффект c1_event (быстрее ретрив по синтезированным событиям). 3 потерянных 1С — вероятно run-to-run дрейф gpt-4.1 Router'а (в 2 из 4 вопросов нужен `entities.clients/suppliers` filter, Router мог пойти другим путём). Детерминизм `temp=0` частичный.
+- **Второй прогон с P0-кодом не делаем:** P0.1 меняет цифры на 1-2% (Корректировки), regex `has_1c_evidence` и число цитат — не чувствительны. Второй прогон выдаст очередные ±3-4 вопроса flap'а без реальной delta.
+- В backlog добавлен пункт «Стабилизация full_rag_battery» — 3-5 прогонов подряд + медиана/std, иначе любая regression тонет в шуме.
+
+## [20:25] Финализация
+- Все 4 приоритета P0 закрыты (top_*, km_facts dedupe, 👍/👎, baseline battery).
+- 2 коммита за сессию: eda283b (bridge), dfaf4f6 (RAG P0).
+- Битва следующей недели: прогнать battery ещё раз с P0-кодом когда отстоится — сравнить с 20.04 baseline.
+
+## Коммиты за эту сессию (post-bridge)
+1. `eda283b` — feat(bridge): claude_tg_bridge hook-mode
+2. `dfaf4f6` — feat(rag): P0 — net sales с Корректировками + 👍/👎 кнопки
+3. (this commit) — baseline battery result 20.04 + backlog обновления

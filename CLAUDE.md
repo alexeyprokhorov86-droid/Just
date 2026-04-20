@@ -270,4 +270,7 @@ Claude Code ведёт НЕПРЕРЫВНЫЙ лог сессии в `.claude/se
 - sync_bank_balances — проверить деплой
 - .well-known для frumelad.ru
 - RAG latency optimization (64s avg → ≤45s)
+- **RAG latency: 2-мин gap между fixation и sendMessage** (обнаружен 2026-04-20 на первом пост-P0 запросе в личке). Между `logger.info("RAG answer fixated")` и HTTP sendMessage в /tmp logs 134 секунд с пустыми getUpdates — main thread чем-то занят. Подозрения: `_log_rag_query` с `RETURNING id` + `fetchone()` (новый код), или saturation DB-connection'ов при параллельном прогоне battery. Повторить без battery; если gap останется — инструментировать шаги между fixation и reply_text.
+- review_knowledge.py Step 1: добавить retry с backoff для RouterAI 402 Payment Required (17.04 и 20.04 весь LLM-ревью упал одним махом; dedupe Step 0 работает, только LLM review страдает)
 - 30 вопросов full_rag_battery расширить до 50+ (добавить сложные аналитические, цепочки)
+- **Стабилизация метрики full_rag_battery**: прогоны 17.04 и 20.04 на одном корпусе вопросов показали run-to-run дрейф ±10% по `has_1c_evidence` (73%→63%, 3 вопроса потеряли 1С, 1 обрёл). gpt-4.1 temp=0 не детерминирован для Router'а. Нужна серия прогонов (3-5 подряд) + медиана/std вместо одиночной цифры. Иначе любая реальная регрессия утонет в шуме.
