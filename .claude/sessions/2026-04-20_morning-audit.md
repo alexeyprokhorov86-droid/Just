@@ -136,3 +136,27 @@
 - Pause-флаг: `/tmp/claude_hook_paused` (touch = хук exit 0 сразу)
 - Маркеры: `/tmp/claude_hook_done/<tool_use_id>.marker` — write on PostToolUse, read by nag
 - Оффсеты: `/tmp/claude_hook_offsets/<session>.txt` — для incremental чтения transcript
+
+## [19:38] RAG roadmap актуализирован + P0 работа стартовала
+- Пересмотрели приоритеты по RAG. Фазы 1-6 TASK_rag_quality_v2 закрыты (2026-04-17), в проде + battery 2026-04-17 подтвердил 30/30 good_citations, 22/30 с 1С-evidence (73%).
+- CLAUDE.md секция «Приоритеты» переписана — структура P0/P1/P2. Старые backlog-пункты (top_* v_sales_adjusted, дедуп km_facts) подняты в P0.
+- Новый P0 финальный: (1) top_* net с учётом Корректировок, (2) подтвердить дедуп km_facts, (3) 👍/👎 inline-кнопки под RAG-ответами.
+- Baseline battery запущен в BG (PID 3042690, start 19:38, ETA 20:10). Сохранил старый результат как `tests/full_rag_battery_result_2026-04-17.json`.
+
+## [19:40] P0.1 top_* → включение Корректировок в net-выручку
+- Исходная проблема не в смене источника: `mart_sales` УЖЕ построен как `FROM v_sales_adjusted WHERE client_name NOT ILIKE '%фрумелад%'` (т.е. effective_date, возвраты вкл., внутренние переводы исключены). Но RAG сам добавлял `WHERE doc_type='Реализация'` → отфильтровывал Корректировки → gross вместо net.
+- `rag_agent.py` — убрал `WHERE doc_type='Реализация'` в трёх запросах: top_clients/sales_summary (L1772), top_products (L1814), sales_by_nomenclature (L1973). Для top_products AVG(price) оставил под FILTER (WHERE doc_type='Реализация') — чтобы средняя цена не искажалась.
+- Проверил на март 2026: ТАНДЕР gross 14.49M → net 14.26M (−224k возвратов), Х5 АГРОТОРГ 8.45M → 8.30M, ПЕРЕКРЁСТОК сполз ниже КАМЕЛОТ (у Камелота нет возвратов). Метабаза и раньше была net — RAG теперь совпадает.
+
+## [19:47] P0.2 km_facts dedupe — оказался уже в работе
+- `review_knowledge.py` Step 0 (cosine ≥ 0.95, max 2000/run) в cron `0 5 * * *` — активен.
+- Сегодня 05:04 дедуп помётил 183 записи: km_facts 92 / km_decisions 28 / km_tasks 24 / km_policies 39. Было 42k fact'ов (CLAUDE.md) → стало 25929 активных = дедуп реально сжал на ~38% за жизнь.
+- Ничего не трогал. P0.2 считаем закрытым.
+- Попутная бага: Step 1 (LLM-ревью) ловит 402 Payment Required от RouterAI в течение секунды по всем 10 батчам (17.04 и 20.04 подряд). retry с backoff отсутствует. В backlog на отдельный фикс.
+
+## [19:50] P0.3 👍/👎 inline-кнопки под RAG
+- DB: `ALTER TABLE rag_query_log ADD COLUMN user_feedback VARCHAR(10), feedback_at TIMESTAMP`; индекс partial по `user_feedback IS NOT NULL`.
+- `rag_agent.py:_log_rag_query` — теперь `RETURNING id`, возвращает int. `process_rag_query` получила опциональный `meta_out: dict` — если передан, пишет туда `log_id`. Backward-compat (battery/matrix_bot не трогал).
+- `bot.py` — `_rag_feedback_keyboard(log_id)` генерит кнопки с callback_data `rag_fb:<id>:up|down`; `rag_feedback_callback` на клике UPDATE'ит `rag_query_log.user_feedback/feedback_at` и меняет клавиатуру на «👍 принято». Привязано к handle_private_rag + handle_mention. Кнопки клеятся ТОЛЬКО к последнему чанку, если ответ режется на >4000 символов.
+- Handler зарегистрирован с `pattern=r'^rag_fb:'` до `handle_full_analysis_button` (catch-all).
+- `sudo systemctl restart telegram-logger` (PID 3049725). Smoke-check: python -c "import bot; import rag_agent" → ok. journalctl → "🚀 Бот запущен", никаких ошибок.

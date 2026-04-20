@@ -1771,6 +1771,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
             
             if analytics_type in ("top_clients", "sales_summary"):
                 try:
+                    # mart_sales уже построен над v_sales_adjusted (effective_date AS doc_date,
+                    # Корректировки включены, ФРУМЕЛАД отфильтрован). Убрали WHERE doc_type='Реализация'
+                    # чтобы net-выручка учитывала возвраты (отрицательные Корректировки).
                     q = """
                         SELECT client_name,
                                COUNT(*) as positions,
@@ -1779,7 +1782,7 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                                MAX(doc_date) as last_date,
                                COUNT(DISTINCT doc_number) as docs_count
                         FROM mart_sales
-                        WHERE doc_type = 'Реализация'
+                        WHERE 1=1
                     """
                     params = []
                     if period_date:
@@ -1813,14 +1816,16 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
             
             if analytics_type in ("top_products", "sales_summary"):
                 try:
+                    # mart_sales — net с учётом Корректировок. AVG(price) считаем только
+                    # по Реализациям (иначе avg искажается ценами возвратов).
                     q = """
                         SELECT nomenclature_name,
                                SUM(quantity) as total_qty,
                                SUM(sum_with_vat) as revenue,
-                               AVG(price) as avg_price,
+                               AVG(NULLIF(price,0)) FILTER (WHERE doc_type='Реализация') as avg_price,
                                COUNT(DISTINCT client_name) as clients_count
                         FROM mart_sales
-                        WHERE doc_type = 'Реализация'
+                        WHERE 1=1
                     """
                     params = []
                     if period_date:
@@ -1972,6 +1977,7 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
 
             if analytics_type == "sales_by_nomenclature":
                 try:
+                    # mart_sales: net-количество и сумма с учётом Корректировок
                     q = """
                         SELECT ms.nomenclature_name,
                                SUM(ms.quantity) AS qty,
@@ -1983,7 +1989,7 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                                MAX(n.weight_unit) AS wu
                         FROM mart_sales ms
                         LEFT JOIN nomenclature n ON n.name = ms.nomenclature_name
-                        WHERE ms.doc_type = 'Реализация'
+                        WHERE 1=1
                     """
                     params = []
                     if period_date:
@@ -3612,7 +3618,7 @@ def rerank_results(question: str, results: list, top_k: int = 10) -> list:
 # =============================================================================
 
 async def process_rag_query(question, chat_context="", user_info: dict = None,
-                              prev_context: dict = None):
+                              prev_context: dict = None, meta_out: dict = None):
     """
     ReAct цикл обработки RAG-запроса:
     0. Если prev_context (reply-chain) — встраиваем предыдущий Q/A в chat_context
@@ -3880,7 +3886,7 @@ async def process_rag_query(question, chat_context="", user_info: dict = None,
         logger.warning(f"fixate wrapper: {e}")
 
     # === Логирование ===
-    _log_rag_query({
+    log_id = _log_rag_query({
         "user_id": user_info.get("user_id"),
         "username": user_info.get("username"),
         "first_name": user_info.get("first_name"),
@@ -3910,11 +3916,14 @@ async def process_rag_query(question, chat_context="", user_info: dict = None,
         "answer_eval_issues": "; ".join(answer_eval.get("issues", [])[:5]) if answer_eval else None,
     })
 
+    if meta_out is not None and log_id is not None:
+        meta_out["log_id"] = log_id
+
     return response
 
 
 def _log_rag_query(data: dict):
-    """Записывает RAG-запрос в лог. Не блокирует основной поток."""
+    """Записывает RAG-запрос в лог, возвращает новый id (или None)."""
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
@@ -3937,12 +3946,15 @@ def _log_rag_query(data: dict):
                     %(response_time_ms)s, %(router_time_ms)s, %(search_time_ms)s,
                     %(generation_time_ms)s, %(web_search_used)s, %(error)s,
                     %(answer_model)s, %(answer_retry_count)s, %(answer_eval_good)s, %(answer_eval_issues)s
-                )
+                ) RETURNING id
             """, data)
+            row = cur.fetchone()
         conn.commit()
         conn.close()
+        return row[0] if row else None
     except Exception as e:
         logger.warning(f"RAG log error: {e}")
+        return None
 
 
 async def index_new_message(table_name: str, message_id: int, content: str):

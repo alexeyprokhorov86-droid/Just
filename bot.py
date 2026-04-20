@@ -2499,6 +2499,53 @@ def _fetch_chain_from_db(chat_id: int, bot_message_id: int, max_depth: int = 5) 
 # RAG АГЕНТ В ЛИЧНЫХ СООБЩЕНИЯХ
 # ============================================================
 
+def _rag_feedback_keyboard(log_id: int) -> InlineKeyboardMarkup:
+    """👍/👎 под RAG-ответом, callback_data ссылается на rag_query_log.id."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("👍", callback_data=f"rag_fb:{log_id}:up"),
+        InlineKeyboardButton("👎", callback_data=f"rag_fb:{log_id}:down"),
+    ]])
+
+
+async def rag_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик клика 👍/👎: пишет user_feedback в rag_query_log."""
+    q = update.callback_query
+    await q.answer()
+    try:
+        _, log_id_s, verdict = q.data.split(":", 2)
+        log_id = int(log_id_s)
+    except (ValueError, AttributeError):
+        return
+    if verdict not in ("up", "down"):
+        return
+    label = "👍" if verdict == "up" else "👎"
+
+    import psycopg2
+    try:
+        conn = psycopg2.connect(
+            host="172.20.0.2", dbname="knowledge_base",
+            user="knowledge", password=os.getenv("DB_PASSWORD"),
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE rag_query_log SET user_feedback=%s, feedback_at=now() "
+                "WHERE id=%s AND (user_feedback IS NULL OR user_feedback=%s)",
+                (verdict, log_id, verdict),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"rag feedback save failed log_id={log_id}: {e}")
+
+    # убираем кнопки и фиксируем выбор прямо в reply_markup-строке сообщения
+    try:
+        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"{label} принято", callback_data="rag_fb:noop"),
+        ]]))
+    except Exception:
+        pass
+
+
 async def handle_private_rag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик личных сообщений — RAG агент без @упоминания.
     
@@ -2552,23 +2599,27 @@ async def handle_private_rag(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"root Q: '{chain_from_db[0]['question'][:60]}'"
                 )
 
+        rag_meta: dict = {}
         response = await process_rag_query(question, "", user_info={
             "user_id": message.from_user.id,
             "username": message.from_user.username,
             "first_name": message.from_user.first_name,
             "chat_id": message.chat.id,
             "chat_type": "private",
-        }, prev_context=prev_context)
+        }, prev_context=prev_context, meta_out=rag_meta)
+
+        fb_kb = _rag_feedback_keyboard(rag_meta["log_id"]) if rag_meta.get("log_id") else None
 
         # Отправляем ответ + сохраняем reference в БД для reply-chain
         sent_messages = []
         if len(response) > 4000:
             parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
-            for part in parts:
-                sent = await message.reply_text(part)
+            for idx, part in enumerate(parts):
+                kb = fb_kb if idx == len(parts) - 1 else None
+                sent = await message.reply_text(part, reply_markup=kb)
                 sent_messages.append(sent)
         else:
-            sent = await message.reply_text(response)
+            sent = await message.reply_text(response, reply_markup=fb_kb)
             sent_messages.append(sent)
 
         # Сохраняем в bot_message_chain для будущих reply.
@@ -2629,22 +2680,26 @@ async def handle_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Reply-chain (mention, DB) depth={len(chain_from_db)}"
                 )
 
+        rag_meta: dict = {}
         response = await process_rag_query(question, "", user_info={
             "user_id": message.from_user.id,
             "username": message.from_user.username,
             "first_name": message.from_user.first_name,
             "chat_id": message.chat.id,
             "chat_type": message.chat.type,
-        }, prev_context=prev_context)
+        }, prev_context=prev_context, meta_out=rag_meta)
+
+        fb_kb = _rag_feedback_keyboard(rag_meta["log_id"]) if rag_meta.get("log_id") else None
 
         sent_messages = []
         if len(response) > 4000:
             parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
-            for part in parts:
-                sent = await message.reply_text(part)
+            for idx, part in enumerate(parts):
+                kb = fb_kb if idx == len(parts) - 1 else None
+                sent = await message.reply_text(part, reply_markup=kb)
                 sent_messages.append(sent)
         else:
-            sent = await message.reply_text(response)
+            sent = await message.reply_text(response, reply_markup=fb_kb)
             sent_messages.append(sent)
 
         if sent_messages:
@@ -4345,6 +4400,10 @@ def main():
     application.add_handler(CallbackQueryHandler(
         nutrition_callback_handler,
         pattern=r'^nutr_'
+    ))
+    application.add_handler(CallbackQueryHandler(
+        rag_feedback_callback,
+        pattern=r'^rag_fb:'
     ))
     application.add_handler(MessageHandler(
         (filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE,

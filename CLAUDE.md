@@ -140,11 +140,21 @@ git add -A && git commit -m "описание" && git push
 
 ## Приоритеты (апрель-май 2026)
 
-1. ✅ **TASK_rag_quality_v2** — Router v2, Evaluator+Escalation, Text-to-SQL, km_fixation, Reply-chain, Periodic Synthesis (Фазы 1-6 готовы 2026-04-17).
-2. **TASK_rules_manage.md** — поиск и деактивация правил фильтрации из бота
-3. Хвосты: matrix_auto_invite.py в cron (✅ уже сделано), iOS ссылка в /element
-4. Мелкие задачи: --invite-rooms прогнать, sync_bank_balances проверить
-5. `v_plan_fact_weekly` в synthesize_1c_facts.py — починить 5-vs-6 колонок
+### RAG (основной фокус):
+1. ✅ **TASK_rag_quality_v2 Фазы 1-6** (готовы 2026-04-17): Router v2, Evaluator+Escalation, Text-to-SQL, km_fixation, Reply-chain, Periodic Synthesis.
+2. **P0 — RAG quality улучшения** (текущая сессия 2026-04-20):
+   - `top_*` analytics tools → `v_sales_adjusted` (учёт возвратов в top_clients/top_products/top_suppliers, sales_summary)
+   - Дедупликация `km_facts` по embedding-similarity (в `review_knowledge.py`)
+   - 👍/👎 inline-кнопки под RAG-ответами → `rag_query_log.user_feedback`
+3. **P1** — full_rag_battery прогон после P0, сравнить с baseline 2026-04-17 (73% с 1С-evidence)
+4. **P2 backlog (отложено):**
+   - Бот в Element X (Matrix-транспорт `/search`, `/analysis`)
+   - Latency optimization (64s avg → цель ≤45s для Tier 3)
+
+### Прочее:
+5. **TASK_rules_manage.md** — поиск и деактивация правил фильтрации из бота
+6. Хвосты: iOS ссылка в /element, --invite-rooms прогнать, sync_bank_balances проверить
+7. `v_plan_fact_weekly` в synthesize_1c_facts.py — починить 5-vs-6 колонок
 
 ## Полезные команды
 
@@ -256,8 +266,8 @@ Claude Code ведёт НЕПРЕРЫВНЫЙ лог сессии в `.claude/se
 - `TASK_rules_manage.md` — ⚠️ файл не существует, но фича `/rules_find`/`/rules_off` уже в bot.py
 
 ### Backlog:
-- Дедупликация km_facts (embedding similarity в review_knowledge.py)
 - Бот в Element X (Matrix-транспорт для /search, /analysis)
 - sync_bank_balances — проверить деплой
 - .well-known для frumelad.ru
-- Обновить `top_*` analytics tools — использовать флаг fresh данных (v_sales_adjusted для возвратов)
+- RAG latency optimization (64s avg → ≤45s)
+- 30 вопросов full_rag_battery расширить до 50+ (добавить сложные аналитические, цепочки)
