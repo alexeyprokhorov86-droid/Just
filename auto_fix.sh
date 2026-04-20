@@ -104,8 +104,12 @@ CLAUDE_ERR="$(mktemp /tmp/auto_fix_claude_err.XXXXXX)"
 # сессии (или цепочкой), дочерний `claude -p` иначе пытается подключиться к
 # родителю и получает 403 Forbidden. Cron-окружение чистое, но защита нужна
 # для ручных запусков и watchdog (который тоже может быть вызван иначе).
+# ANTHROPIC_API_KEY подтягивается из .env — без него claude в cron использует
+# OAuth-токен, который протухает за сутки и возвращает 403 "Request not allowed".
+ANTHROPIC_API_KEY_VAL="$(grep -E '^ANTHROPIC_API_KEY=' "$REPO_DIR/.env" | cut -d= -f2-)"
 set +e
 env -u CLAUDECODE -u CLAUDE_CODE_SSE_PORT -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
+    ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY_VAL" \
     timeout "$CLAUDE_TIMEOUT_SEC" "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
     --permission-mode acceptEdits \
     --allowedTools "Bash,Edit,Read,Write,Grep,Glob" \
