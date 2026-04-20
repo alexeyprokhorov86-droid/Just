@@ -54,3 +54,6 @@ Thumbs.db
 
 # Дубликаты и временные папки
 db/
+
+# Временный приёмник файлов для Claude Code (см. .tmp_input/README.md)
+.tmp_input/

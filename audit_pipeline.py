@@ -459,7 +459,7 @@ def fix_distillation(undistilled):
         try:
             result = subprocess.run(
                 [VENV_PYTHON, f'{SCRIPTS_DIR}/distillation.py', sk, str(batches)],
-                capture_output=True, text=True, timeout=600, cwd=SCRIPTS_DIR
+                capture_output=True, text=True, timeout=1800, cwd=SCRIPTS_DIR
             )
             for line in result.stdout.split('\n'):
                 if 'ИТОГО' in line:

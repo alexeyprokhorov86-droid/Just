@@ -48,3 +48,17 @@
 - RouterAI 402 за одну секунду по всем 10 батчам — это не rate-limit клиента (тогда бы не сразу), а сбой на стороне провайдера. Одиночный инцидент, не фиксим до повторения.
 - OAuth-токен Claude Code обновляется только при интерактивном запуске (`.credentials.json` mtime совпал с моим логином сегодня в 11:20). В cron refresh не триггерится — отсюда систематические 403.
 - Коммит фикса `auto_fix.sh` — по окончанию сессии, после user-approve.
+
+## [12:30] Зачистка мусорного чата antony_nut
+- Пользователь: «antony_nut вычеркни отовсюду, затесался и не удаляется до конца».
+- Инвентаризация: `tg_chats_metadata` (1 запись), `tg_chat_1001199207547_antony_nut` (1000 сообщений, без медиа, 2025-09-15..12-31), **в source_documents / km_* / коде — 0 следов**.
+- `DROP TABLE tg_chat_1001199207547_antony_nut; DELETE FROM tg_chats_metadata WHERE chat_id=-1001199207547;` — успешно. Verify: meta_left=0, table_exists=0.
+
+## [12:15] Distillation timeout fix
+- `audit_pipeline.py:462` — timeout 600 → 1800. Дать distillation.py telegram_message шанс переварить 408 pending за один ночной прогон audit.
+
+## [12:00] Продвижение по очереди (по запросу «делай всё по очереди»)
+1. ✅ `git push` commit 555a16e (auto_fix ANTHROPIC_API_KEY fix) → origin/main. Feedback: `git push` теперь часть стандартного flow, не спрашиваю.
+2. ✅ distillation timeout 600→1800 в audit_pipeline.
+3. ✅ Хвост TG-вложений: проверка показала 0 pending с S3 по всем чатам (33 без storage_path — проблема миграции S3, не analyze).
+4. ⏳ c1_event — MVP в процессе (приостановил на зачистке antony).

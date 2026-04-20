@@ -10,13 +10,14 @@
 - Matrix-медиа вообще не индексируется
 - 1С — только 11 синтезированных агрегатов, нет точечных событий
 
-## Сводка прогресса 2026-04-19
+## Сводка прогресса 2026-04-20
 | Пункт | Статус | Детали |
 |---|---|---|
 | #4 TG body composition | ✅ | 838 docs обновлено + 2699 chunks пересозданы |
-| #1 Email attachments | ✅ backfill, ⏳ chunks | 11758 docs в canonical, ~85 мин чанкинг идёт |
-| #5 analyze_tg_media | ✅ запущен | media_analyzer.py + analyze_tg_media_backlog.py, 2261 backlog в фоне (~7h, ~$100-140) |
-| #2 c1_event | ⏳ план | средний приоритет |
+| #1 Email attachments | ✅ | 11758 canonical docs + chunks embedded |
+| #5 analyze_tg_media | ✅ | 2 347 / 2 347 (100%) в Торты-Отгрузки. 33 pending без S3 в других чатах — отдельная задача миграции S3 |
+| #2 c1_event | ✅ MVP (2026-04-20) | 3 категории: purchase_large, sale_large, payment_large. Backfill 180 дней + cron `*/30 * * * *` |
+| #2 c1_event V2 | ⏳ план | +4 категории: dispatch_large, inventory_discrepancy, production_issue, staff_change |
 | #6 Matrix media | ⏳ план | низкий |
 | #3 v_messages_unified | ⏳ план | низкий |
 
@@ -274,11 +275,40 @@ WHERE source_kind IN ('email_message','telegram_message','matrix_message');
 ## Приоритет внедрения
 
 1. ✅ **#4 Fix TG body_text composition** — сделано 2026-04-19
-2. ✅ **#1 Email attachments** — сделано 2026-04-19 (chunks ещё генерируются)
-3. **#5 analyze_tg_media** — следующий: только 2409 backlog, $40-80
-4. **#2 c1_event** — после #5 (улучшает точечные 1С-вопросы)
-5. **#6 Matrix media** — низкий (пока не основной канал)
-6. **#3 v_messages_unified** — низкий (косметика для Metabase)
+2. ✅ **#1 Email attachments** — сделано 2026-04-19
+3. ✅ **#5 analyze_tg_media** — сделано 2026-04-19/20 (2347/2347 в Торты-Отгрузки)
+4. ✅ **#2 c1_event MVP** — сделано 2026-04-20 (3 категории, backfill 180d + cron)
+5. **#2 c1_event V2** — +4 категории: dispatch_large, inventory_discrepancy, production_issue, staff_change
+6. **#6 Matrix media** — низкий (пока не основной канал)
+7. **#3 v_messages_unified** — низкий (косметика для Metabase)
+
+### План V2 c1_event (дополнительные категории)
+| event_type | Источник | Порог | Примерный объём/год |
+|---|---|---|---|
+| `dispatch_large` | c1_dispatch_orders + c1_dispatch_order_items | amount > 200k | ~500-800 |
+| `inventory_discrepancy` | c1_inventory_count + c1_inventory_count_items | любая ненулевая разница | ~50-100 |
+| `production_issue` | c1_shortage + c1_shortage_items | любая запись | ~30-70 |
+| `staff_change` | c1_staff_history | event_type='Перемещение' | ~20-40 |
+
+**Реализация**: добавить 4 функции `fetch_*_events()` в `canonize_1c_events.py`, расширить choice=`--category`. Backfill ~1000 доков, embed ~15 мин.
+
+Детали по таблицам (проверено 2026-04-20):
+- `dispatch_large`: **решено JOIN**. `c1_dispatch_order_items` → `c1_customer_order_items` по `(customer_order_key, nomenclature_key)` (line_number между документами не согласован). Сумма dispatch = `SUM(price × dispatch_quantity)` где price берётся из customer_order_items по той же номенклатуре. Формула:
+  ```sql
+  SELECT doi.order_key AS dispatch_ref,
+         SUM(COALESCE(coi.price,0) * doi.quantity) AS dispatch_sum
+  FROM c1_dispatch_order_items doi
+  LEFT JOIN c1_customer_order_items coi
+    ON coi.doc_key = doi.customer_order_key
+   AND coi.nomenclature_key = doi.nomenclature_key
+  GROUP BY doi.order_key
+  HAVING SUM(COALESCE(coi.price,0) * doi.quantity) >= 200000;
+  ```
+  **Проверено 2026-04-20 на 6-мес данных**: 2755 dispatches, 361 >200k. НО avg_match_ratio=0.58 — **42% строк не матчатся** с customer_order (прямые отгрузки без заказа, перемещения, регрейд). Нужен fallback: average price из mart_sales по той же nomenclature в ±30 дней от doc_date. Или через поле customer_order_key='' → отдельная ветка. Решить при реализации V2.
+  Колонка в `c1_customer_order_items`: `order_key` (не `doc_key`).
+- `inventory_discrepancy`: JOIN `c1_inventory_count` + `c1_inventory_count_items` с `WHERE deviation <> 0`. В body: список SKU и отклонений.
+- `production_issue`: `c1_shortage` + `c1_shortage_items`, `sum_total` доступен. Аналогично purchase_large по структуре.
+- `staff_change`: `c1_staff_history WHERE event_type='Перемещение' AND active=true`. JOIN на c1_employees/c1_positions/c1_departments для human body.
 
 ## ✅ После завершения backfill_embeddings_v2 (сделано 2026-04-19 19:00)
 
