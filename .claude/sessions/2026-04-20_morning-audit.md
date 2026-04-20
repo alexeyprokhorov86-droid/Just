@@ -61,4 +61,78 @@
 1. ✅ `git push` commit 555a16e (auto_fix ANTHROPIC_API_KEY fix) → origin/main. Feedback: `git push` теперь часть стандартного flow, не спрашиваю.
 2. ✅ distillation timeout 600→1800 в audit_pipeline.
 3. ✅ Хвост TG-вложений: проверка показала 0 pending с S3 по всем чатам (33 без storage_path — проблема миграции S3, не analyze).
-4. ⏳ c1_event — MVP в процессе (приостановил на зачистке antony).
+4. ✅ c1_event MVP (2026-04-20 13:52):
+   - Новый скрипт `canonize_1c_events.py`: 3 категории (purchase_large 300k / sale_large 200k / payment_large 500k)
+   - Backfill 180 дней: **3531 событий** (payment 2234 / purchase 893 / sale 404), 33 мин
+   - Cron `*/30 * * * *` incremental (updated_at > 1h)
+   - 3531 chunks с embedding_v2 = 100% покрытие
+   - Smoke-тест «крупная закупка у Калкулэйт» → 5 реальных закупок у ПК Калкулэйт, sim 0.5+
+   - Первый прогон завис (58 мин CPU 99%, 0 вставок) — единый `c.commit()` в конце + конфликт с cron. Фикс: commit каждые 20 событий + прогресс-лог 30с + временно отключил cron на backfill
+   - Коммит 6cfda03, push
+   - V2 план зафиксирован: +4 категории в `TASK_canonical_attachments.md` (dispatch_large c проверкой JOIN на 6-мес данных — 361 dispatch >200k, 58% match — требуется fallback)
+
+## [13:25] Параллельная задача: .tmp_input/ setup для пользователя
+- Пользователь спросил как скармливать файлы в Claude Code.
+- Создана `/home/admin/telegram_logger_bot/.tmp_input/` + `.gitignore: .tmp_input/`.
+- Memory reference: `reference_tmp_input.md`.
+- В чат — инструкции для Linux (sshfs) + Windows (WinSCP GUI / PowerShell scp / WSL).
+
+## Коммиты за сессию
+1. `555a16e` fix(auto_fix): ANTHROPIC_API_KEY из .env → стоп 403 в cron
+2. `6cfda03` feat(canonical): c1_event MVP + distillation timeout + .tmp_input + antony cleanup
+
+## Промежуточное состояние (сессия продолжается)
+- ✅ auto_fix.sh устойчив к OAuth-протуханию
+- ✅ distillation timeout 1800s
+- ✅ c1_event MVP в проде (3531 events, cron работает)
+- ✅ antony_nut удалён полностью
+- ✅ .tmp_input/ готов для подкидывания файлов
+- embedding_v2: 320 963 / 320 963 = 100% (прирост +3 531 от c1_event)
+
+## Незавершённое / Следующая сессия
+- Наблюдать `auto_fix_log` завтра в 08:15 — должен отработать на API key
+- c1_event V2: реализовать 4 категории (dispatch_large — с fallback для 42% нематченных строк, inventory_discrepancy, production_issue, staff_change)
+- Hand 1C: доделать `fetch_dispatch_events` через JOIN с customer_order_items + average price fallback
+- `tests/full_rag_battery_result.json` — прогнать полную батарею на обновлённом RAG (теперь c c1_event), сравнить с прошлыми результатами
+
+## [18:30] claude_tg_bridge — переход на hook-режим
+- SDK-режим (`claude_runner.py`, ADK subprocess) убран. Причина: Algorithm 403 в subprocess без OAuth, плохая трансляция действий, не совпадает с поведением «увидеть что Claude делает в реальной сессии».
+- Новый дизайн: `~/.claude/settings.json` hooks → `claude_tg_bridge/hook_bridge.py` → Telegram. Бот `claude_tg_bridge/bot.py` переделан в long-poll callback handler + `/pause` `/resume` `/status`.
+- Hook events: UserPromptSubmit (echo «🙂 …»), PreToolUse (Read/Grep/Glob — тихий лог; Bash/Write/Edit — **блокирующий approve-запрос**, ждёт decision файл до 5 мин), PostToolUse (Bash — stdout-хвост), Stop (summary).
+- Pause-флаг `/tmp/claude_hook_paused` — если существует, хуки `sys.exit(0)` сразу, не блокируют ничего.
+- Deadlock при первом `systemctl start`: хуки применились раньше чем бот поднялся → Bash блок. Решение (ручные команды user-а через SSH): `touch /tmp/claude_hook_paused` + `systemctl enable/start claude-tg-bridge`.
+- Service `claude-tg-bridge.service` включён и запущен. Бот в pause-режиме, готов принимать callback'и.
+
+## Изменённые файлы (18:30)
+- `claude_tg_bridge/hook_bridge.py` — новый, stdin hook payload → TG, ждёт decision для Bash/Write/Edit.
+- `claude_tg_bridge/bot.py` — переписан: только callback handler (happrove/hdeny) + /pause /resume /status.
+- `~/.claude/settings.json` — добавлены hooks UserPromptSubmit/PreToolUse/PostToolUse/Stop.
+- `claude_tg_bridge/claude_runner.py`, `permission_gate.py`, `session_store.py` — устарели, но пока не удаляю (проверить после первой реальной сессии).
+
+## [19:00] claude_tg_bridge — variant 2a (terminal-first + TG nag + assistant-text stream)
+- Текущая итерация TG-only approve оказалась неудобной: если Алексей за терминалом, клик в TG — лишний шаг. Обсудили. Я объяснил что «reverse order» (терминал первый, TG fallback) структурно невозможен: hook — синхронный, терминальный prompt появляется только если hook вернул `ask`, после этого hook уже завершён и TG-клик не может достучаться до stdin терминала.
+- Компромисс — **variant 2a**: hook сразу отпускает терминалу обычный permission flow, параллельно форкает detached nag-процесс. Через 5 мин (`NAG_TIMEOUT_SEC=300`) nag проверяет `/tmp/claude_hook_done/<tool_use_id>.marker` — если маркера нет (tool не отработал = approve не дан), шлёт в TG напоминалку «⏰ approve висит >5 мин». Кнопок нет сознательно (бесполезны).
+- Корреляция Pre↔Post через `tool_use_id` из payload хука (подтвердил смоком: реально прилетает `toolu_01...`). Fallback на hash(session_id + tool_input) — на случай если payload без id.
+- `settings.json`: `PostToolUse` matcher `""` (было `"Bash"`), чтобы маркер писался и для Write/Edit.
+- Смоук `echo "smoke-test new hook"`: PreToolUse→PostToolUse 130ms → маркер записан → nag процесс через 5 мин тихо вышел. ✓
+
+## [19:15] Streaming ассистент-текста в TG (через transcript_path)
+- Алексей: «почему в TG не видны твои ответы и рассуждения, только команды?»
+- Причина: у Claude Code нет hook'а на «ассистент сгенерировал текст» — только дискретные события (UserPromptSubmit / PreToolUse / PostToolUse / Stop). Но в каждом payload есть `transcript_path` — путь к JSONL где assistant-message с content-блоками text/thinking/tool_use пишется построчно.
+- Реализовал `flush_assistant_texts(transcript_path, session_id)` в hook_bridge.py: дочитывает JSONL с сохранённого оффсета (`/tmp/claude_hook_offsets/<session>.txt`), извлекает `content[].type == "text"` и `"thinking"` блоки ассистента, шлёт в TG как 💬 / 🧠 (chunked до 3800 символов). Вызывается на PreToolUse и Stop.
+- **Анти-флуд первого запуска**: если offset-файла нет, ищем байт-оффсет после последнего user-сообщения в transcript и ставим туда. Так старая история до текущего промпта не флудит, но текущий ход ассистента показывается полностью.
+- **Был один флуд**: между Edit 4 (добавление flush в handle_stop) и Edit 5 (first_time-гард), хук успел сработать БЕЗ гарда → прилетело ~10-30 💬 с историей переписки. Алексей получил.
+
+## [19:24] Cleanup + restart
+- Удалены `claude_tg_bridge/claude_runner.py`, `permission_gate.py`, `session_store.py` — SDK-режим мёртв.
+- `bot.py` упрощён: убран callback-handler (happrove/hdeny больше не шлются), только `/status /pause /resume`. /start обновлён под hook-mode описание с эмодзи-легендой.
+- `sudo systemctl restart claude-tg-bridge` — PID 3034815, active.
+
+## Bridge — итоговое состояние
+- Transport: ~/.claude/settings.json hooks → claude_tg_bridge/hook_bridge.py → Telegram (через Privoxy 8118)
+- Control: claude_tg_bridge/bot.py (long-poll, /pause /resume /status)
+- Approve: всегда в терминале (родной permission-flow Claude Code)
+- TG показывает: 🎤 user prompt, 💬 assistant text, 🧠 thinking, 🔹 Read/Grep/Glob/WebFetch/WebSearch/TodoWrite, 📤 Bash stdout, ⏰ nag если approve висит >5 мин, ✅ Stop
+- Pause-флаг: `/tmp/claude_hook_paused` (touch = хук exit 0 сразу)
+- Маркеры: `/tmp/claude_hook_done/<tool_use_id>.marker` — write on PostToolUse, read by nag
+- Оффсеты: `/tmp/claude_hook_offsets/<session>.txt` — для incremental чтения transcript
