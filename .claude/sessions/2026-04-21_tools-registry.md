@@ -34,15 +34,16 @@
 - [13:24] Smoke test 10 сценариев всех 4 tools (defaults, positional, mixed, validation rejects). OK.
 - [13:26] Миграция bot.py: /rules_find → search_filter_rules, /rules_off → deactivate_filter_rule (с reason из tg user id+username). py_compile OK.
 
+- [13:27] Шаг 3: tools/c1_synthesis.py — synthesize_1c_snapshot(persist). Scope/period параметризация отложена (требует разбиения build_synthesis_facts на под-функции — это отдельный рефакторинг). Smoke с persist=False: 11 фактов за 0.2с, все категории на месте. Теперь 5 tools в registry.
+
 ## Незавершённое / Следующие шаги
-- [ ] Рестарт telegram-logger + smoke на /rules_find /rules_off в проде.
-- [ ] Коммит шага 2.
-- [ ] Шаг 3: c1_synthesis (synthesize_1c_snapshot, параметризация scope/period).
+- [ ] Коммит шага 3.
 - [ ] Шаг 4: send_notification (рефакторинг confirm_send — выдрать бизнес из handler).
 
 ## Backlog
 - /rules_pending (bot.py:3365), rule_approve/rule_reject callbacks (bot.py:3427-3474) остались inline. Подходят для следующей волны вместе с tools для review_knowledge.py (apply_verdicts, apply_new_rules).
 - Другие ad-hoc SELECTs по km_filter_rules: auto_agent_cron.py:85, daily_report.py:295/318/324 — утилитарные счётчики, можно покрыть tool'ом get_filter_rules_stats() позже.
+- Scope/period параметризация synthesize_1c_snapshot — разбить build_synthesis_facts на sub-функции (sales_day/sales_week/clients_month/...) и добавить scope: Literal[...] в InputModel. Доделать когда появится конкретный use-case (RAG on-demand recompute по конкретному entity).
 
 ## Заметки
 - Решение: декоратор возвращает ИСХОДНУЮ функцию, не враппер. Даёт zero-cost migration — существующий Python-код зовёт через import, LLM/HTTP/slash зовут через invoke(). Валидация pydantic только на invoke() пути, прямой вызов полагается на typing.
