@@ -26,6 +26,8 @@ from telegram.ext import (
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+from tools.chats import get_chat_list
+
 ADMIN_USER_ID = 805598873
 
 # Conversation states
@@ -69,17 +71,6 @@ def resolve_recipients(target_type: str, target_filter: dict = None) -> list:
             )
         else:
             return []
-        return [dict(r) for r in cur.fetchall()]
-    finally:
-        cur.close()
-        conn.close()
-
-
-def get_available_chats() -> list:
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        cur.execute("SELECT chat_id, chat_title FROM tg_chats_metadata ORDER BY chat_title")
         return [dict(r) for r in cur.fetchall()]
     finally:
         cur.close()
@@ -138,7 +129,7 @@ async def select_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "notify_target_chats":
         context.user_data["notify"]["target_type"] = "chats"
         context.user_data["notify"]["selected_chats"] = []
-        chats = get_available_chats()
+        chats = get_chat_list(order_by="title")
         context.user_data["notify"]["all_chats"] = chats
         await _render_chat_buttons(query, context)
         return SELECT_CHATS
@@ -159,7 +150,7 @@ async def _render_chat_buttons(query, context):
     for c in chats:
         mark = "✅" if c["chat_id"] in selected else "⬜"
         kb.append([InlineKeyboardButton(
-            f'{mark} {c["chat_title"]}',
+            f'{mark} {c["title"]}',
             callback_data=f'notify_chat_{c["chat_id"]}',
         )])
     kb.append([InlineKeyboardButton("✅ Готово", callback_data="notify_chats_done")])

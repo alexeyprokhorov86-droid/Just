@@ -42,8 +42,8 @@ except ImportError:
     logger.warning("embedding_service не найден, векторный поиск отключен")
 
 
-# === Кэш списка чатов из metadata ===
-_chat_list_cache = {"data": None, "ts": 0}
+# get_chat_list переехал в tools.chats (кэш живёт там же).
+from tools.chats import get_chat_list
 
 # Ограничители качества retrieval/generation
 TELEGRAM_VECTOR_MIN_SCORE = 0.72
@@ -494,40 +494,6 @@ def freshness_by_time(dt_value, decay_days: int) -> float:
         return 0.5
     age_seconds = max((datetime.now() - dt_value).total_seconds(), 0)
     return float(math.exp(-age_seconds / max(decay_days * 86400, 1)))
-
-
-def get_chat_list() -> list:
-    """Возвращает список чатов из metadata с кэшем 5 минут."""
-    now = time.time()
-    if _chat_list_cache["data"] and (now - _chat_list_cache["ts"]) < 300:
-        return _chat_list_cache["data"]
-
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT chat_id, chat_title, table_name, last_message_at, description
-                FROM tg_chats_metadata
-                WHERE table_name IS NOT NULL
-                ORDER BY last_message_at DESC NULLS LAST
-            """)
-            chats = []
-            for row in cur.fetchall():
-                chats.append({
-                    "chat_id": row[0],
-                    "title": row[1] or "",
-                    "table": row[2],
-                    "last_msg": row[3].strftime("%d.%m.%Y") if row[3] else "нет сообщений",
-                    "description": row[4] or ""
-                })
-        conn.close()
-        _chat_list_cache["data"] = chats
-        _chat_list_cache["ts"] = now
-        logger.info(f"Загружен список чатов: {len(chats)} шт")
-        return chats
-    except Exception as e:
-        logger.error(f"Ошибка загрузки списка чатов: {e}")
-        return []
 
 
 def format_chat_list_for_llm() -> str:
