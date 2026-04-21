@@ -23,6 +23,24 @@ def _strip_bom(data: bytes) -> bytes:
     return data
 
 
+def _detect_encoding(data: bytes) -> str:
+    """Угадать кодировку XML: XML-декларация (encoding=...) → utf-8 → cp1251.
+
+    ФНС-файлы часто приходят в windows-1251 без BOM; без этой фоллбэк-логики
+    lxml бросает XMLSyntaxError на любой кириллический символ.
+    """
+    head = data[:200].decode("ascii", errors="ignore").lower()
+    if "encoding=" in head:
+        # lxml сам разберётся по XML-декларации
+        return ""
+    # Пробуем utf-8 strict, если падает — cp1251
+    try:
+        data[:2000].decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "windows-1251"
+
+
 def _clean_tag(tag: str) -> str:
     """Убрать namespace-префикс {ns}Tag → Tag."""
     return tag.split("}", 1)[-1] if "}" in tag else tag
@@ -87,6 +105,14 @@ def analyze_xml(
     """
     errors: list[str] = []
     data = _strip_bom(file_bytes)
+
+    # Если XML без декларации и не UTF-8 — lxml нужна явная перекодировка.
+    enc_hint = _detect_encoding(data)
+    if enc_hint and enc_hint != "utf-8":
+        try:
+            data = data.decode(enc_hint).encode("utf-8")
+        except UnicodeDecodeError:
+            pass
 
     try:
         root = etree.fromstring(data)

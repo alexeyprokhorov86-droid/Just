@@ -31,8 +31,22 @@ def detect_format(data: bytes) -> Format:
     if data[:4] == b"%PDF":
         return "pdf"
 
-    # XML (с BOM или без). ЭДО-УПД всегда с BOM UTF-8.
-    if data[:5] == b"<?xml" or (data[:3] == b"\xef\xbb\xbf" and data[3:8] == b"<?xml"):
+    # XML: несколько паттернов которые встречаются в реальных ЭДО-файлах
+    #   - <?xml (стандарт)
+    #   - BOM + <?xml (1С СчетаПК edi_stnd/109)
+    #   - \r\n<Файл ... (ФНС XML без декларации, часто windows-1251)
+    #   - <Файл ... (тот же ФНС, без CRLF)
+    head = data[:256]
+    if head[:5] == b"<?xml" or (head[:3] == b"\xef\xbb\xbf" and head[3:8] == b"<?xml"):
+        return "xml_upd"
+    # ФНС-паттерн: корневой <Файл ...> (cp1251 байты: d0a4d0b0d0b9d0bb = «Файл» в UTF-8,
+    # либо d4e0e9eb в cp1251). Детектим обе кодировки.
+    stripped = head.lstrip(b"\r\n\t ")
+    if stripped.startswith(b"<\xd0\xa4\xd0\xb0\xd0\xb9\xd0\xbb") or stripped.startswith(b"<\xd4\xe0\xe9\xeb"):
+        return "xml_upd"
+    # Любой XML начинающийся с < и содержащий xmlns= в первых 256 байтах —
+    # агрессивный фоллбек (xmlns может быть только в XML).
+    if stripped.startswith(b"<") and b"xmlns" in head:
         return "xml_upd"
 
     # Images

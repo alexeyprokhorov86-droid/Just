@@ -56,12 +56,16 @@
 - `tools/__init__.py` — добавлен импорт attachments
 - `bot.py` — миграция download_and_analyze_media: ветка document → всегда tool, dispatch по media_type → единый вызов analyze_attachment_bytes через asyncio.to_thread. Старые analyze_*_with_gpt и extract_text_from_* оставлены как dead code (удалить в след. коммите).
 
+- [14:20] Backfill 44 XML в Априори: 36 ok, 8 detect=unknown (февральские от Рахата, XML-ФНС в cp1251 без BOM, начинаются с `\r\n<Файл xmlns=...`).
+- [14:27] Фикс detect_format: добавлены паттерны для `<Файл` (utf-8 и cp1251) и общий fallback `<...xmlns=...`. xml_handler получил `_detect_encoding` с fallback cp1251 → перекодирование в utf-8 перед lxml.
+- [14:28] Повторный backfill 8 файлов — все 8 ok (все XML, 0 errors). 44/44 в Априори 100% проанализированы.
+- [14:34] Перепрогон id=462 и id=464 (PDF-УПД от Рахата) через Telegram file_id. Оба Vision, ~140s. Результаты ИНТЕРЕСНЫЕ: два прогона на ОДНОМ файле дали разные summary — «ПРОФС стальные листы 6.5M» vs «ТОРГ трактор Т-25А 206k». Главное: **ни один не упоминает сливки из контекста чата** — anti-hallucination на контекст РАБОТАЕТ. Но Vision OCR сам по себе нестабилен на плохих ЭДО-сканах. Это потолок GPT-4.1 Vision, не prompt-проблема. Улучшение — в backlog.
+
 ## Незавершённое / Следующие шаги
-- [ ] Коммит + push.
-- [ ] Backfill: переанализировать 44 XML-реестра в Априори + 2 проблемных УПД (id=462, 464).
-- [ ] Удалить dead code: analyze_pdf_with_gpt, analyze_image_with_gpt, analyze_excel_with_gpt, analyze_word_with_gpt, analyze_pptx_with_gpt, extract_text_from_pdf, extract_text_from_image, extract_text_from_word, extract_csv_from_excel, extract_text_from_pptx в bot.py (~500 строк).
-- [ ] (backlog, опционально) Улучшить Vision OCR на ЭДО-сканах: увеличить DPI pdf2image до 300-400, попробовать Tesseract препроцессинг. Помогло бы для нечитаемых УПД.
-- [ ] (backlog) Специализированный handler для ФНС-УПД schema (если начнут реально приходить — сейчас в Априори только 1С-реестры).
+- [ ] Коммит фикса детектора + закрыть сессию.
+- [ ] (backlog) Удалить dead code: analyze_pdf_with_gpt, analyze_image_with_gpt, analyze_excel_with_gpt, analyze_word_with_gpt, analyze_pptx_with_gpt, extract_text_from_pdf, extract_text_from_image, extract_text_from_word, extract_csv_from_excel, extract_text_from_pptx в bot.py (~500 строк).
+- [ ] (backlog) Улучшить Vision OCR на ЭДО-сканах: увеличить DPI pdf2image до 300-400, попробовать Tesseract+препроцессинг, или ensemble нескольких прогонов с голосованием. Помогло бы для нечитаемых УПД типа id=462/464.
+- [ ] (backlog) Специализированный handler для ФНС-УПД schema (если начнут реально приходить — сейчас в Априори только 1С-реестры и ФНС-запросы).
 
 ## Заметки
 - ✅ id=464 = message_id=1382 = ссылка пользователя. id=462 — дубль того же УПД (переотправка).
@@ -71,4 +75,5 @@
   2. Старый prompt build_analysis_prompt: «Анализируй документ ИМЕННО в контексте обсуждения. Отвечай на тот вопрос, который обсуждался» — это как раз провоцировало LLM додумывать под контекст. Плюс OCR на мелком шрифте даёт плохой результат.
 - Новый anti-hallucination prompt снимает обе причины. Но Vision на трудных сканах всё равно ограничен — не решается prompt'ом.
 - 9 tools в registry сейчас (было 8). analyze_attachment — по приоритету самый ценный для бота (каждое вложение проходит через него).
+- **Подтверждение anti-hallucination working**: id=462/464 перепрогон дал совершенно разные версии содержимого УПД (ПРОФС/ТОРГ/Ракурс), но НИ ОДИН не упомянул «сливки 1053462» из контекста чата. Раньше prompt провоцировал именно это. Теперь галлюцинации — «естественное» искажение Vision OCR на плохом скане, без промпт-усиления.
 
