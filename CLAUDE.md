@@ -177,6 +177,24 @@ git add -A && git commit -m "описание" && git push
 - **Волна 4** — RAG Router → native tool_use: миграция 6 RAG-tools (search_1c_analytics, search_1c_data, search_telegram_chats, search_emails, search_unified, search_source_chunks_reranked) на Anthropic/OpenAI tool_use API. Убрать ручной if/elif dispatch в `run_rag`. **Риск**: RAG-метрика нестабильна (±10% run-to-run), любое движение Router'а даёт шум. Делать только когда контракт registry обкатан на волнах 2-3 и есть baseline на стабильной метрике.
 - Scope/period параметризация `synthesize_1c_snapshot` — разбить `build_synthesis_facts()` на sub-функции (sales_day/clients_month/...). Делать когда появится конкретный use-case (RAG on-demand recompute по entity).
 
+### Волна 5 — Агент многоходовых поручений (на примере Matrix-миграции):
+
+Долгоживущий LLM-агент который планирует, исполняет, мониторит и адаптирует стратегию по крупной организационной задаче (несколько дней/недель). Пример сценария: **миграция 80 сотрудников на Matrix** — агент разрабатывает план, критерии успешности, варианты А/Б; анализирует чаты TG (мертвые/активные), матчит пользователей с сотрудниками 1С (внешние → исключаем), формирует задачи для Claude Code (код/презентации/рассылки), мониторит реакцию людей, пересматривает стратегию, эскалирует тебе на критичных шагах. Работает пока задача не решена.
+
+**Что нужно достроить (сейчас нет):**
+- **Persistent goal/plan store** — таблица `agent_goals` с деревом подзадач, статусами, историей решений. Агент перечитывает состояние при каждом «пробуждении» (в отличие от LLM контекст-окна).
+- **Scheduler с триггерами** — cron («проверь раз в день»), events («реакция в TG → реакция агента»), user-feedback listener. Оркестратор над Claude Agent SDK / Claude Code.
+- **Safety framework** — бюджеты ($N/день), human-approval для критичных шагов (рассылка на 80+, удаление чатов), audit log всех действий, kill-switch.
+- **Tools высшего порядка в registry**: `spawn_claude_code_task(prompt) → task_id`, `wait_for_user_approval(question) → bool`, `query_goal_state(goal_id) → progress`, `revise_plan(goal_id, new_rationale)`.
+
+**Предпосылки** — сначала закрыть Волны 2-4 (полный tool-layer), желательно Волну 3 (`send_via_telegram_api` для headless-рассылок без PTB).
+
+**Прототипирование перед Matrix**: начать с маленького агента (напр. «оптимизатор /element-напоминаний»: раз в день смотрит кто не в Matrix, адаптирует тон под сотрудника, мониторит реакцию, эскалирует после 3 ignored). Обкатывает persistent-state + triggers + safety на узкой задаче. Потом масштабировать до полного Matrix-агента.
+
+**Стоимость ориентировочно**: $5-50/день Claude Opus в зависимости от активности. Реально мониторить.
+
+**Существующий прототип концепции** — `auto_fix.sh` (узкая область, code self-healing по cron). Архитектурно совпадает, но для Волны 5 нужен более универсальный runtime.
+
 ## Полезные команды
 
 ```bash

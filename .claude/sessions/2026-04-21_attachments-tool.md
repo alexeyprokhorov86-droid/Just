@@ -66,6 +66,7 @@
 - (backlog, отдельная сессия) Удалить dead code в bot.py: analyze_pdf_with_gpt, analyze_image_with_gpt, analyze_excel_with_gpt, analyze_word_with_gpt, analyze_pptx_with_gpt, extract_text_from_pdf, extract_text_from_image, extract_text_from_word, extract_csv_from_excel, extract_text_from_pptx (~500 строк).
 - (backlog) Улучшить Vision OCR на ЭДО-сканах: ↑DPI pdf2image до 300-400, Tesseract+препроцессинг, либо ensemble с голосованием. Нужно для нечитаемых УПД (id=462/464 дали разные интерпретации на каждом прогоне).
 - (backlog) Специализированный handler для ФНС-УПД schema — когда начнут реально приходить (сейчас только 1С-реестры и ФНС-запросы).
+- [14:50] Пользователь попросил зафиксировать в CLAUDE.md концепцию Волны 5 — агент многоходовых поручений (пример Matrix-миграция). Добавлена секция в Приоритеты с описанием: persistent goal/plan store, scheduler+triggers, safety framework, tools высшего порядка, прототипирование на «оптимизаторе /element-напоминаний», оценка стоимости.
 
 ## Заметки
 - ✅ id=464 = message_id=1382 = ссылка пользователя. id=462 — дубль того же УПД (переотправка).
