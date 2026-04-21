@@ -44,9 +44,10 @@
 - [13:33] Smoke 10 проверок (8 tools, все валидации, позиционные/keyword, прямой/invoke). Рестарт telegram-logger: active, чистый startup, 0 errors.
 - [13:34] notifications.py: -116 +35 строк. Total на всю сессию: -173 строки дубликатов/handler-коробок, +6 файлов tools/ infrastructure, 8 tools в registry.
 
-## Незавершённое / Следующие шаги
-- [ ] Коммит шага 4 + финальный push.
-- [ ] (backlog) send_via_telegram_api(bot_token, chat_id, text, reply_markup) — прямой HTTPS POST для cron/headless. Нужно когда авто_fix будет слать алерты без PTB Application.
+## Незавершённое / Следующие шаги (сессия закрыта 2026-04-21)
+- Сессия закрыта. Все 4 шага + checkpoint + CLAUDE.md запушены, бот проверен юзером в бою (`/notify`, `/rules_find`, `/rules_off`).
+- Продолжение → отдельные сессии: волны 2-4 расписаны в CLAUDE.md#Приоритеты.
+- (backlog) send_via_telegram_api(bot_token, chat_id, text, reply_markup) — прямой HTTPS POST для cron/headless.
 
 ## Backlog
 - /rules_pending (bot.py:3365), rule_approve/rule_reject callbacks (bot.py:3427-3474) остались inline. Подходят для следующей волны вместе с tools для review_knowledge.py (apply_verdicts, apply_new_rules).
