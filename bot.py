@@ -3920,13 +3920,20 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
             headers=mh, timeout=10
         ).json().get("members", []))
 
-        # ── Load mapping from DB ──
+        # ── Load mapping from DB (с agent-колонками и connection к 1С) ──
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
             SELECT m.telegram_user_id, m.telegram_name, m.telegram_username,
-                   m.matrix_id, m.matrix_username, m.matrix_password, m.joined_at
+                   m.matrix_id, m.matrix_username, m.matrix_password, m.joined_at,
+                   m.exclude_from_reminder, m.reminder_sent_count,
+                   m.last_reminder_sent_at, m.reminder_frequency_days,
+                   m.escalated_at, m.employee_ref_key, m.is_external,
+                   (SELECT COUNT(*) FROM tg_user_roles ur
+                    WHERE ur.user_id = m.telegram_user_id AND ur.is_active = true) AS active_chats,
+                   s.dismissal_date, s.position_name
             FROM matrix_user_mapping m
+            LEFT JOIN v_current_staff s ON s.ref_key = m.employee_ref_key
         """)
         users = []
         for row in cur.fetchall():
@@ -3934,6 +3941,16 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
                 "tg_uid": row[0], "name": row[1], "username": row[2],
                 "matrix_id": row[3], "mx_user": row[4], "mx_pass": row[5],
                 "joined_at": row[6],
+                "exclude": bool(row[7]),
+                "sent_count": row[8] or 0,
+                "last_sent": row[9],
+                "freq_days": row[10] or 1,
+                "escalated_at": row[11],
+                "employee_ref_key": row[12],
+                "is_external": row[13],
+                "active_chats": row[14] or 0,
+                "dismissal_date": row[15],
+                "position_name": row[16],
             })
 
         # ── Sync joined_at via devices API ──
@@ -4031,12 +4048,42 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
                         invites_sent += 1
                     _time.sleep(0.2)
 
-        # ── Send personal reminders ──
+        # ── Smart-фильтр: кого НЕ беспокоить ─────────────────────────────
+        # Решение каждое утро: стоит ли писать этому user-у reminder сегодня?
+        # Критерии складываются; skip-reason попадает в админский отчёт.
+        from datetime import datetime, timezone
+        now_ts = datetime.now(timezone.utc)
+
+        def reminder_decision(u: dict) -> tuple[bool, str]:
+            if u["matrix_id"] in SKIP_MATRIX:
+                return False, "SKIP_MATRIX"
+            if u.get("exclude"):
+                return False, "exclude_from_reminder=true"
+            if u.get("active_chats", 0) == 0:
+                return False, "покинул все активные TG-чаты"
+            if u.get("is_external") is True:
+                return False, "помечен как внешний"
+            if u.get("dismissal_date"):
+                return False, f"уволен в 1С (dismissal_date={u['dismissal_date']:%Y-%m-%d})"
+            last = u.get("last_sent")
+            freq = u.get("freq_days", 1)
+            if last:
+                days_since = (now_ts - last).total_seconds() / 86400
+                if days_since < freq:
+                    return False, f"frequency dampening ({days_since:.1f}<{freq} дней)"
+            return True, ""
+
+        # ── Send personal reminders ────────────────────────────────────
         sent_personal = 0
+        skipped: list[tuple[str, str]] = []  # (name, reason) для админа
 
         for u in users:
-            if u["matrix_id"] in SKIP_MATRIX:
+            ok_to_send, reason = reminder_decision(u)
+            if not ok_to_send:
+                if reason and reason != "SKIP_MATRIX":
+                    skipped.append((u["name"], reason))
                 continue
+
             tg_uid = u["tg_uid"]
             name = u["name"]
 
@@ -4061,6 +4108,7 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
                     ).json()
                     if resp.get("ok"):
                         sent_personal += 1
+                        u["_reminder_sent"] = True
                     else:
                         u["_cant_send"] = True
                         logger.info(f"element_reminder: не удалось отправить {name} ({tg_uid}): {resp.get('description', '')}")
@@ -4090,6 +4138,7 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
                     ).json()
                     if resp.get("ok"):
                         sent_personal += 1
+                        u["_reminder_sent"] = True
                     else:
                         u["_cant_send"] = True
                         logger.info(f"element_reminder: не удалось отправить {name} ({tg_uid}): {resp.get('description', '')}")
@@ -4097,70 +4146,59 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
                     u["_cant_send"] = True
                     logger.warning(f"element_reminder: ошибка отправки {name}: {e}")
 
-        # ── Group messages with inline button for unreachable users ──
-        cant_reach = [u for u in users if u.get("_cant_send") and u["matrix_id"] not in SKIP_MATRIX]
-        group_msgs_sent = 0
-        if cant_reach:
-            # Group unreachable users by their TG chats
-            from collections import defaultdict
-            chat_to_users = defaultdict(list)
-            conn2 = get_db_connection()
-            cur2 = conn2.cursor()
-            for u in cant_reach:
-                cur2.execute(
-                    "SELECT chat_id FROM tg_user_roles WHERE user_id = %s AND is_active = true",
-                    (u["tg_uid"],)
-                )
-                for (cid,) in cur2.fetchall():
-                    chat_to_users[cid].append(u)
-            cur2.close()
-            conn2.close()
-
-            # Send one message per group with inline button
-            sent_chats = set()
-            for chat_id, group_users in chat_to_users.items():
-                if chat_id in sent_chats:
+        # ── Batch-update stats + adaptive frequency + эскалация ────────
+        # После успешных отправок: increment counter, адаптивная частота:
+        #   * 3+ ignored ≈ неделя между reminder'ами (freq_days=7)
+        #   * 10+ → отмечаем escalated_at, в админский отчёт попадёт
+        #     отдельным блоком «нужно лично поговорить».
+        conn3 = get_db_connection()
+        cur3 = conn3.cursor()
+        try:
+            for u in users:
+                if not u.get("_reminder_sent"):
                     continue
-                # Deduplicate users across chats
-                names_in_group = []
-                for u in group_users:
-                    if u.get("username"):
-                        names_in_group.append(f"@{u['username']}")
-                    else:
-                        names_in_group.append(u["name"])
+                new_count = u["sent_count"] + 1
+                new_freq = u["freq_days"]
+                if new_count >= 3 and new_freq < 7:
+                    new_freq = 7
+                just_escalated = new_count >= 10 and not u.get("escalated_at")
+                if just_escalated:
+                    cur3.execute(
+                        """UPDATE matrix_user_mapping SET
+                               reminder_sent_count = %s,
+                               last_reminder_sent_at = NOW(),
+                               reminder_frequency_days = %s,
+                               escalated_at = NOW()
+                           WHERE telegram_user_id = %s""",
+                        (new_count, new_freq, u["tg_uid"]),
+                    )
+                    u["just_escalated"] = True
+                else:
+                    cur3.execute(
+                        """UPDATE matrix_user_mapping SET
+                               reminder_sent_count = %s,
+                               last_reminder_sent_at = NOW(),
+                               reminder_frequency_days = %s
+                           WHERE telegram_user_id = %s""",
+                        (new_count, new_freq, u["tg_uid"]),
+                    )
+            conn3.commit()
+        finally:
+            cur3.close()
+            conn3.close()
 
-                keyboard = {"inline_keyboard": [[{
-                    "text": "📱 Получить данные для Element X",
-                    "url": "https://t.me/AI_FRUM_NF_bot?start=element"
-                }]]}
-                group_msg = (
-                    f"📢 Element X — корпоративный мессенджер\n\n"
-                    f"Ещё не подключились: {', '.join(names_in_group)}\n\n"
-                    f"Нажмите кнопку ниже — я отправлю вам данные для входа в личном сообщении."
-                )
-                try:
-                    resp = req.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        json={
-                            "chat_id": chat_id,
-                            "text": group_msg,
-                            "reply_markup": keyboard,
-                            "disable_web_page_preview": True,
-                        },
-                        proxies=proxies, timeout=15
-                    ).json()
-                    if resp.get("ok"):
-                        group_msgs_sent += 1
-                        sent_chats.add(chat_id)
-                except Exception as e:
-                    logger.warning(f"element_reminder: group msg to {chat_id} failed: {e}")
+        # ── Unreachable users → только в админский отчёт ────────────────
+        # (старое поведение: спам в рабочие чаты с тегами — УБРАНО;
+        # внешние не должны видеть «кто не подключился»).
+        cant_reach = [u for u in users if u.get("_cant_send") and u["matrix_id"] not in SKIP_MATRIX]
 
-        # ── Admin report ──
+        # ── Admin report ──────────────────────────────────────────────
         total = len([u for u in users if u["matrix_id"] not in SKIP_MATRIX])
         joined = len([u for u in users if u.get("has_devices") and u["matrix_id"] not in SKIP_MATRIX])
         not_joined = total - joined
         with_missing = len([u for u in users if u.get("has_devices") and u.get("missing_rooms") and u["matrix_id"] not in SKIP_MATRIX])
         all_ok = len([u for u in users if u.get("has_devices") and not u.get("missing_rooms") and u["matrix_id"] not in SKIP_MATRIX])
+        escalated_now = [u for u in users if u.get("just_escalated")]
 
         report_lines = [
             f"📊 Element X — статус миграции",
@@ -4168,13 +4206,29 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
             f"✅ Подключились полностью: {all_ok}",
             f"⚠️ Подключились, не все комнаты: {with_missing}",
             f"❌ Не вошли: {not_joined}",
-            f"📨 Личных напоминаний отправлено: {sent_personal}",
+            f"📨 Личных напоминаний отправлено сегодня: {sent_personal}",
             f"🔗 Matrix-приглашений отправлено: {invites_sent}",
-            f"💬 Сообщений в группы (с кнопкой): {group_msgs_sent}",
         ]
+        if skipped:
+            report_lines.append(f"🤫 Пропущено reminder'ов (фильтры): {len(skipped)}")
 
         if newly_joined:
             report_lines.append(f"\n🆕 Новые подключения: {', '.join(newly_joined)}")
+
+        # Эскалированные — требуют личного вмешательства.
+        if escalated_now:
+            report_lines.append(f"\n🚨 Эскалация (10+ reminder'ов, не реагируют) — нужно лично:")
+            for u in escalated_now:
+                n = f"@{u['username']}" if u.get("username") else u["name"]
+                pos = f" ({u['position_name']})" if u.get("position_name") else ""
+                report_lines.append(f"  • {n}{pos}")
+
+        # Кто заблокировал бота — не можем достать персональным сообщением.
+        if cant_reach:
+            report_lines.append(f"\n🔕 Заблокировали бота / не начали диалог ({len(cant_reach)}) — надо достучаться другим путём:")
+            for u in cant_reach:
+                n = f"@{u['username']}" if u.get("username") else u["name"]
+                report_lines.append(f"  • {n}")
 
         if with_missing > 0:
             report_lines.append(f"\n⚠️ Не все комнаты приняты:")
@@ -4192,6 +4246,15 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
                     names.append(n)
             report_lines.append(f"  {', '.join(names)}")
 
+        # Подробный отчёт по skipped reasons — только если их много или впервые,
+        # чтобы не засорять каждый день одним и тем же.
+        if skipped and len(skipped) >= 3:
+            from collections import Counter
+            reason_stats = Counter(reason for _, reason in skipped)
+            report_lines.append(f"\n🤫 Причины пропусков:")
+            for reason, cnt in reason_stats.most_common():
+                report_lines.append(f"  • {cnt}× {reason}")
+
         admin_report = "\n".join(report_lines)
         req.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -4199,7 +4262,11 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
             proxies=proxies, timeout=30
         )
 
-        logger.info(f"element_reminder: total={total}, joined={joined}, not_joined={not_joined}, missing_rooms={with_missing}, sent={sent_personal}")
+        logger.info(
+            f"element_reminder: total={total}, joined={joined}, not_joined={not_joined}, "
+            f"missing_rooms={with_missing}, sent={sent_personal}, skipped={len(skipped)}, "
+            f"escalated_now={len(escalated_now)}, cant_reach={len(cant_reach)}"
+        )
 
     except Exception as e:
         logger.error(f"element_reminder error: {e}", exc_info=True)
