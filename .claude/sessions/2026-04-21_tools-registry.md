@@ -28,11 +28,21 @@
 - [13:14] Миграция notifications.py: удалил `get_available_chats` (lines 78-86), заменил вызов на `get_chat_list(order_by="title")` в `_ask_type`, починил `_render_chat_buttons` (`c["chat_title"]` → `c["title"]`). Добавил импорт `from tools.chats import get_chat_list` после `load_dotenv()`.
 - [13:15] Финальный grep: остаточных ссылок на `_chat_list_cache`/`get_available_chats` нет (только комментарий в tools/chats.py).
 
+- [13:16] Checkpoint 1: 2 коммита (auto_fix + tools-start), git push, systemctl restart telegram-logger → active, "Бот запущен", нет ImportError.
+- [13:20] Шаг 2 start: tools/km_rules.py — search_filter_rules + deactivate_filter_rule. В distillation.py добавлена invalidate_filter_rules_cache() (deactivate её дёргает через sys.modules лениво — не триггерит import, если distillation ещё не загружен).
+- [13:22] Bug в registry: sig.bind() падал на required args без Python-defaults. Fix: маппить позиционные args в kwargs вручную (param_names из inspect.signature), InputModel сам применяет defaults. SSOT = InputModel.
+- [13:24] Smoke test 10 сценариев всех 4 tools (defaults, positional, mixed, validation rejects). OK.
+- [13:26] Миграция bot.py: /rules_find → search_filter_rules, /rules_off → deactivate_filter_rule (с reason из tg user id+username). py_compile OK.
+
 ## Незавершённое / Следующие шаги
-- [ ] Checkpoint 1 — показать юзеру, `sudo systemctl restart telegram-logger` если ок, коммит.
-- [ ] Шаг 2: km_rules (get_filter_rules + deactivate_filter_rule).
-- [ ] Шаг 3: c1_synthesis (synthesize_1c_snapshot).
-- [ ] Шаг 4: send_notification (рефакторинг confirm_send).
+- [ ] Рестарт telegram-logger + smoke на /rules_find /rules_off в проде.
+- [ ] Коммит шага 2.
+- [ ] Шаг 3: c1_synthesis (synthesize_1c_snapshot, параметризация scope/period).
+- [ ] Шаг 4: send_notification (рефакторинг confirm_send — выдрать бизнес из handler).
+
+## Backlog
+- /rules_pending (bot.py:3365), rule_approve/rule_reject callbacks (bot.py:3427-3474) остались inline. Подходят для следующей волны вместе с tools для review_knowledge.py (apply_verdicts, apply_new_rules).
+- Другие ad-hoc SELECTs по km_filter_rules: auto_agent_cron.py:85, daily_report.py:295/318/324 — утилитарные счётчики, можно покрыть tool'ом get_filter_rules_stats() позже.
 
 ## Заметки
 - Решение: декоратор возвращает ИСХОДНУЮ функцию, не враппер. Даёт zero-cost migration — существующий Python-код зовёт через import, LLM/HTTP/slash зовут через invoke(). Валидация pydantic только на invoke() пути, прямой вызов полагается на typing.

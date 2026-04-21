@@ -331,6 +331,13 @@ def get_filter_rules(conn):
     return _filter_rules_cache
 
 
+def invalidate_filter_rules_cache():
+    """Сбросить кэш после изменения km_filter_rules (напр. deactivate_filter_rule
+    из tools/km_rules.py). Следующий is_junk() перезагрузит правила."""
+    global _filter_rules_cache
+    _filter_rules_cache = None
+
+
 def is_junk(text, target='facts', conn=None):
     """Проверяет текст по правилам из km_filter_rules. True = мусор."""
     if not text or not text.strip():

@@ -31,6 +31,7 @@ from apscheduler.triggers.cron import CronTrigger
 from company_context import get_company_profile
 from fact_extractor import extract_and_save_facts
 from notifications import get_notify_conversation_handler, handle_ack, notify_status, notify_remind
+from tools.km_rules import search_filter_rules, deactivate_filter_rule
 
 # Загружаем переменные окружения
 # Ищем .env в директории скрипта или в текущей директории
@@ -3484,28 +3485,20 @@ async def rules_find_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     query_str = " ".join(context.args).strip()
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, value, rule_type, added_by, created_at::date
-                FROM km_filter_rules
-                WHERE is_active = true AND value ILIKE %s
-                ORDER BY created_at DESC LIMIT 10
-            """, (f"%{query_str}%",))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+    rows = search_filter_rules(query=query_str, only_active=True, limit=10)
 
     if not rows:
         await update.message.reply_text(f'🔍 Правила с "{query_str}" не найдены')
         return
 
     lines = [f'🔍 Найдено {len(rows)} для "{query_str}":\n']
-    for i, (rid, value, rtype, added_by, created) in enumerate(rows, 1):
-        date_str = created.strftime("%d.%m") if created else ""
-        lines.append(f'{i}. [ID:{rid}] "{value}" ({rtype}) — {added_by or "?"}, {date_str}')
-    all_ids = " ".join(str(r[0]) for r in rows)
+    for i, r in enumerate(rows, 1):
+        date_str = r["created_at"].strftime("%d.%m") if r.get("created_at") else ""
+        lines.append(
+            f'{i}. [ID:{r["id"]}] "{r["value"]}" ({r["rule_type"]}) — '
+            f'{r.get("added_by") or "?"}, {date_str}'
+        )
+    all_ids = " ".join(str(r["id"]) for r in rows)
     lines.append(f"\nОтключить: /rules_off {all_ids}")
     await update.message.reply_text("\n".join(lines))
 
@@ -3526,26 +3519,17 @@ async def rules_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ID должны быть числами")
         return
 
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE km_filter_rules SET is_active = false, updated_at = NOW()
-                WHERE id = ANY(%s) AND is_active = true
-                RETURNING id, value, rule_type
-            """, (ids,))
-            updated = cur.fetchall()
-            conn.commit()
-    finally:
-        conn.close()
+    user = update.effective_user
+    reason = f"manual off by tg:{user.id} @{user.username or ''}".strip()
+    result = deactivate_filter_rule(rule_ids=ids, reason=reason)
 
-    if not updated:
+    if result["deactivated"] == 0:
         await update.message.reply_text("Ничего не отключено (правила не найдены или уже неактивны)")
         return
 
-    lines = [f"✅ Отключено: {len(updated)}"]
-    for rid, value, rtype in updated:
-        lines.append(f'  "{value}" ({rtype}, ID:{rid})')
+    lines = [f"✅ Отключено: {result['deactivated']}"]
+    for r in result["rules"]:
+        lines.append(f'  "{r["value"]}" ({r["rule_type"]}, ID:{r["id"]})')
     await update.message.reply_text("\n".join(lines))
 
 def get_chat_id_by_title(chat_title: str) -> int | None:

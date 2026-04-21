@@ -58,15 +58,30 @@ def tool(
     def wrap(fn: Callable) -> Callable:
         if name in REGISTRY:
             raise ValueError(f"tool '{name}' already registered")
-        sig = inspect.signature(fn)
+        param_names = list(inspect.signature(fn).parameters.keys())
 
         @functools.wraps(fn)
         def validated(*args: Any, **kwargs: Any) -> Any:
-            bound = sig.bind(*args, **kwargs)
-            bound.apply_defaults()
+            # Маппим позиционные аргументы в keyword — InputModel работает только
+            # с именами. Не используем sig.bind() потому что он требует
+            # Python-defaults на fn-сигнатуре; defaults мы держим только в
+            # InputModel (single source of truth).
+            if args:
+                for i, value in enumerate(args):
+                    if i >= len(param_names):
+                        raise TypeError(
+                            f"{name}() got {len(args)} positional args, "
+                            f"expected at most {len(param_names)}"
+                        )
+                    key = param_names[i]
+                    if key in kwargs:
+                        raise TypeError(
+                            f"{name}() got multiple values for '{key}'"
+                        )
+                    kwargs[key] = value
             # InputModel ловит опечатки/неверные типы/enum-нарушения одинаково
-            # для прямого импорта и для invoke() из dict.
-            model = input_model(**bound.arguments)
+            # для прямого импорта и для invoke() из dict, и применяет defaults.
+            model = input_model(**kwargs)
             return fn(**model.model_dump())
 
         REGISTRY[name] = Tool(
