@@ -27,6 +27,11 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 from tools.chats import get_chat_list
+from tools.notifications import (
+    resolve_notification_recipients,
+    prepare_notification,
+    finalize_notification,
+)
 
 ADMIN_USER_ID = 805598873
 
@@ -42,39 +47,6 @@ def get_db_connection():
         user="knowledge",
         password=os.getenv("DB_PASSWORD"),
     )
-
-
-def resolve_recipients(target_type: str, target_filter: dict = None) -> list:
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        if target_type == "all":
-            cur.execute(
-                "SELECT DISTINCT ON (user_id) user_id, first_name "
-                "FROM tg_user_roles WHERE is_active = TRUE ORDER BY user_id, id"
-            )
-        elif target_type == "chats":
-            chat_ids = target_filter.get("chat_ids", [])
-            cur.execute(
-                "SELECT DISTINCT ON (user_id) user_id, first_name "
-                "FROM tg_user_roles WHERE is_active = TRUE AND chat_id = ANY(%s) "
-                "ORDER BY user_id, id",
-                (chat_ids,),
-            )
-        elif target_type == "users":
-            user_ids = target_filter.get("user_ids", [])
-            cur.execute(
-                "SELECT DISTINCT ON (user_id) user_id, first_name "
-                "FROM tg_user_roles WHERE user_id = ANY(%s) "
-                "ORDER BY user_id, id",
-                (user_ids,),
-            )
-        else:
-            return []
-        return [dict(r) for r in cur.fetchall()]
-    finally:
-        cur.close()
-        conn.close()
 
 
 def get_active_users() -> list:
@@ -122,7 +94,7 @@ async def select_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "notify_target_all":
         context.user_data["notify"]["target_type"] = "all"
         context.user_data["notify"]["target_filter"] = None
-        recipients = resolve_recipients("all")
+        recipients = resolve_notification_recipients(target_type="all", target_filter={})
         context.user_data["notify"]["recipients"] = recipients
         return await _ask_type(query, context)
 
@@ -168,7 +140,9 @@ async def select_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Выберите хотя бы один чат", show_alert=True)
             return SELECT_CHATS
         context.user_data["notify"]["target_filter"] = {"chat_ids": selected}
-        recipients = resolve_recipients("chats", {"chat_ids": selected})
+        recipients = resolve_notification_recipients(
+            target_type="chats", target_filter={"chat_ids": selected}
+        )
         context.user_data["notify"]["recipients"] = recipients
         return await _ask_type(query, context)
 
@@ -209,7 +183,9 @@ async def select_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Выберите хотя бы одного", show_alert=True)
             return SELECT_USERS
         context.user_data["notify"]["target_filter"] = {"user_ids": selected}
-        recipients = resolve_recipients("users", {"user_ids": selected})
+        recipients = resolve_notification_recipients(
+            target_type="users", target_filter={"user_ids": selected}
+        )
         context.user_data["notify"]["recipients"] = recipients
         return await _ask_type(query, context)
 
@@ -272,107 +248,50 @@ async def confirm_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     nd = context.user_data["notify"]
-    recipients = nd["recipients"]
 
-    # Save to DB
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO notifications (text, notification_type, target_type, target_filter, created_by, status) "
-            "VALUES (%s, %s, %s, %s, %s, 'sending') RETURNING id",
-            (nd["text"], nd["notification_type"], nd["target_type"],
-             json.dumps(nd["target_filter"]) if nd["target_filter"] else None,
-             ADMIN_USER_ID),
-        )
-        notif_id = cur.fetchone()[0]
-
-        for r in recipients:
-            cur.execute(
-                "INSERT INTO notification_recipients (notification_id, user_id, first_name) "
-                "VALUES (%s, %s, %s)",
-                (notif_id, r["user_id"], r["first_name"]),
-            )
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
+    plan = prepare_notification(
+        text=nd["text"],
+        target_type=nd["target_type"],
+        target_filter=nd.get("target_filter") or {},
+        notification_type=nd["notification_type"],
+        created_by=ADMIN_USER_ID,
+    )
+    notif_id = plan["notification_id"]
+    recipients = plan["recipients"]
 
     await query.edit_message_text(f"📤 Отправка оповещения #{notif_id}...")
 
-    # Send messages
-    sent = 0
-    errors = 0
+    results = []
     for r in recipients:
+        reply_markup = None
+        if nd["notification_type"] == "confirm":
+            reply_markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Ознакомлен(а)", callback_data=f"notify_ack_{notif_id}")
+            ]])
         try:
-            text = nd["text"]
-            reply_markup = None
-            if nd["notification_type"] == "confirm":
-                reply_markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Ознакомлен(а)", callback_data=f"notify_ack_{notif_id}")
-                ]])
-
             await context.bot.send_message(
                 chat_id=r["user_id"],
-                text=text,
+                text=nd["text"],
                 reply_markup=reply_markup,
             )
-            _mark_delivered(notif_id, r["user_id"])
-            sent += 1
+            results.append({"user_id": r["user_id"], "delivered": True, "error": ""})
         except Exception as e:
             err_msg = str(e)
             logger.warning(f"notify #{notif_id}: failed to send to {r['user_id']}: {err_msg}")
-            _mark_error(notif_id, r["user_id"], err_msg)
-            errors += 1
-
+            results.append({"user_id": r["user_id"], "delivered": False, "error": err_msg})
         await asyncio.sleep(0.05)
 
-    # Update status
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("UPDATE notifications SET status = 'sent' WHERE id = %s", (notif_id,))
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
+    summary = finalize_notification(notification_id=notif_id, results=results)
 
     await context.bot.send_message(
         chat_id=ADMIN_USER_ID,
-        text=f"✅ Оповещение #{notif_id} отправлено.\nДоставлено: {sent}, Ошибки: {errors}",
+        text=(
+            f"✅ Оповещение #{notif_id} отправлено.\n"
+            f"Доставлено: {summary['sent']}, Ошибки: {summary['errors']}"
+        ),
     )
     context.user_data.pop("notify", None)
     return ConversationHandler.END
-
-
-def _mark_delivered(notif_id, user_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "UPDATE notification_recipients SET sent_at = NOW(), delivered = TRUE "
-            "WHERE notification_id = %s AND user_id = %s",
-            (notif_id, user_id),
-        )
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
-
-
-def _mark_error(notif_id, user_id, error):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "UPDATE notification_recipients SET sent_at = NOW(), error = %s "
-            "WHERE notification_id = %s AND user_id = %s",
-            (error, notif_id, user_id),
-        )
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):

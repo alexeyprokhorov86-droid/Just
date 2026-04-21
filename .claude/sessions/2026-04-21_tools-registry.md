@@ -36,9 +36,17 @@
 
 - [13:27] Шаг 3: tools/c1_synthesis.py — synthesize_1c_snapshot(persist). Scope/period параметризация отложена (требует разбиения build_synthesis_facts на под-функции — это отдельный рефакторинг). Smoke с persist=False: 11 фактов за 0.2с, все категории на месте. Теперь 5 tools в registry.
 
+- [13:30] Шаг 4: tools/notifications.py — 3 tool-а чистого разделения бизнес/доставка.
+  - resolve_notification_recipients(target_type, target_filter) — чтение tg_user_roles, для preview UI.
+  - prepare_notification(text, target_type, target_filter, notification_type, created_by) — INSERT в notifications + notification_recipients, вернуть {notification_id, recipients, recipient_count}.
+  - finalize_notification(notification_id, results:[{user_id,delivered,error}]) — batch UPDATE + status='sent', вернуть {sent, errors, total}.
+- [13:32] Миграция notifications.py: удалил локальные resolve_recipients, _mark_delivered, _mark_error (эти 3 функции полностью съедены tool-ами). Refactor confirm_send: prepare_notification → цикл context.bot.send_message → сбор results → finalize_notification. PTB UI (reply_markup InlineKeyboard, edit_message_text) остался в handler — там где и должен.
+- [13:33] Smoke 10 проверок (8 tools, все валидации, позиционные/keyword, прямой/invoke). Рестарт telegram-logger: active, чистый startup, 0 errors.
+- [13:34] notifications.py: -116 +35 строк. Total на всю сессию: -173 строки дубликатов/handler-коробок, +6 файлов tools/ infrastructure, 8 tools в registry.
+
 ## Незавершённое / Следующие шаги
-- [ ] Коммит шага 3.
-- [ ] Шаг 4: send_notification (рефакторинг confirm_send — выдрать бизнес из handler).
+- [ ] Коммит шага 4 + финальный push.
+- [ ] (backlog) send_via_telegram_api(bot_token, chat_id, text, reply_markup) — прямой HTTPS POST для cron/headless. Нужно когда авто_fix будет слать алерты без PTB Application.
 
 ## Backlog
 - /rules_pending (bot.py:3365), rule_approve/rule_reject callbacks (bot.py:3427-3474) остались inline. Подходят для следующей волны вместе с tools для review_knowledge.py (apply_verdicts, apply_new_rules).
