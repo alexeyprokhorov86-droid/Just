@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
+import tempfile
 
 from pydantic import BaseModel, Field
 
 from ..registry import tool
 from ._detect import detect_format, mime_for_format
-from .handlers import image_handler, ooxml_handler, pdf_handler, xml_handler
+from .handlers import image_handler, ooxml_handler, pdf_handler, video_handler, xml_handler
 
 log = logging.getLogger("tools.attachments")
 
@@ -143,3 +145,116 @@ def _analyze_attachment_impl(
 
     result.setdefault("detected_format", fmt)
     return result
+
+
+# ----------------------------------------------------------------------------
+# Video: отдельный путь (MTProto-скачивание + adaptive frame sampling).
+#
+# Не участвует в analyze_attachment_bytes потому что:
+#   1. Видео может быть до 2 GB — не держим в RAM, работаем с путём к файлу.
+#   2. Нужны дополнительные параметры (chat_id, message_id) для MTProto.
+#   3. focus_query — специфично для RAG-сценария (личка с ботом, без chat_context).
+# ----------------------------------------------------------------------------
+
+
+class AnalyzeVideoInput(BaseModel):
+    chat_id: int = Field(description="Telegram chat_id где лежит сообщение с видео (для супергрупп — с -100 префиксом).")
+    message_id: int = Field(description="message_id сообщения-источника видео.")
+    filename: str = Field(default="video.mp4", description="Имя файла для логов/prompt (опционально).")
+    chat_context: str = Field(default="", description="Контекст обсуждения в чате. Для attachments-пути.")
+    focus_query: str = Field(default="", description="Вопрос пользователя про видео. Для RAG-пути. Если задан — превалирует над chat_context.")
+
+
+@tool(
+    name="analyze_video",
+    domain="attachments",
+    description=(
+        "Анализирует видео из Telegram (совещания, собеседования, демо) любого "
+        "размера до 2 GB. Скачивает через MTProto user-client, извлекает "
+        "транскрипт Whisper, делает adaptive frame sampling (scene-detection "
+        "+ LLM-классификация static/mixed/dynamic + опциональный deep-scan) и "
+        "возвращает summary. Вызывается из двух мест: (1) bot.download_and_"
+        "analyze_media для ingestion чатов, (2) RAG-агент когда в личке "
+        "присылают видео — в этом случае передавать focus_query вместо "
+        "chat_context. Возвращает {document_type='video', extracted_text="
+        "транскрипт, summary, structured_fields (duration/frames/density), "
+        "errors}. Требует чтобы user 805598873 был в чате chat_id — иначе "
+        "MtprotoUnavailable."
+    ),
+    input_model=AnalyzeVideoInput,
+)
+def analyze_video(
+    chat_id: int,
+    message_id: int,
+    filename: str = "video.mp4",
+    chat_context: str = "",
+    focus_query: str = "",
+) -> dict:
+    """Sync-обёртка для совместимости с registry.invoke (тот синхронный).
+    Внутри делает asyncio.run по новому event loop — годится для CLI/tests.
+    Для bot.py используй `analyze_video_from_telegram` (async, работает в
+    существующем loop'е)."""
+    import asyncio
+    return asyncio.run(
+        analyze_video_from_telegram(
+            chat_id=chat_id,
+            message_id=message_id,
+            filename=filename,
+            chat_context=chat_context,
+            focus_query=focus_query,
+        )
+    )
+
+
+async def analyze_video_from_telegram(
+    *,
+    chat_id: int,
+    message_id: int,
+    filename: str = "video.mp4",
+    chat_context: str = "",
+    focus_query: str = "",
+) -> dict:
+    """Async entrypoint для bot.py и других уже-в-event-loop вызывов.
+
+    Fallback-поведение (session нет / user не в чате) — возвращает dict с
+    errors=[...] и пустым summary, НЕ бросает. bot.py сохранит запись,
+    пользователь получит honest message что видео недоступно.
+    """
+    from ._mtproto import MtprotoUnavailable, download_from_telegram
+    from company_context import get_company_profile
+    company_profile = get_company_profile()
+    from bot import gpt_client
+
+    tmp_dir = tempfile.mkdtemp(prefix="video_dl_")
+    dest_path = os.path.join(tmp_dir, filename if filename else "video.mp4")
+
+    try:
+        try:
+            actual_path, size = await download_from_telegram(chat_id, message_id, dest_path)
+        except MtprotoUnavailable as e:
+            log.warning("video download skipped: %s", e)
+            return {
+                "document_type": "video",
+                "extracted_text": "",
+                "structured_fields": {"reason": "mtproto_unavailable"},
+                "summary": "",
+                "confidence": 0.0,
+                "errors": [str(e)],
+            }
+
+        import asyncio
+        result = await asyncio.to_thread(
+            video_handler.analyze_video,
+            video_path=actual_path,
+            filename=filename,
+            chat_context=chat_context,
+            focus_query=focus_query,
+            gpt_client=gpt_client,
+            company_profile=company_profile,
+        )
+        result.setdefault("structured_fields", {})
+        result["structured_fields"]["downloaded_bytes"] = size
+        return result
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(tmp_dir, ignore_errors=True)

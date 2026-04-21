@@ -29,6 +29,7 @@ def build_analysis_prompt(
     doc_content: str,
     chat_context: str,
     filename: str,
+    focus_query: str = "",
 ) -> str:
     """Основной промпт для LLM-анализа вложения.
 
@@ -48,7 +49,17 @@ def build_analysis_prompt(
     parts.append("- Если нужно действие — скажи кратко в конце.")
     parts.append("")
 
-    if chat_context:
+    if focus_query:
+        parts.append(
+            "Пользователь спрашивает про этот документ / видео:"
+        )
+        parts.append(focus_query)
+        parts.append(
+            "Сфокусируй анализ на ответе этот вопрос — но только из содержимого документа; "
+            "если ответа в нём нет, честно скажи."
+        )
+        parts.append("")
+    elif chat_context:
         parts.append("Справочный контекст обсуждения (для понимания зачем прислали документ, НЕ ИСТОЧНИК данных):")
         parts.append(chat_context)
         parts.append("")
@@ -61,4 +72,96 @@ def build_analysis_prompt(
         parts.append(doc_content)
     parts.append("")
     parts.append("Краткий анализ (только факты из документа):")
+    return "\n".join(parts)
+
+
+def build_video_prompt(
+    *,
+    company_profile: str,
+    filename: str,
+    duration_sec: float,
+    transcript: str,
+    chat_context: str,
+    focus_query: str,
+    frame_timestamps: list[float],
+    visual_density: str,
+) -> str:
+    """Отдельный промпт для видео: длинный нарратив, структурированный конспект.
+
+    В отличие от `build_analysis_prompt` (оптимизирован под PDF/изображение,
+    требует 5-15 предложений) — видео нуждается в развёрнутом разборе:
+    хронология, участники, решения, action items. Для 30-мин совещания
+    200-символьная аннотация бесполезна.
+    """
+    parts: list[str] = []
+    parts.append(company_profile)
+    parts.append("")
+    parts.append(
+        "Ты аналитик в рабочем чате. Коллега прислал видео — твоя задача "
+        "составить ПОДРОБНЫЙ внутренний конспект, который заменит "
+        "необходимость пересматривать запись."
+    )
+    parts.append(ANTI_HALLUCINATION_HEADER)
+    parts.append("")
+    parts.append("СТРУКТУРА ОТВЕТА (все 6 секций, каждая на своей строке после заголовка):")
+    parts.append("")
+    parts.append("1. СУТЬ")
+    parts.append("   — 2-4 предложения: что это (совещание/собеседование/"
+                 "демо/производство/скринкаст), зачем прислано, главный итог.")
+    parts.append("")
+    parts.append("2. УЧАСТНИКИ И ВИЗУАЛ")
+    parts.append("   — Кто говорит (имена если названы или роли если видно), "
+                 "сколько человек в кадре, что показано визуально (окно Zoom/"
+                 "Meet, экран с 1С/Excel, производственная линия, упаковка, "
+                 "образец продукта и т.п.). Если имена не озвучены — так и "
+                 "написать «имена не названы».")
+    parts.append("")
+    parts.append("3. ХРОНОЛОГИЯ ОБСУЖДЕНИЯ")
+    parts.append("   — Детальный пересказ по темам в порядке появления. "
+                 "Используй опорные таймштампы из транскрипта/кадров "
+                 "в формате [M:SS] когда это даёт читателю «быструю прокрутку». "
+                 "Для статичных talking-heads упор на речь; для динамичных "
+                 "(демо, производство) — описывай что показывают на кадрах.")
+    parts.append("")
+    parts.append("4. РЕШЕНИЯ И ВЫВОДЫ")
+    parts.append("   — К чему пришли, что согласовали, какие цифры/параметры "
+                 "зафиксированы. Если решений нет — «решения не приняты».")
+    parts.append("")
+    parts.append("5. ACTION ITEMS И ОТКРЫТЫЕ ВОПРОСЫ")
+    parts.append("   — Что кому поручено, что осталось не решённым, что "
+                 "планируют сделать дальше. Если нечего — «поручений нет».")
+    parts.append("")
+    parts.append("6. АРТЕФАКТЫ")
+    parts.append("   — Конкретные реквизиты если ВИДНЫ в кадре или озвучены: "
+                 "номера партий, даты, артикулы, размеры, цены, названия "
+                 "контрагентов, дата на этикетке, номер документа 1С, модель "
+                 "оборудования. Перечисли сплошным списком. Нет — «реквизиты "
+                 "не зафиксированы».")
+    parts.append("")
+    parts.append("ФОРМАТ: разделы пиши заглавными заголовками как выше, "
+                 "дальше обычным текстом (без markdown-синтаксиса). Пиши "
+                 "развёрнуто, не экономь на объёме — для 30-мин совещания "
+                 "конспект 2-4 тыс. символов это норма. Для 2-мин ролика "
+                 "уместнее 500-1000.")
+    parts.append("")
+    parts.append(f"Файл: {filename}")
+    parts.append(f"Длительность: {duration_sec:.0f} сек ({duration_sec/60:.1f} мин)")
+    parts.append(f"Визуальная плотность (автоклассификация): {visual_density}")
+    parts.append(f"Кадров в анализе: {len(frame_timestamps)}, "
+                 f"таймштампы (сек): {[round(t, 1) for t in frame_timestamps]}")
+    parts.append("")
+
+    if focus_query:
+        parts.append("ФОКУС-ВОПРОС пользователя (на него ответь отдельно в конце):")
+        parts.append(focus_query)
+        parts.append("")
+    elif chat_context:
+        parts.append("Справочный контекст обсуждения в чате (НЕ источник данных, только понимание зачем прислали):")
+        parts.append(chat_context)
+        parts.append("")
+
+    parts.append("ТРАНСКРИПТ АУДИО (Whisper, русский):")
+    parts.append(transcript if transcript else "[транскрипт пуст — видео без речи или речь не распознана]")
+    parts.append("")
+    parts.append("Начинай конспект с раздела «1. СУТЬ».")
     return "\n".join(parts)
