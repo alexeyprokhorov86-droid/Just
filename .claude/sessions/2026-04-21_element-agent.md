@@ -22,8 +22,19 @@
 - **Шаг 5**: per-user tone через GPT-4.1 (position_name из 1С → формальный/дружеский стиль).
 
 ## Что сделано
+- [14:50] Step 1: schema-миграция matrix_user_mapping (+9 колонок: exclude/frequency/count/escalated/employee_ref_key/is_external/identification_asked_at/identification_answer).
+- [15:10] Step 2: фильтры в element_reminder — skip inactive/external/dismissed/frequency; adaptive freq (3→weekly, 10→escalate); убрал group-теги в рабочие чаты → только admin report.
+- [15:22] Step 3: tools/identification.py (identify_employee_by_text через GPT-4.1) + /identify_unknown (admin) + handle_identification_reply (MessageHandler group=2) + handle_identification_callback (inline approve/external/retry). handle_private_rag skip'ает pending identification users.
+- [15:45] Step 4: tools/element_video.py v1 (Nano Banana × 4 + Silero TTS + ffmpeg) → video 22s. **Обнаружены проблемы**: Nano Banana не умеет кириллицу — slide 4 с «Бухгалерия / Произгвотво / Сосаловано / Обчий чат»; slide 1 с «dovnlows» вместо «downloads».
+- [15:52] Step 5: LLM-personalized tone в reminder-loop через GPT-4.1 (тон формальный/дружеский по position_name, учёт sent_count), fallback на шаблон.
+- [15:58] Step 4b: перепишет element_video.py полностью на PIL (без Nano Banana) — 4 slide-builder'а с DejaVu Sans Bold, правильная кириллица 100%. Video 22s, 13s generation time (быстрее чем v1).
 
 ## Изменённые файлы
+- `tools/identification.py` — новый tool (LLM-match to v_current_staff)
+- `tools/element_video.py` — новый tool (v2 PIL-based slideshow)
+- `tools/__init__.py` — регистрация 2 новых tools (итого 11)
+- `bot.py` — element_reminder фильтры/adaptive freq/video attachment; identification handlers; /identify_unknown, /refresh_element_video commands; _personalized_reminder helper
+- БД: `matrix_user_mapping` +9 columns; `bot_settings` table для file_id видео
 
 ## Незавершённое / Следующие шаги
 
