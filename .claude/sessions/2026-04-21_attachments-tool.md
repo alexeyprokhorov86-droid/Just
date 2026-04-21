@@ -61,8 +61,8 @@
 - [14:28] Повторный backfill 8 файлов — все 8 ok (все XML, 0 errors). 44/44 в Априори 100% проанализированы.
 - [14:34] Перепрогон id=462 и id=464 (PDF-УПД от Рахата) через Telegram file_id. Оба Vision, ~140s. Результаты ИНТЕРЕСНЫЕ: два прогона на ОДНОМ файле дали разные summary — «ПРОФС стальные листы 6.5M» vs «ТОРГ трактор Т-25А 206k». Главное: **ни один не упоминает сливки из контекста чата** — anti-hallucination на контекст РАБОТАЕТ. Но Vision OCR сам по себе нестабилен на плохих ЭДО-сканах. Это потолок GPT-4.1 Vision, не prompt-проблема. Улучшение — в backlog.
 
-## Незавершённое / Следующие шаги (сессия закрыта 2026-04-21)
-- Сессия закрыта. 9 tools в registry, 44/44 backfill в Априори, галлюцинация на УПД по контексту чата УБРАНА.
+## Незавершённое / Следующие шаги
+- 9 tools в registry, 44/44 backfill в Априори сделан, галлюцинация на УПД по контексту чата УБРАНА — проверено юзером.
 - (backlog, отдельная сессия) Удалить dead code в bot.py: analyze_pdf_with_gpt, analyze_image_with_gpt, analyze_excel_with_gpt, analyze_word_with_gpt, analyze_pptx_with_gpt, extract_text_from_pdf, extract_text_from_image, extract_text_from_word, extract_csv_from_excel, extract_text_from_pptx (~500 строк).
 - (backlog) Улучшить Vision OCR на ЭДО-сканах: ↑DPI pdf2image до 300-400, Tesseract+препроцессинг, либо ensemble с голосованием. Нужно для нечитаемых УПД (id=462/464 дали разные интерпретации на каждом прогоне).
 - (backlog) Специализированный handler для ФНС-УПД schema — когда начнут реально приходить (сейчас только 1С-реестры и ФНС-запросы).

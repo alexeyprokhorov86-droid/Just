@@ -44,9 +44,9 @@
 - [13:33] Smoke 10 проверок (8 tools, все валидации, позиционные/keyword, прямой/invoke). Рестарт telegram-logger: active, чистый startup, 0 errors.
 - [13:34] notifications.py: -116 +35 строк. Total на всю сессию: -173 строки дубликатов/handler-коробок, +6 файлов tools/ infrastructure, 8 tools в registry.
 
-## Незавершённое / Следующие шаги (сессия закрыта 2026-04-21)
-- Сессия закрыта. Все 4 шага + checkpoint + CLAUDE.md запушены, бот проверен юзером в бою (`/notify`, `/rules_find`, `/rules_off`).
-- Продолжение → отдельные сессии: волны 2-4 расписаны в CLAUDE.md#Приоритеты.
+## Незавершённое / Следующие шаги
+- Все 4 шага + checkpoint + CLAUDE.md запушены, бот проверен юзером в бою (`/notify`, `/rules_find`, `/rules_off`).
+- Волны 2-4 (approval workflow, send_via_telegram_api, RAG Router→native tool_use) — расписаны в CLAUDE.md#Приоритеты, делать отдельными сессиями.
 - (backlog) send_via_telegram_api(bot_token, chat_id, text, reply_markup) — прямой HTTPS POST для cron/headless.
 
 ## Backlog
