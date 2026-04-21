@@ -138,6 +138,21 @@ git add -A && git commit -m "описание" && git push
 7. **Fixation** — удачные ответы с 1С-источником → source_documents(source_kind='rag_answer') + source_chunks. Повторные похожие вопросы ретривятся мгновенно.
 8. **Reply-chain** — `message.reply_to_message.from_user.is_bot` → prev Q/A из chat_data → передаётся в process_rag_query как prev_context → встраивается в prompt Answerer'а.
 
+## Tool Registry (`tools/`, 2026-04-21)
+
+Путь B (прагматичная стандартизация): декоратор `@tool(name, domain, description, input_model)` регистрирует функцию в `tools.registry.REGISTRY`. Прямой import и `invoke(name, params)` оба валидируют через pydantic InputModel (SSOT для defaults). `llm_schemas()` даёт JSON-schema в формате Anthropic/OpenAI tool_use — готово для native tool_use API.
+
+**8 tools в registry** (путь B шаг 1 закрыт 2026-04-21):
+- `chats` — get_chat_list
+- `bom` — get_bom_report
+- `km_rules` — search_filter_rules, deactivate_filter_rule (с инвалидацией distillation cache через sys.modules)
+- `c1` — synthesize_1c_snapshot (persist=True триггерит upsert в source_chunks)
+- `notifications` — resolve_notification_recipients, prepare_notification, finalize_notification
+
+**Добавить tool**: модуль в `tools/`, функция с декоратором, импорт в `tools/__init__.py`. Внутренний Python-код зовёт через прямой import (type-hints, нет лишних wrapper frames). LLM/slash/HTTP/Element-бот — через `invoke(name, dict_params)`.
+
+Детали контракта и проектные решения: `.claude/sessions/2026-04-21_tools-registry.md`.
+
 ## Приоритеты (апрель-май 2026)
 
 ### RAG (основной фокус):
@@ -152,9 +167,15 @@ git add -A && git commit -m "описание" && git push
    - Latency optimization (64s avg → цель ≤45s для Tier 3)
 
 ### Прочее:
-5. **TASK_rules_manage.md** — поиск и деактивация правил фильтрации из бота
+5. ✅ **TASK_rules_manage** — /rules_find и /rules_off через tools/km_rules (2026-04-21).
 6. Хвосты: iOS ссылка в /element, --invite-rooms прогнать, sync_bank_balances проверить
 7. `v_plan_fact_weekly` в synthesize_1c_facts.py — починить 5-vs-6 колонок
+
+### Tool Registry — следующие волны (после 2026-04-21 шага 1):
+- **Волна 2** — approval workflow + review_knowledge: /rules_pending, rule_approve/rule_reject (bot.py:3365-3474), apply_verdicts/apply_new_rules из review_knowledge.py. Завершает домен `km_rules`.
+- **Волна 3** — `send_via_telegram_api(bot_token, chat_id, text, reply_markup)`: прямой HTTPS POST для headless-сценариев. Разблокирует: auto_fix-алерты без PTB Application, Element-бота, любые cron-уведомления.
+- **Волна 4** — RAG Router → native tool_use: миграция 6 RAG-tools (search_1c_analytics, search_1c_data, search_telegram_chats, search_emails, search_unified, search_source_chunks_reranked) на Anthropic/OpenAI tool_use API. Убрать ручной if/elif dispatch в `run_rag`. **Риск**: RAG-метрика нестабильна (±10% run-to-run), любое движение Router'а даёт шум. Делать только когда контракт registry обкатан на волнах 2-3 и есть baseline на стабильной метрике.
+- Scope/period параметризация `synthesize_1c_snapshot` — разбить `build_synthesis_facts()` на sub-функции (sales_day/clients_month/...). Делать когда появится конкретный use-case (RAG on-demand recompute по entity).
 
 ## Полезные команды
 
@@ -263,7 +284,7 @@ Claude Code ведёт НЕПРЕРЫВНЫЙ лог сессии в `.claude/se
 - `TASK_autonomous_agent.md` — автономный Claude-агент (✅ 2026-04-16)
 - `TASK_qwen_consistency.md` — дисциплина instruction-aware Qwen3 (✅ 2026-04-17)
 - `TASK_rag_quality_v2.md` — Router v2 + Evaluator + Text-to-SQL + km-fixation + Reply-chain (✅ Фазы 1-6 2026-04-17)
-- `TASK_rules_manage.md` — ⚠️ файл не существует, но фича `/rules_find`/`/rules_off` уже в bot.py
+- `TASK_rules_manage` — ✅ /rules_find и /rules_off мигрированы на tools/km_rules (2026-04-21).
 
 ### Backlog:
 - Бот в Element X (Matrix-транспорт для /search, /analysis)
