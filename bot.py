@@ -4437,23 +4437,51 @@ async def identify_unknown_command(update: Update, context: ContextTypes.DEFAULT
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            # Те же фильтры что в element_reminder: не беспокоим кто уже
+            # покинул все TG-чаты компании (active_chats=0 — скорее всего
+            # уже ушёл из организации).
             cur.execute(
                 """
-                SELECT telegram_user_id, telegram_name, telegram_username
-                FROM matrix_user_mapping
-                WHERE identification_asked_at IS NULL
-                  AND employee_ref_key IS NULL
-                  AND is_external IS NULL
-                  AND matrix_id NOT IN ('@bot:frumelad.ru', '@aleksei:frumelad.ru')
-                ORDER BY created_at ASC
+                SELECT m.telegram_user_id, m.telegram_name, m.telegram_username
+                FROM matrix_user_mapping m
+                WHERE m.identification_asked_at IS NULL
+                  AND m.employee_ref_key IS NULL
+                  AND m.is_external IS NULL
+                  AND m.exclude_from_reminder = false
+                  AND m.matrix_id NOT IN ('@bot:frumelad.ru', '@aleksei:frumelad.ru')
+                  AND EXISTS (
+                        SELECT 1 FROM tg_user_roles ur
+                        WHERE ur.user_id = m.telegram_user_id
+                          AND ur.is_active = true
+                  )
+                ORDER BY m.created_at ASC
                 LIMIT 10
                 """
             )
             targets = cur.fetchall()
+
+            # Отдельно — список тех кого НЕ трогаем (0 активных чатов), чтобы
+            # admin понимал сколько их и мог вручную почистить mapping.
+            cur.execute(
+                """
+                SELECT m.telegram_user_id, m.telegram_name
+                FROM matrix_user_mapping m
+                WHERE m.identification_asked_at IS NULL
+                  AND m.employee_ref_key IS NULL
+                  AND m.is_external IS NULL
+                  AND NOT EXISTS (
+                        SELECT 1 FROM tg_user_roles ur
+                        WHERE ur.user_id = m.telegram_user_id
+                          AND ur.is_active = true
+                  )
+                ORDER BY m.telegram_name
+                """
+            )
+            auto_skipped = cur.fetchall()
     finally:
         conn.close()
 
-    if not targets:
+    if not targets and not auto_skipped:
         await update.message.reply_text("✅ Всех известных пользователей уже опросили.")
         return
 
@@ -4482,6 +4510,17 @@ async def identify_unknown_command(update: Update, context: ContextTypes.DEFAULT
     if failed:
         lines.append(f"\n❌ Ошибки ({len(failed)}):")
         lines.extend(f"  • {f}" for f in failed)
+    if auto_skipped:
+        lines.append(
+            f"\n🤫 Автоматически пропущено ({len(auto_skipped)}) — "
+            f"покинули все активные TG-чаты, скорее всего уже не в компании:"
+        )
+        lines.extend(f"  • {name or uid}" for uid, name in auto_skipped)
+        lines.append(
+            "\nЕсли кого-то надо всё-таки опросить (например, перешли в другой чат вне "
+            "ingestion) — пометь вручную `UPDATE matrix_user_mapping SET exclude_from_reminder=false "
+            "WHERE telegram_user_id=...` и верни в tg_user_roles."
+        )
     await update.message.reply_text("\n".join(lines))
 
 
