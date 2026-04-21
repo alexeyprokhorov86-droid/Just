@@ -100,16 +100,23 @@ fi
 log "Вызываем claude -p (timeout=${CLAUDE_TIMEOUT_SEC}s) ..."
 CLAUDE_OUT="$(mktemp /tmp/auto_fix_claude_out.XXXXXX)"
 CLAUDE_ERR="$(mktemp /tmp/auto_fix_claude_err.XXXXXX)"
-# Снимаем CLAUDE_CODE_* env vars: если auto_fix.sh запущен ИЗ другой Claude-
-# сессии (или цепочкой), дочерний `claude -p` иначе пытается подключиться к
-# родителю и получает 403 Forbidden. Cron-окружение чистое, но защита нужна
-# для ручных запусков и watchdog (который тоже может быть вызван иначе).
-# ANTHROPIC_API_KEY подтягивается из .env — без него claude в cron использует
-# OAuth-токен, который протухает за сутки и возвращает 403 "Request not allowed".
-ANTHROPIC_API_KEY_VAL="$(grep -E '^ANTHROPIC_API_KEY=' "$REPO_DIR/.env" | cut -d= -f2-)"
+# Снимаем CLAUDE_CODE_SSE_PORT/ENTRYPOINT/EXECPATH/CLAUDECODE: если auto_fix.sh
+# запущен ИЗ другой Claude-сессии, дочерний `claude -p` иначе пытается подключиться
+# к родителю и получает 403 Forbidden. Cron-окружение чистое, но защита нужна
+# для ручных запусков и watchdog.
+# CLAUDE_CODE_OAUTH_TOKEN — long-lived token от `claude setup-token` (2026-04-21,
+# ~1 год). Привязан к Claude Max подписке, а не к API billing, поэтому не тратит
+# API-токены отдельно. Заменил ANTHROPIC_API_KEY (тот протух за сутки в OAuth-режиме
+# и не триггерился) и `credentials.json` OAuth (~24h TTL, без refresh в cron).
+CLAUDE_OAUTH_TOKEN_VAL="$(grep -E '^CLAUDE_CODE_OAUTH_TOKEN=' "$REPO_DIR/.env" | cut -d= -f2-)"
+if [[ -z "$CLAUDE_OAUTH_TOKEN_VAL" ]]; then
+    log "ERROR: CLAUDE_CODE_OAUTH_TOKEN не найден в .env — abort"
+    exit 1
+fi
 set +e
 env -u CLAUDECODE -u CLAUDE_CODE_SSE_PORT -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
-    ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY_VAL" \
+    -u ANTHROPIC_API_KEY \
+    CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_OAUTH_TOKEN_VAL" \
     timeout "$CLAUDE_TIMEOUT_SEC" "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
     --permission-mode acceptEdits \
     --allowedTools "Bash,Edit,Read,Write,Grep,Glob" \
