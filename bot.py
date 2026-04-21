@@ -4069,6 +4069,21 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
                         invites_sent += 1
                     _time.sleep(0.2)
 
+        # ── Загрузить file_id обучающего видео (если генерировано) ───
+        onboarding_video_file_id = None
+        try:
+            _c = get_db_connection()
+            with _c.cursor() as _cur:
+                _cur.execute(
+                    "SELECT value FROM bot_settings WHERE key = 'element_onboarding_video_file_id'"
+                )
+                _row = _cur.fetchone()
+                if _row and _row[0]:
+                    onboarding_video_file_id = _row[0]
+            _c.close()
+        except Exception as e:
+            logger.warning(f"element_reminder: не смог прочитать video file_id: {e}")
+
         # ── Smart-фильтр: кого НЕ беспокоить ─────────────────────────────
         # Решение каждое утро: стоит ли писать этому user-у reminder сегодня?
         # Критерии складываются; skip-reason попадает в админский отчёт.
@@ -4121,12 +4136,26 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
                     f"4. Пароль: напишите /element — я отправлю\n\n"
                     f"Все рабочие чаты уже ждут вас в пространстве «Фрумелад»."
                 )
+                # Отправка: если есть обучающее видео — шлём как sendVideo с caption;
+                # без видео — обычный sendMessage.
                 try:
-                    resp = req.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        json={"chat_id": tg_uid, "text": msg, "disable_web_page_preview": True},
-                        proxies=proxies, timeout=15
-                    ).json()
+                    if onboarding_video_file_id:
+                        resp = req.post(
+                            f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
+                            json={
+                                "chat_id": tg_uid,
+                                "video": onboarding_video_file_id,
+                                "caption": msg,
+                                "supports_streaming": True,
+                            },
+                            proxies=proxies, timeout=30
+                        ).json()
+                    else:
+                        resp = req.post(
+                            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                            json={"chat_id": tg_uid, "text": msg, "disable_web_page_preview": True},
+                            proxies=proxies, timeout=15
+                        ).json()
                     if resp.get("ok"):
                         sent_personal += 1
                         u["_reminder_sent"] = True
@@ -4475,6 +4504,57 @@ async def handle_identification_reply(update: Update, context: ContextTypes.DEFA
         logger.error(f"identification admin notify failed: {e}")
 
 
+async def refresh_element_video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-команда: перегенерировать Element X onboarding video через Nano Banana+Silero.
+    Сохраняет новый file_id в bot_settings, автоматически подхватится следующим reminder'ом."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Только для администратора")
+        return
+
+    await update.message.reply_text(
+        "🎬 Генерирую видео (Nano Banana × 4 + Silero TTS + ffmpeg)... ~1 минута."
+    )
+
+    import asyncio as _asyncio
+    try:
+        from tools.element_video import generate_element_onboarding_video
+        result = await _asyncio.to_thread(
+            generate_element_onboarding_video,
+            output_path="/home/admin/telegram_logger_bot/assets/element_onboarding.mp4",
+            seconds_per_slide=5.5,
+            speaker="aidar",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка генерации: {e}")
+        return
+
+    # Отправляем админу для проверки, сохраняем новый file_id.
+    try:
+        with open(result["path"], "rb") as f:
+            sent = await context.bot.send_video(
+                chat_id=ADMIN_USER_ID,
+                video=f,
+                caption=f"🎬 Обновлён Element X onboarding video ({result['total_duration_sec']:.0f}с).",
+                supports_streaming=True,
+            )
+        new_file_id = sent.video.file_id
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO bot_settings (key, value) VALUES
+                   ('element_onboarding_video_file_id', %s)
+                   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+                (new_file_id,),
+            )
+            conn.commit()
+        conn.close()
+        await update.message.reply_text(
+            f"✅ Новый file_id сохранён в bot_settings. Следующий reminder приложит это видео."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не смог отправить/сохранить: {e}")
+
+
 async def handle_identification_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin нажал кнопку — применяем решение к matrix_user_mapping."""
     query = update.callback_query
@@ -4633,6 +4713,8 @@ def main():
     application.add_handler(CommandHandler("element", element_command))
     application.add_handler(CommandHandler("rooms", rooms_command))
     application.add_handler(CommandHandler("rag_stats", rag_stats_command))
+    # Element video — генерация обучающего видео
+    application.add_handler(CommandHandler("refresh_element_video", refresh_element_video_command))
     # Identification agent — опрос неопознанных пользователей + admin approval
     application.add_handler(CommandHandler("identify_unknown", identify_unknown_command))
     application.add_handler(CallbackQueryHandler(
