@@ -2554,10 +2554,31 @@ async def handle_private_rag(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     question = message.text.strip()
-    
+
     if not question:
         return
-    
+
+    # Если у user-а pending identification — его ответ обрабатывает
+    # handle_identification_reply в другой группе, RAG не нужен.
+    try:
+        c = get_db_connection()
+        with c.cursor() as _cur:
+            _cur.execute(
+                """SELECT 1 FROM matrix_user_mapping
+                   WHERE telegram_user_id = %s
+                     AND identification_asked_at IS NOT NULL
+                     AND employee_ref_key IS NULL
+                     AND is_external IS NULL
+                     AND identification_answer IS NULL""",
+                (message.from_user.id,),
+            )
+            if _cur.fetchone():
+                c.close()
+                return
+        c.close()
+    except Exception:
+        pass  # не критично, если не смогли проверить — пускай RAG отработает
+
     # Пропускаем простые приветствия — на них ответит /start
     if question.lower() in ['привет', 'hi', 'hello', 'старт', 'start']:
         await message.reply_text(
@@ -4272,6 +4293,273 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"element_reminder error: {e}", exc_info=True)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# IDENTIFICATION AGENT
+# ══════════════════════════════════════════════════════════════════════
+# Мусорные имена в matrix_user_mapping (😀, fff, Anna SV и т.п.) — это
+# реальные люди, которых мы не смогли сматчить с 1С автоматически. Этот
+# агент спрашивает их лично, обрабатывает ответы LLM'ом и предлагает
+# admin-у выбрать через inline-кнопки. Результат → employee_ref_key или
+# is_external=true → умнее reminder'ы.
+
+IDENTIFICATION_PROMPT = (
+    "👋 Здравствуйте! Это бот кадровой системы компании Фрумелад.\n\n"
+    "Мы переводим всех сотрудников на корпоративный мессенджер Element X, "
+    "но в моей базе ваш Telegram-аккаунт записан под коротким именем и "
+    "я не могу точно понять кто вы.\n\n"
+    "Подскажите пожалуйста:\n"
+    "• Ваше полное ФИО (как в кадровых документах)\n"
+    "• Должность\n"
+    "• Отдел/подразделение\n\n"
+    "Одним сообщением в свободной форме — я разберусь. Если вы не сотрудник "
+    "компании (внешний партнёр/контрагент) — так и напишите."
+)
+
+
+async def identify_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-команда /identify_unknown — отправляет запрос identification
+    неопознанным пользователям в личку. Max 10 за раз чтобы не флудить."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Только для администратора")
+        return
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT telegram_user_id, telegram_name, telegram_username
+                FROM matrix_user_mapping
+                WHERE identification_asked_at IS NULL
+                  AND employee_ref_key IS NULL
+                  AND is_external IS NULL
+                  AND matrix_id NOT IN ('@bot:frumelad.ru', '@aleksei:frumelad.ru')
+                ORDER BY created_at ASC
+                LIMIT 10
+                """
+            )
+            targets = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not targets:
+        await update.message.reply_text("✅ Всех известных пользователей уже опросили.")
+        return
+
+    sent, failed = [], []
+    for tg_uid, name, username in targets:
+        try:
+            await context.bot.send_message(chat_id=tg_uid, text=IDENTIFICATION_PROMPT)
+            # Отмечаем в БД что запрос отправлен
+            c2 = get_db_connection()
+            with c2.cursor() as cur:
+                cur.execute(
+                    "UPDATE matrix_user_mapping SET identification_asked_at = NOW() "
+                    "WHERE telegram_user_id = %s",
+                    (tg_uid,),
+                )
+                c2.commit()
+            c2.close()
+            sent.append(f"{name} ({'@' + username if username else tg_uid})")
+        except Exception as e:
+            failed.append(f"{name}: {e}")
+
+    lines = [f"📩 Идентификационных запросов отправлено: {len(sent)}"]
+    if sent:
+        lines.append("\nУспешно:")
+        lines.extend(f"  • {s}" for s in sent)
+    if failed:
+        lines.append(f"\n❌ Ошибки ({len(failed)}):")
+        lines.extend(f"  • {f}" for f in failed)
+    await update.message.reply_text("\n".join(lines))
+
+
+async def handle_identification_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """MessageHandler для private-chat. Если user имеет pending identification —
+    обрабатываем его ответ через LLM-матчинг и шлём админу inline-кнопки."""
+    msg = update.message
+    if not msg or not msg.from_user or not msg.text:
+        return
+    if msg.chat.type != "private":
+        return
+    if msg.text.startswith("/"):
+        return  # команды обрабатываются отдельно
+
+    user_id = msg.from_user.id
+
+    # Есть ли у user-а pending identification?
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT telegram_name FROM matrix_user_mapping
+                WHERE telegram_user_id = %s
+                  AND identification_asked_at IS NOT NULL
+                  AND employee_ref_key IS NULL
+                  AND is_external IS NULL
+                  AND identification_answer IS NULL
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return  # не pending — не наше дело
+
+    user_name = row[0] or f"tg:{user_id}"
+    answer = msg.text.strip()
+
+    # Сохраняем ответ
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE matrix_user_mapping SET identification_answer = %s "
+            "WHERE telegram_user_id = %s",
+            (answer, user_id),
+        )
+        conn.commit()
+    conn.close()
+
+    await msg.reply_text(
+        "Спасибо! Передал информацию администратору — он подтвердит привязку "
+        "в ближайшее время. Как только всё готово, пришлю вам данные для Element X."
+    )
+
+    # Запускаем LLM-матчинг (синхронно — это быстрый tool ~2-5s)
+    try:
+        from tools.identification import identify_employee_by_text
+        result = identify_employee_by_text(user_answer=answer, top_k=3)
+    except Exception as e:
+        logger.error(f"identify_employee_by_text failed: {e}")
+        result = {"candidates": [], "best_confidence": "none"}
+
+    # Шлём админу inline-кнопки
+    admin_lines = [
+        f"🔍 Identification ответ от {user_name} (tg:{user_id}):",
+        f"",
+        f"❝ {answer[:500]} ❞",
+        f"",
+        f"🎯 LLM best_confidence: **{result.get('best_confidence', '?')}**",
+    ]
+    keyboard_rows = []
+    for c in result.get("candidates", []):
+        full = c.get("full_name", "?")
+        pos = c.get("position_name") or "?"
+        conf = c.get("confidence", "?")
+        reasoning = c.get("reasoning", "")[:80]
+        admin_lines.append(f"\n• {full} — {pos}")
+        admin_lines.append(f"  {conf}: {reasoning}")
+        # Кнопка approve
+        cb = f"ident_approve:{user_id}:{c.get('employee_ref_key', 'none')}"
+        if len(cb) < 64:  # Telegram callback_data limit
+            keyboard_rows.append([InlineKeyboardButton(
+                f"✅ {full[:40]}", callback_data=cb
+            )])
+
+    keyboard_rows.append([
+        InlineKeyboardButton("🚫 Внешний (не в компании)", callback_data=f"ident_external:{user_id}"),
+        InlineKeyboardButton("❓ Переспросить", callback_data=f"ident_retry:{user_id}"),
+    ])
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text="\n".join(admin_lines),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"identification admin notify failed: {e}")
+
+
+async def handle_identification_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin нажал кнопку — применяем решение к matrix_user_mapping."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("⛔ Только для администратора", show_alert=True)
+        return
+
+    data = query.data  # ident_approve:<uid>:<ref_key> | ident_external:<uid> | ident_retry:<uid>
+    parts = data.split(":")
+    action = parts[0]
+
+    try:
+        tg_uid = int(parts[1])
+    except (IndexError, ValueError):
+        return
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            if action == "ident_approve":
+                ref_key = parts[2]
+                if ref_key == "none" or not ref_key:
+                    await query.edit_message_text(query.message.text + "\n\n❌ ref_key отсутствует, не могу привязать.")
+                    return
+                cur.execute(
+                    """UPDATE matrix_user_mapping SET
+                           employee_ref_key = %s::uuid,
+                           is_external = false
+                       WHERE telegram_user_id = %s""",
+                    (ref_key, tg_uid),
+                )
+                conn.commit()
+                # Получаем имя сотрудника
+                cur.execute(
+                    "SELECT full_name, position_name FROM v_current_staff WHERE ref_key = %s::uuid",
+                    (ref_key,),
+                )
+                emp = cur.fetchone()
+                await query.edit_message_text(
+                    query.message.text + f"\n\n✅ Привязано: {emp[0] if emp else ref_key}"
+                )
+                # Уведомляем user-а
+                try:
+                    await context.bot.send_message(
+                        chat_id=tg_uid,
+                        text=(
+                            f"✅ Вас подтвердили: {emp[0] if emp else 'OK'}. "
+                            f"Напишите /element — пришлю данные для входа в Element X."
+                        ),
+                    )
+                except Exception:
+                    pass
+
+            elif action == "ident_external":
+                cur.execute(
+                    "UPDATE matrix_user_mapping SET is_external = true WHERE telegram_user_id = %s",
+                    (tg_uid,),
+                )
+                conn.commit()
+                await query.edit_message_text(query.message.text + "\n\n🚫 Помечен внешним — reminder'ы отключены.")
+                try:
+                    await context.bot.send_message(
+                        chat_id=tg_uid,
+                        text="Спасибо за ответ! Вы не в штате — Element X вам не нужен, больше не буду беспокоить.",
+                    )
+                except Exception:
+                    pass
+
+            elif action == "ident_retry":
+                # Сбрасываем identification_asked_at чтобы следующий /identify_unknown снова его спросил
+                cur.execute(
+                    """UPDATE matrix_user_mapping SET
+                           identification_asked_at = NULL,
+                           identification_answer = NULL
+                       WHERE telegram_user_id = %s""",
+                    (tg_uid,),
+                )
+                conn.commit()
+                await query.edit_message_text(query.message.text + "\n\n🔄 Сброшено — следующий /identify_unknown спросит снова.")
+    finally:
+        conn.close()
+
+
 def main():
     """Запуск бота."""
     if not BOT_TOKEN:
@@ -4345,6 +4633,21 @@ def main():
     application.add_handler(CommandHandler("element", element_command))
     application.add_handler(CommandHandler("rooms", rooms_command))
     application.add_handler(CommandHandler("rag_stats", rag_stats_command))
+    # Identification agent — опрос неопознанных пользователей + admin approval
+    application.add_handler(CommandHandler("identify_unknown", identify_unknown_command))
+    application.add_handler(CallbackQueryHandler(
+        handle_identification_callback,
+        pattern=r"^ident_"
+    ))
+    # Handler перехватчик ответов в личке — в group=2 чтобы работал параллельно
+    # с RAG (тот сам пропускает pending identification users).
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_identification_reply,
+        ),
+        group=2,
+    )
 
     # Notifications
     application.add_handler(get_notify_conversation_handler())
