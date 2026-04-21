@@ -4084,6 +4084,79 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"element_reminder: не смог прочитать video file_id: {e}")
 
+        # ── LLM-персонализация текста (Step 5) ───────────────────────────
+        def _personalized_reminder(u: dict, stage: str) -> str | None:
+            """Генерирует персональное напоминание через GPT-4.1.
+
+            stage: 'not_joined' (ещё не вошёл) | 'missing_rooms' (вошёл, комнат нет)
+            На основе: имя, должность (если employee_ref_key сматчен),
+            reminder_sent_count, список missing_rooms. Возвращает None при ошибке
+            — caller использует fallback-шаблон."""
+            if not gpt_client:
+                return None
+            name = u["name"]
+            position = u.get("position_name") or ""
+            count = u.get("sent_count", 0)
+            rooms = u.get("missing_rooms") or []
+            mx_user = u["mx_user"]
+
+            # Определяем тон по позиции (формально для руководителей).
+            formal_markers = ("директор", "руководит", "начальник", "главн", "замест", "управл")
+            is_formal = any(m in position.lower() for m in formal_markers)
+            tone = "формальный уважительный" if is_formal else "дружеский рабочий"
+
+            if stage == "not_joined":
+                stage_prompt = (
+                    f"Сотрудник ЕЩЁ НЕ ВОШЁЛ в Element X. Reminder #{count+1}. "
+                    f"Нужно мотивировать войти."
+                )
+                instructions = (
+                    f"Инструкция для первого входа: "
+                    f"1) Скачать Element X из Google Play/App Store. "
+                    f"2) Нажать 'Изменить сервер' → ввести frumelad.ru. "
+                    f"3) Логин: {mx_user}. "
+                    f"4) Пароль получить через команду /element."
+                )
+                if count >= 3:
+                    tail = "Это уже не первое напоминание — мягко намекни что важно."
+                else:
+                    tail = "Первые напоминания — приветливо."
+            else:  # missing_rooms
+                rooms_text = ", ".join(rooms[:5])
+                stage_prompt = (
+                    f"Сотрудник УЖЕ В Element X, но НЕ принял приглашения в комнаты: {rooms_text}. "
+                    f"Нужно попросить открыть Element X и принять приглашения."
+                )
+                instructions = "Откройте Element X → раздел 'Приглашения' → примите приглашения."
+                tail = ""
+
+            prompt = (
+                f"Ты ассистент кадровой системы Фрумелад, помогаешь переводу на Element X. "
+                f"Напиши короткое (3-5 предложений) персональное напоминание в Telegram-сообщение.\n\n"
+                f"Имя: {name}\n"
+                f"Должность: {position or 'неизвестна'}\n"
+                f"Тон: {tone}\n"
+                f"Ситуация: {stage_prompt}\n"
+                f"Что сказать про шаги: {instructions}\n"
+                f"{tail}\n\n"
+                f"ПРАВИЛА:\n"
+                f"- Без Markdown (**, ##, списки).\n"
+                f"- Не упоминай reminder_count цифрой.\n"
+                f"- Обращайся по имени, без фамилии.\n"
+                f"- Реплика как от коллеги-ассистента.\n"
+                f"- Верни ТОЛЬКО текст сообщения, без preambles."
+            )
+            try:
+                resp = gpt_client.chat.completions.create(
+                    model="openai/gpt-4.1",
+                    max_tokens=400,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                logger.warning(f"personalized reminder LLM failed for {name}: {e}")
+                return None
+
         # ── Smart-фильтр: кого НЕ беспокоить ─────────────────────────────
         # Решение каждое утро: стоит ли писать этому user-у reminder сегодня?
         # Критерии складываются; skip-reason попадает в админский отчёт.
@@ -4124,18 +4197,23 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
             name = u["name"]
 
             if not u.get("has_devices"):
-                # Не вошёл — напоминание с инструкцией
-                msg = (
-                    f"👋 {name}, напоминаю о переходе на Element X!\n\n"
-                    f"Ваш аккаунт готов. Для входа:\n"
-                    f"1. Скачайте Element X:\n"
-                    f"   • Android: play.google.com/store/apps/details?id=io.element.android.x\n"
-                    f"   • iPhone: apps.apple.com/app/element-x/id1672254904\n"
-                    f"2. Нажмите «Изменить сервер» → введите: frumelad.ru\n"
-                    f"3. Логин: {u['mx_user']}\n"
-                    f"4. Пароль: напишите /element — я отправлю\n\n"
-                    f"Все рабочие чаты уже ждут вас в пространстве «Фрумелад»."
-                )
+                # Не вошёл — напоминание с инструкцией. Пробуем LLM-персонализацию;
+                # если не получилось — шаблон.
+                personal = _personalized_reminder(u, stage="not_joined")
+                if personal:
+                    msg = personal
+                else:
+                    msg = (
+                        f"👋 {name}, напоминаю о переходе на Element X!\n\n"
+                        f"Ваш аккаунт готов. Для входа:\n"
+                        f"1. Скачайте Element X:\n"
+                        f"   • Android: play.google.com/store/apps/details?id=io.element.android.x\n"
+                        f"   • iPhone: apps.apple.com/app/element-x/id1672254904\n"
+                        f"2. Нажмите «Изменить сервер» → введите: frumelad.ru\n"
+                        f"3. Логин: {u['mx_user']}\n"
+                        f"4. Пароль: напишите /element — я отправлю\n\n"
+                        f"Все рабочие чаты уже ждут вас в пространстве «Фрумелад»."
+                    )
                 # Отправка: если есть обучающее видео — шлём как sendVideo с caption;
                 # без видео — обычный sendMessage.
                 try:
@@ -4167,19 +4245,23 @@ async def element_reminder(context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"element_reminder: ошибка отправки {name}: {e}")
 
             elif u.get("missing_rooms"):
-                # Вошёл, приглашения отправлены/висят — напоминаем
-                rooms_list = "\n".join(f"  • {r}" for r in u["missing_rooms"])
-                space_note = ""
-                if not u.get("in_space"):
-                    space_note = "\n\n⚠️ Также примите приглашение в пространство «Фрумелад» — в нём собраны все рабочие комнаты."
-                msg = (
-                    f"👋 {name}, вы уже в Element X — отлично!\n\n"
-                    f"Вам отправлены приглашения в комнаты:\n"
-                    f"{rooms_list}\n\n"
-                    f"Откройте Element X → раздел «Приглашения» и примите их, "
-                    f"чтобы не пропускать рабочие обсуждения.{space_note}\n\n"
-                    f"Если приглашения не видно — напишите /rooms, и я отправлю заново."
-                )
+                # Вошёл, приглашения отправлены/висят — напоминаем.
+                personal = _personalized_reminder(u, stage="missing_rooms")
+                if personal:
+                    msg = personal
+                else:
+                    rooms_list = "\n".join(f"  • {r}" for r in u["missing_rooms"])
+                    space_note = ""
+                    if not u.get("in_space"):
+                        space_note = "\n\n⚠️ Также примите приглашение в пространство «Фрумелад» — в нём собраны все рабочие комнаты."
+                    msg = (
+                        f"👋 {name}, вы уже в Element X — отлично!\n\n"
+                        f"Вам отправлены приглашения в комнаты:\n"
+                        f"{rooms_list}\n\n"
+                        f"Откройте Element X → раздел «Приглашения» и примите их, "
+                        f"чтобы не пропускать рабочие обсуждения.{space_note}\n\n"
+                        f"Если приглашения не видно — напишите /rooms, и я отправлю заново."
+                    )
                 try:
                     resp = req.post(
                         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
