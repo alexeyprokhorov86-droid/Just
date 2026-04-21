@@ -1400,27 +1400,8 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
             filename = doc.file_name or ""
             filename_lower = filename.lower()
 
-            if doc.mime_type and doc.mime_type.startswith("image/"):
-                file = await bot.get_file(doc.file_id)
-                media_type = doc.mime_type
-                media_type_str = "image"
-            elif doc.mime_type == "application/pdf" or filename_lower.endswith(".pdf"):
-                file = await bot.get_file(doc.file_id)
-                media_type = "application/pdf"
-                media_type_str = "pdf"
-            elif filename_lower.endswith(('.xlsx', '.xls')):
-                file = await bot.get_file(doc.file_id)
-                media_type = "excel"
-                media_type_str = "excel"
-            elif filename_lower.endswith(('.docx', '.doc')):
-                file = await bot.get_file(doc.file_id)
-                media_type = "word"
-                media_type_str = "word"
-            elif filename_lower.endswith(('.pptx', '.ppt')):
-                file = await bot.get_file(doc.file_id)
-                media_type = "powerpoint"
-                media_type_str = "powerpoint"
-            elif filename_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
+            # Видео как документ — сохраняем старую обработку (Gemini).
+            if filename_lower.endswith(('.mp4', '.avi', '.mov', '.mkv')):
                 if doc.file_size and doc.file_size < 40 * 1024 * 1024:
                     file = await bot.get_file(doc.file_id)
                     media_type = "video"
@@ -1429,8 +1410,14 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
                     logger.warning("Видео слишком большое для анализа")
                     return "video", "", ""
             else:
-                media_type_str = "document"
-                return media_type_str, "", ""
+                # Все прочие документы (PDF/XML/docx/xlsx/image/unknown) — через
+                # tools.attachments, формат определяется по magic-bytes.
+                if doc.file_size and doc.file_size > 50 * 1024 * 1024:
+                    logger.warning(f"Документ слишком большой: {doc.file_size} bytes")
+                    return "document", "", ""
+                file = await bot.get_file(doc.file_id)
+                media_type = "attachment"  # маркер → диспатч ниже в analyze_attachment_bytes
+                media_type_str = "document"  # будет переопределён из tool result
         else:
             return media_type_str, "", ""
 
@@ -1499,21 +1486,27 @@ async def download_and_analyze_media(bot, message, table_name: str = None) -> tu
             finally:
                 if os.path.exists(audio_path):
                     os.unlink(audio_path)
-        elif media_type == "application/pdf":
-            media_analysis = await analyze_pdf_with_gpt(bytes(file_data), filename, context)
-            content_text = await extract_text_from_pdf(bytes(file_data))
-        elif media_type and media_type.startswith("image/"):
-            media_analysis = await analyze_image_with_gpt(bytes(file_data), media_type, context, filename)
-            content_text = await extract_text_from_image(bytes(file_data), media_type)
-        elif media_type == "excel":
-            media_analysis = await analyze_excel_with_gpt(bytes(file_data), filename, context)
-            content_text = await extract_csv_from_excel(bytes(file_data), filename)
-        elif media_type == "word":
-            media_analysis = await analyze_word_with_gpt(bytes(file_data), filename, context)
-            content_text = await extract_text_from_word(bytes(file_data))
-        elif media_type == "powerpoint":
-            media_analysis = await analyze_pptx_with_gpt(bytes(file_data), filename, context)
-            content_text = await extract_text_from_pptx(bytes(file_data))
+        elif media_type == "attachment" or media_type == "image/jpeg" or (media_type and media_type.startswith("image/")):
+            # Единый путь для PDF / XML / docx / xlsx / pptx / image.
+            # Magic-byte detection внутри tool'а, anti-hallucination промпт.
+            import asyncio as _asyncio
+            from tools.attachments import analyze_attachment_bytes
+            result = await _asyncio.to_thread(
+                analyze_attachment_bytes,
+                file_bytes=bytes(file_data),
+                filename=filename,
+                mime_type=media_type if media_type != "attachment" else "",
+                chat_context=context,
+            )
+            media_analysis = result.get("summary", "")
+            content_text = result.get("extracted_text", "")
+            # Переопределяем media_type_str из реально распознанного формата
+            # (маркер 'attachment' заменится на 'pdf'/'xml'/'docx' и т.п.).
+            doc_type = result.get("document_type") or media_type_str
+            if doc_type and doc_type != "unknown":
+                media_type_str = doc_type
+            if result.get("errors"):
+                logger.warning(f"attachment analysis warnings: {result['errors']}")
         elif media_type == "video":
             media_analysis = await analyze_video_with_gemini(bytes(file_data), filename, context)
             # Для видео извлекаем транскрипт аудио

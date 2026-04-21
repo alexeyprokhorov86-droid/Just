@@ -12,3 +12,4 @@ from . import bom            # noqa: F401
 from . import km_rules       # noqa: F401
 from . import c1_synthesis   # noqa: F401
 from . import notifications  # noqa: F401
+from . import attachments    # noqa: F401
