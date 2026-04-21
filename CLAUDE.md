@@ -76,8 +76,15 @@
 
 ### Knowledge Management (km_*)
 - `km_facts` (~42k), `km_decisions` (~6.3k), `km_tasks` (~8k), `km_policies` (~2.3k)
-- `km_entities` (~11.8k), `km_relations` (~7.5k)
+- `km_entities` (~13k) — +5 колонок kg_graph (centrality/degree_in/degree_out/community_id/kg_updated_at), rebuild `0 */6 * * *`
+- `km_relations` (~7.9k) — типы: stored_at (3593), supplies (1316), works_in (1114), holds_position (1095), responsible_for (366), buys (225), collaborates_with (40), reports_to (40), complains_about (29), approves (23). Soft-связи (collaborates/reports) слабо извлекаются — compensated Фаза 4 (comm_edges)
 - `km_filter_rules` — фильтрация мусора (junk_word/safe_word/min_length)
+
+### Communication Graph (comm_*, 2026-04-21 KG Фаза 4)
+- `comm_edges` — рёбра tg_user_id × tg_user_id по типам сигналов (reply weight 3.0, co_activity 0.2/неделя)
+- `comm_users` — per-user community_id / betweenness / degree_weighted / matrix_joined / is_external / km_entity_id / employee_ref_key
+- Rebuild `30 2 * * *` через `python3 -m tools.comm_graph rebuild` (~3 сек для 48 чатов)
+- Цель: Волна 5 (Matrix-миграция по кластерам общения)
 
 ### 1С данные (c1_*)
 - `c1_sales`, `c1_customer_orders`, `c1_dispatch_orders`
@@ -92,9 +99,11 @@
 - Views: `v_plan_fact_weekly`, `v_consumption_vs_purchases_monthly`, `v_sales_adjusted`, `v_current_staff`
 
 ### Прочее
-- `bom_expanded` (3,835 строк), `bom_calculations`
+- `bom_expanded` (15k строк, calc_id=4) — DAG продукт→материалы, используется tools/bom_graph (reachability upward/downward). В bom 197 finished + 48 полуфабрикатов + 418 raw.
+- `bom_calculations`
 - `matrix_invites` (17 записей)
 - `tg_user_roles`, `tg_full_analysis_settings`
+- `bot_settings` — key/value для рантайм-настроек бота (element_onboarding_video_file_id и т.п.)
 
 ## Подключение к БД
 
@@ -142,16 +151,23 @@ git add -A && git commit -m "описание" && git push
 
 Путь B (прагматичная стандартизация): декоратор `@tool(name, domain, description, input_model)` регистрирует функцию в `tools.registry.REGISTRY`. Прямой import и `invoke(name, params)` оба валидируют через pydantic InputModel (SSOT для defaults). `llm_schemas()` даёт JSON-schema в формате Anthropic/OpenAI tool_use — готово для native tool_use API.
 
-**8 tools в registry** (путь B шаг 1 закрыт 2026-04-21):
-- `chats` — get_chat_list
-- `bom` — get_bom_report
-- `km_rules` — search_filter_rules, deactivate_filter_rule (с инвалидацией distillation cache через sys.modules)
+**20 tools в registry** (состояние на 2026-04-21 после KG Фаз 1-4):
+- `attachments` — analyze_attachment (PDF/XML/docx/xlsx/image, magic-byte detect, anti-hallucination), analyze_video (MTProto до 2GB + Whisper + adaptive frame sampling + 6-section prompt)
+- `bom` — get_bom_report, bom_reachability (upward/downward в BOM DAG), bom_affected_by_supplier_delay (supplier→supplies→BOM upward)
 - `c1` — synthesize_1c_snapshot (persist=True триггерит upsert в source_chunks)
+- `chats` — get_chat_list
+- `comm` — comm_neighbors, comm_community, matrix_migration_wave (communication graph из tg_chat reply + co_activity)
+- `element_video` — generate_element_onboarding_video
+- `identification` — identify_employee_by_text (LLM-match к v_current_staff)
+- `kg` — graph_neighbors, graph_shortest_path, employee_responsibility (поверх km_entities+km_relations с PageRank/Louvain)
+- `km_rules` — search_filter_rules, deactivate_filter_rule (с инвалидацией distillation cache через sys.modules)
 - `notifications` — resolve_notification_recipients, prepare_notification, finalize_notification
 
 **Добавить tool**: модуль в `tools/`, функция с декоратором, импорт в `tools/__init__.py`. Внутренний Python-код зовёт через прямой import (type-hints, нет лишних wrapper frames). LLM/slash/HTTP/Element-бот — через `invoke(name, dict_params)`.
 
-Детали контракта и проектные решения: `.claude/sessions/2026-04-21_tools-registry.md`.
+Двойная регистрация при `python3 -m tools.X`: `tools/__init__.py` импортирует модуль, runner запускает как `__main__` — те же @tool срабатывают второй раз. `registry.py` это штатно обрабатывает (возвращает существующую Tool, не raise).
+
+Детали контракта и проектные решения: `.claude/sessions/2026-04-21_tools-registry.md`. Граф-слой: `TASK_kg_graph.md`.
 
 ## Приоритеты (апрель-май 2026)
 

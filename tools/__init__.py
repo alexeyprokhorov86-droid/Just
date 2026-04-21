@@ -15,3 +15,6 @@ from . import notifications   # noqa: F401
 from . import attachments     # noqa: F401
 from . import identification  # noqa: F401
 from . import element_video   # noqa: F401
+from . import kg_graph        # noqa: F401
+from . import bom_graph       # noqa: F401
+from . import comm_graph      # noqa: F401

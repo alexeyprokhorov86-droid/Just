@@ -57,7 +57,13 @@ def tool(
 ) -> Callable[[Callable], Callable]:
     def wrap(fn: Callable) -> Callable:
         if name in REGISTRY:
-            raise ValueError(f"tool '{name}' already registered")
+            # Двойная регистрация происходит при `python3 -m tools.X`:
+            # tools/__init__.py импортирует модуль один раз, а runner запускает
+            # его как __main__ второй раз — те же @tool декораторы срабатывают
+            # снова на тех же именах. Это законный сценарий для CLI-режима,
+            # не ошибка. Оставляем первую регистрацию, возвращаем обёрнутую
+            # функцию.
+            return REGISTRY[name].fn
         param_names = list(inspect.signature(fn).parameters.keys())
 
         @functools.wraps(fn)

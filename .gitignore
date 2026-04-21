@@ -57,3 +57,6 @@ db/
 
 # Временный приёмник файлов для Claude Code (см. .tmp_input/README.md)
 .tmp_input/
+
+# Generated artifacts (element onboarding video и т.п.)
+assets/
