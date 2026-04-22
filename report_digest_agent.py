@@ -13,6 +13,7 @@ auto_fix.sh report_digest <ctx_path>.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -298,7 +299,29 @@ def call_auto_fix(ctx_path: str) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--unconditional", action="store_true",
+        help="Будить агента каждый день, даже если проблем не найдено (режим scheduled_review).",
+    )
+    parser.add_argument(
+        "--until", type=str, default=None,
+        help="Дата окончания для --unconditional (YYYY-MM-DD включительно). После — обычное поведение.",
+    )
+    args = parser.parse_args()
+
     log.info("=== report_digest_agent start ===")
+
+    unconditional_active = args.unconditional
+    if args.unconditional and args.until:
+        try:
+            until_dt = datetime.strptime(args.until, "%Y-%m-%d").date()
+            today_dt = datetime.now().date()
+            if today_dt > until_dt:
+                unconditional_active = False
+                log.info("--unconditional истёк (today=%s > until=%s) — обычный режим", today_dt, until_dt)
+        except ValueError:
+            log.warning("--until не распарсился (%s), игнорирую", args.until)
 
     # Читаем сегодняшние блоки из логов
     audit_text = _read_today_block(AUDIT_LOG)
@@ -327,7 +350,7 @@ def main() -> int:
     if daily_report:
         all_issues.extend(parse_daily_issues(daily_report))
 
-    if not all_issues:
+    if not all_issues and not unconditional_active:
         log.info("Проблем не найдено — всё ок")
         log.info("=== report_digest_agent done ===")
         return 0
@@ -336,13 +359,18 @@ def main() -> int:
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     all_issues.sort(key=lambda x: severity_order.get(x.get("severity", "low"), 3))
 
-    log.info("Найдено %d проблем:", len(all_issues))
-    for iss in all_issues:
-        log.info("  [%s] %s — %s", iss["severity"], iss["type"], iss["description"])
+    if all_issues:
+        log.info("Найдено %d проблем:", len(all_issues))
+        for iss in all_issues:
+            log.info("  [%s] %s — %s", iss["severity"], iss["type"], iss["description"])
+    else:
+        log.info("Проблем не найдено, но --unconditional активен — будим агента для обзора (no_action ожидаем)")
 
     # Формируем контекст для auto_fix.sh
+    mode = "scheduled_review" if unconditional_active and not all_issues else "issues_found"
     ctx = {
         "trigger": "report_digest",
+        "mode": mode,
         "detected_at": datetime.now().isoformat(),
         "date": TODAY,
         "issues_count": len(all_issues),
@@ -353,11 +381,18 @@ def main() -> int:
             "daily_report": daily_report[:2000] if daily_report else "не найден",
         },
     }
+    if mode == "scheduled_review":
+        ctx["note"] = (
+            "Плановое ежедневное пробуждение: парсер не нашёл явных проблем. "
+            "Прочитай 3 отчёта (audit_pipeline / review_knowledge / daily_report), "
+            "оцени общее состояние. Если всё ок — верни STATUS: no_action (ничего не правь). "
+            "Если увидел что-то, что парсер пропустил — действуй по правилам."
+        )
     ctx_path = f"/tmp/agent_report_digest_ctx.json"
     with open(ctx_path, "w") as f:
         json.dump(ctx, f, ensure_ascii=False, default=str, indent=2)
 
-    log.info("Контекст записан: %s (%d байт)", ctx_path, os.path.getsize(ctx_path))
+    log.info("Контекст записан: %s (%d байт, mode=%s)", ctx_path, os.path.getsize(ctx_path), mode)
 
     call_auto_fix(ctx_path)
 
