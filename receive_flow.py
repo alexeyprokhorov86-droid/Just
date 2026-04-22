@@ -41,11 +41,16 @@ from tools.vision_upd import (
     UpdExtractResult,
     UpdWarning,
 )
+from tools.supplier_order_matcher import (
+    find_matching_orders,
+    format_match_for_tg,
+    MatchResult,
+)
 
 logger = logging.getLogger("receive_flow")
 
 # States
-WAITING_PHOTOS, PROCESSING, SHOWN = range(3)
+WAITING_PHOTOS, PROCESSING, SHOWN, CHOOSING_ORDER = range(4)
 
 # Admin-only на Фазу 1. В Фазе 2+ расширим на всех сотрудников склада
 # (через c1_staff_history и роли).
@@ -196,21 +201,95 @@ async def on_redo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_match(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Фаза 1 заглушка. Реальный матчинг — Фаза 2."""
+    """Фаза 2: ищет Заказы поставщику под распознанный УПД."""
     query = update.callback_query
     await query.answer()
+
     result_dict = ctx.user_data.get("upd_result") or {}
-    supplier = (result_dict.get("supplier") or {}).get("name") or "?"
-    amount = (result_dict.get("document") or {}).get("total_amount")
+    if not result_dict:
+        await query.message.reply_text("Нет распознанного УПД. /receive — начать заново.")
+        return ConversationHandler.END
+
+    upd = UpdExtractResult(**result_dict)
+    try:
+        await query.message.chat.send_action(ChatAction.TYPING)
+    except Exception:
+        pass
+    await query.message.reply_text("🔍 Ищу подходящие Заказы поставщику в 1С…")
+
+    try:
+        match: MatchResult = find_matching_orders(upd)
+    except Exception as e:
+        logger.exception("find_matching_orders failed: %s", e)
+        await query.message.reply_text(f"❌ Ошибка поиска заказов: {e}")
+        return ConversationHandler.END
+
+    ctx.user_data["match_result"] = match.model_dump()
+    text = format_match_for_tg(match)
+
+    if not match.found or match.blacklisted or not match.candidates:
+        # Блокер — завершаем
+        await query.message.reply_text(
+            text + "\n\n<i>Приёмка невозможна. /receive — начать заново.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    # Есть кандидаты — предлагаем выбрать
+    buttons = []
+    for i, c in enumerate(match.candidates[:8]):  # до 8 кандидатов в UI
+        mark = "✅" if c.fits_upd else "⚠️"
+        buttons.append([InlineKeyboardButton(
+            f"{mark} № {c.number} — остаток {c.remaining:.0f} ₽",
+            callback_data=f"pick_order:{i}",
+        )])
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="upd_cancel")])
+
     await query.message.reply_text(
-        "🚧 <b>Фаза 1 MVP</b>: распознавание работает, создание ПТУ — в Фазе 2+.\n\n"
-        f"Сохранено в user_data:\n"
-        f"• Поставщик: {supplier}\n"
-        f"• Сумма: {amount}\n"
-        f"• Позиций: {len(result_dict.get('items') or [])}\n\n"
+        text + "\n\n<i>Выберите заказ, под который создать ПТУ:</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return CHOOSING_ORDER
+
+
+async def on_pick_order(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кладовщик выбрал заказ. Phase 2 — показываем payload-preview; ПТУ — Фаза 3."""
+    query = update.callback_query
+    await query.answer()
+
+    # callback_data = "pick_order:<idx>"
+    try:
+        idx = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.message.reply_text("Некорректный выбор.")
+        return ConversationHandler.END
+
+    match_dict = ctx.user_data.get("match_result") or {}
+    cands = match_dict.get("candidates") or []
+    if idx >= len(cands):
+        await query.message.reply_text("Заказ не найден.")
+        return ConversationHandler.END
+
+    chosen = cands[idx]
+    ctx.user_data["chosen_order"] = chosen
+
+    upd_dict = ctx.user_data.get("upd_result") or {}
+    supplier_name = (upd_dict.get("supplier") or {}).get("name")
+    amount = (upd_dict.get("document") or {}).get("total_amount")
+
+    await query.message.reply_text(
+        "✅ <b>Выбран заказ</b>\n\n"
+        f"Заказ: № {chosen.get('number')} от {chosen.get('date')}\n"
+        f"Сумма заказа: {chosen.get('amount'):.2f} ₽\n"
+        f"Остаток: {chosen.get('remaining'):.2f} ₽\n\n"
+        f"УПД: {supplier_name} на {amount:.2f} ₽\n\n"
+        "🚧 <b>Фаза 2 MVP</b>: матчинг работает, сбор payload ПТУ — Фаза 3.\n"
+        "Ref_Key заказа сохранён в user_data для следующего шага.\n\n"
         "Для новой приёмки: /receive",
         parse_mode=ParseMode.HTML,
     )
+    logger.info("order picked: %s ref=%s", chosen.get("number"), chosen.get("ref_key"))
     return ConversationHandler.END
 
 
@@ -243,6 +322,10 @@ def receive_conversation() -> ConversationHandler:
                 CallbackQueryHandler(on_match,  pattern=r"^upd_match$"),
                 CallbackQueryHandler(on_redo,   pattern=r"^upd_redo$"),
                 CallbackQueryHandler(on_cancel, pattern=r"^upd_cancel$"),
+            ],
+            CHOOSING_ORDER: [
+                CallbackQueryHandler(on_pick_order, pattern=r"^pick_order:\d+$"),
+                CallbackQueryHandler(on_cancel,     pattern=r"^upd_cancel$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", on_cancel)],

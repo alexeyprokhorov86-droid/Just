@@ -234,9 +234,33 @@
 - Warning: не видно печати покупателя (нормально — документ ещё не принят).
 - Стоимость: ~$0.13 за УПД (5373 input + 629 output tokens на Opus).
 
+### Фаза 2 — матчинг с Заказом поставщику (закрыта 2026-04-22)
+
+- [x] `tools/supplier_order_matcher.py`:
+  - `resolve_partner_by_inn(inn)` — ИНН → partner_key через c1_counterparties JOIN c1_partners
+  - `fetch_candidate_orders(partner_key)` — on-demand OData GET, не локальный кэш (свежие данные всегда).
+  - `already_received_amount(order_ref_key)` — сумма уже принятого ПТУ (JOIN через `c1_purchase_items.supplier_order_key`)
+  - `find_matching_orders(upd)` — применяет все критерии ТЗ: ИНН найден, партнёр не в ЧС, статус «Подтвержден», ≤90 дней, остаток ≥ сумма УПД.
+  - Сортировка: подходящие по сумме → сверху, внутри — по дате DESC.
+- [x] `receive_flow.py` — новое состояние `CHOOSING_ORDER` + хендлер `on_pick_order`.
+  - После распознанного УПД юзер нажимает «Далее: подобрать заказ» → matcher → InlineKeyboardMarkup с до 8 кандидатами (✅ подходит по сумме / ⚠️ остаток недостаточен).
+  - Выбор → payload-preview, `ref_key` сохраняется в user_data для Фазы 3.
+
+- [x] Обнаруженные квирки OData 1С (учтены в коде):
+  - `$filter` с **русскими значениями** (например `Статус eq 'Подтвержден'`) → **500**. Фильтруем в Python.
+  - `params=dict` в `requests` кодирует `:` в `%3A` в datetime — **500**. Собираем URL вручную как в `sync_1c_full.py`.
+  - **Имена полей кириллицей** в $filter (`Партнер_Key`) — **500**. Фильтруем в Python.
+  - `$top=500` + `$orderby=Date desc` иногда **500** на больших выборках. Берём `$top=100` с пагинацией.
+
+**Проверено** на реальном УПД: нашёл 8 заказов от Русагрикома за 3 мес, все в статусе «Подтвержден». Но у всех уже есть ПТУ на полную сумму (остаток 0) — значит реально принимать по этому УПД нечего. Это соответствует логике: тестовый УПД от марта уже был обработан, система корректно это увидела.
+
 ### Следующие шаги
 
-**Фаза 2** — матчинг с Заказом поставщику:
-- `tools/match_supplier_order.py:find_candidates(upd) -> list[OrderCandidate]` по критериям: поставщик (по ИНН → c1_counterparties.partner_key → c1_partners), проведён, статус «Подтверждён», не старше 3 мес, не в чёрном списке, номенклатура не в Архиве (один из 2 ref_key), сумма Заказа ≥ сумма ПТУ (минус уже принятое).
-- UI выбора в TG (InlineKeyboardMarkup с номерами заказов).
-- **Предварительно**: расширить `sync_1c_full.py:sync_supplier_orders` недостающими полями (agreement_key, nds_mode, currency_key, …) — `c1_supplier_orders` уже имеет колонки (ALTER прошёл), но пустые. Либо разово перегнать `sync_procurement.py` + расширить существующий sync.
+**Фаза 3** — создание ПТУ в 1С через OData:
+- `tools/procurement_builder.py:build_ptu_payload(order, upd, agreement, user)` — собирает dict из ~25 полей ПТУ + строки Товары (с СтавкаНДС_Key lookup из c1_vat_rates).
+- `tools/onec_write.py:create_and_post_document(doc_type, payload)` — POST + Post + rollback (Unpost + DELETE) если Post упал.
+- Проверка действующего Соглашения (c1_supplier_agreements):
+  - 1 действующее → используем.
+  - 0 → alert в Закупки, блокируем.
+  - >1 → запрос в Закупки с вариантами, ждём ответа.
+- Интеграция в receive_flow: после выбора заказа → preview payload → подтверждение → POST → показ номера созданного ПТУ.
