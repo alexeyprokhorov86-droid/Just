@@ -61,3 +61,4 @@ db/
 # Generated artifacts (element onboarding video и т.п.)
 assets/
 claude_tg_bridge/sessions.json
+docs/odata_metadata.xml
