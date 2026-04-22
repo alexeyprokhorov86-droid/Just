@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from telegram.ext import CallbackQueryHandler
 from rag_agent import process_rag_query, index_new_message
+from receive_flow import receive_conversation
 from telegram.helpers import escape_markdown
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -4827,6 +4828,8 @@ def main():
     application.add_handler(CommandHandler("assign_email", assign_email_command))
     application.add_handler(CommandHandler("list_employees", list_employees_command))
     application.add_handler(CommandHandler("bom", bom_command))
+    # /receive — приёмка УПД (Фаза 1: OCR; Фаза 2+: матчинг заказа и ПТУ)
+    application.add_handler(receive_conversation())
     # Команда /rules — управление правилами фильтрации
     application.add_handler(CommandHandler("rules", rules_command))
     application.add_handler(CommandHandler("rules_find", rules_find_command))

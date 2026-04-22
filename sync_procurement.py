@@ -205,6 +205,30 @@ def ensure_tables(conn) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ctp_inn ON c1_counterparties(inn)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ctp_partner ON c1_counterparties(partner_key)")
 
+        # Наши организации (Catalog_Организации в 1С). Обычно 5-10 записей.
+        # Нужны для: (1) выбора организации при создании ПТУ,
+        # (2) валидатора "supplier из УПД != наша организация".
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS c1_organizations (
+                id SERIAL PRIMARY KEY,
+                ref_key VARCHAR(50) UNIQUE NOT NULL,
+                code VARCHAR(50),
+                name VARCHAR(500),
+                full_name VARCHAR(1000),
+                inn VARCHAR(20),
+                kpp VARCHAR(20),
+                ogrn VARCHAR(20),
+                legal_form VARCHAR(100),
+                is_individual BOOLEAN DEFAULT FALSE,
+                head_key VARCHAR(50),
+                chief_accountant_key VARCHAR(50),
+                is_deleted BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_orgs_inn ON c1_organizations(inn)")
+
         # Партнёры (бизнес-сущности, Catalog_Партнеры в 1С).
         # Здесь живут флаги Клиент/Поставщик и «чёрный список».
         cur.execute("""
@@ -464,6 +488,31 @@ def sync_counterparties(conn) -> int:
     return n
 
 
+def sync_organizations(conn) -> int:
+    log("→ Наши организации (Catalog_Организации)")
+    data = odata_all("Catalog_Организации")
+    active = [r for r in data if not r.get("DeletionMark") and r.get("Description")]
+    log(f"  получено {len(data)} всего, {len(active)} активных")
+    rows = [(
+        r["Ref_Key"], r.get("Code"), r.get("Description"),
+        r.get("НаименованиеПолное"),
+        r.get("ИНН"), r.get("КПП"), r.get("ОГРН"),
+        r.get("ЮрФизЛицо"), bool(r.get("ЮрФизЛицо") == "ФизЛицо"),
+        _d(r, "Руководитель_Key"), _d(r, "ГлавныйБухгалтер_Key"),
+        bool(r.get("DeletionMark")),
+    ) for r in active]
+    cols = [
+        "ref_key", "code", "name", "full_name",
+        "inn", "kpp", "ogrn",
+        "legal_form", "is_individual",
+        "head_key", "chief_accountant_key",
+        "is_deleted",
+    ]
+    n = upsert(conn, "c1_organizations", rows, cols)
+    log(f"  ✓ upserted {n}")
+    return n
+
+
 def sync_partners(conn) -> int:
     log("→ Партнёры (Catalog_Партнеры, ~2805)")
     data = odata_all("Catalog_Партнеры")
@@ -502,6 +551,7 @@ ALL_TASKS = {
     "vat_rates":           sync_vat_rates,
     "nomenclature_kinds":  sync_nomenclature_kinds,
     "agreements":          sync_agreements,
+    "organizations":       sync_organizations,
     "partners":            sync_partners,
     "counterparties":      sync_counterparties,
 }

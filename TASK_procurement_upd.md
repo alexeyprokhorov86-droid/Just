@@ -207,6 +207,36 @@
 
 **Остаток фазы 0 (фаза 0.4)**: досинхрон таблиц — ~1 день работы. **Следующий шаг.**
 
+### Фаза 1 — TG-команда /receive + OCR (закрыта 2026-04-22)
+
+- [x] `tools/vision_upd.py` — extract_upd + validate_upd + format_extract_for_tg.
+  - Backend: **RouterAI** (модель `anthropic/claude-opus-4.7`, единый биллинг с rag_agent), **не прямой Anthropic API**.
+  - PDF растеризуется через `pdf2image` (poppler) → JPEG → image_url (OpenAI-compat формат).
+  - PDF_MAX_PAGES=3, DPI=200.
+  - Валидатор (по ИНН, не по имени, т.к. Vision иногда галлюцинирует имена):
+    - **error** `supplier_is_own_org` — ИНН поставщика в c1_organizations (наша). Блокер.
+    - **error** `buyer_not_own_org` — ИНН покупателя НЕ наш. Блокер.
+    - **error** `no_inn`, `no_items`.
+    - **warning** `unusual_vat_rate` — ставка не в {0, 10, 20, 22, «Без НДС»}.
+    - **warning** `sum_mismatch` — ±1 руб между суммой документа и sum(items).
+    - **warning** `supplier/buyer_attestation_missing` — нет печати/подписи.
+- [x] `receive_flow.py` — ConversationHandler.
+  - `/receive` (admin-only на MVP) → ждёт 1+ фото/PDF → кнопка «Готово» → OCR → показывает результат с валидацией.
+  - Состояния: WAITING_PHOTOS → PROCESSING → SHOWN.
+  - При error'е — кнопки «Переснять / Завершить». При success — кнопки «Далее (заглушка Фазы 2) / Переснять / Отмена».
+  - Отмена: /cancel.
+- [x] Регистрация в `bot.py` (импорт + add_handler).
+
+**Проверено на реальном УПД** (`Русагриком 17,03,2026.pdf`):
+- Поставщик «ООО Русагриком» ИНН 7727616155 ✓
+- Покупатель «ООО НОВЭЛ ФУД» ИНН 5029266281 (наша) ✓
+- Сумма 100000.00, НДС 22%, 1 позиция ✓
+- Warning: не видно печати покупателя (нормально — документ ещё не принят).
+- Стоимость: ~$0.13 за УПД (5373 input + 629 output tokens на Opus).
+
 ### Следующие шаги
 
-После 0.4 → Фаза 1 (TG-команда `/receive` + OCR).
+**Фаза 2** — матчинг с Заказом поставщику:
+- `tools/match_supplier_order.py:find_candidates(upd) -> list[OrderCandidate]` по критериям: поставщик (по ИНН → c1_counterparties.partner_key → c1_partners), проведён, статус «Подтверждён», не старше 3 мес, не в чёрном списке, номенклатура не в Архиве (один из 2 ref_key), сумма Заказа ≥ сумма ПТУ (минус уже принятое).
+- UI выбора в TG (InlineKeyboardMarkup с номерами заказов).
+- **Предварительно**: расширить `sync_1c_full.py:sync_supplier_orders` недостающими полями (agreement_key, nds_mode, currency_key, …) — `c1_supplier_orders` уже имеет колонки (ALTER прошёл), но пустые. Либо разово перегнать `sync_procurement.py` + расширить существующий sync.
