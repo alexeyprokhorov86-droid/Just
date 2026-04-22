@@ -12,7 +12,7 @@ RULES_FILE="$REPO_DIR/.claude/AUTO_AGENT_RULES.md"
 SESSIONS_DIR="$REPO_DIR/.claude/auto_sessions"
 HELPER="$REPO_DIR/auto_fix_helper.py"
 PY="$REPO_DIR/venv/bin/python"
-CLAUDE_BIN="$(command -v claude || echo /usr/bin/claude)"
+CLAUDE_BIN="$(command -v claude || echo /home/admin/.local/bin/claude)"
 CLAUDE_TIMEOUT_SEC=600
 HEALTHCHECK_WAIT_SEC=30
 HEALTHCHECK_TIMEOUT_SEC=120
@@ -113,9 +113,12 @@ if [[ -z "$CLAUDE_OAUTH_TOKEN_VAL" ]]; then
     log "ERROR: CLAUDE_CODE_OAUTH_TOKEN не найден в .env — abort"
     exit 1
 fi
+# HTTPS_PROXY через локальный Privoxy (:8118 → Amsterdam SOCKS5): без него
+# Anthropic API отвечает 403 "Request not allowed" на российский IP.
 set +e
 env -u CLAUDECODE -u CLAUDE_CODE_SSE_PORT -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
     -u ANTHROPIC_API_KEY \
+    HTTPS_PROXY="http://127.0.0.1:8118" HTTP_PROXY="http://127.0.0.1:8118" \
     CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_OAUTH_TOKEN_VAL" \
     timeout "$CLAUDE_TIMEOUT_SEC" "$CLAUDE_BIN" -p "$(cat "$PROMPT_FILE")" \
     --permission-mode acceptEdits \
