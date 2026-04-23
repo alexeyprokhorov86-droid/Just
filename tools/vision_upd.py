@@ -249,6 +249,27 @@ def _our_inns() -> set[str]:
         conn.close()
 
 
+def _inn_near_our(inn: str, our: set[str], max_diff: int = 1) -> str | None:
+    """Fuzzy-match ИНН: если OCR ошибся в 1 цифре среди наших 8 организаций —
+    возвращает правильный ИНН. Длина должна совпадать (10 или 12)."""
+    if not inn:
+        return None
+    matches = []
+    for o in our:
+        if len(o) != len(inn):
+            continue
+        diff = sum(1 for a, b in zip(inn, o) if a != b)
+        if 0 < diff <= max_diff:
+            matches.append((diff, o))
+    if not matches:
+        return None
+    matches.sort()
+    # Возвращаем только если ближайший match уникален (diff меньше второго)
+    if len(matches) == 1 or matches[0][0] < matches[1][0]:
+        return matches[0][1]
+    return None
+
+
 def _norm_vat(value) -> int | None:
     """Нормализует nds_rate_percent в int или None для «Без НДС»."""
     if value is None:
@@ -273,30 +294,54 @@ def validate_upd(result: UpdExtractResult) -> list[UpdWarning]:
     our = _our_inns()
 
     # 1. Swap: supplier в УПД = наша организация → блокер
-    if result.supplier.inn and result.supplier.inn in our:
+    supplier_own = result.supplier.inn and result.supplier.inn in our
+    # Fuzzy: OCR мог ошибиться на 1 цифру (у нас всего 8 своих ИНН, коллизии крайне редки)
+    supplier_own_fuzzy = None
+    if not supplier_own and result.supplier.inn:
+        supplier_own_fuzzy = _inn_near_our(result.supplier.inn, our)
+    if supplier_own or supplier_own_fuzzy:
+        shown_inn = supplier_own_fuzzy or result.supplier.inn
         warnings.append(UpdWarning(
             level="error",
             code="supplier_is_own_org",
             message=(
                 "В УПД поставщиком указана НАША организация "
-                f"(ИНН {result.supplier.inn}, «{result.supplier.name}»). "
+                f"(ИНН {shown_inn}, «{result.supplier.name}»). "
                 "Документ оформлен неправильно — приём товара невозможен без согласования."
             ),
-            details={"inn": result.supplier.inn, "name": result.supplier.name},
+            details={"inn": shown_inn, "name": result.supplier.name,
+                     "ocr_inn": result.supplier.inn, "fuzzy_matched": bool(supplier_own_fuzzy)},
         ))
 
     # 2. Покупатель (buyer) должен быть наша организация
     if result.buyer.inn and result.buyer.inn not in our:
-        warnings.append(UpdWarning(
-            level="error",
-            code="buyer_not_own_org",
-            message=(
-                "В УПД покупателем указана НЕ наша организация "
-                f"(ИНН {result.buyer.inn}, «{result.buyer.name}»). "
-                "Возможно, это УПД не для нас."
-            ),
-            details={"inn": result.buyer.inn, "name": result.buyer.name},
-        ))
+        fuzzy = _inn_near_our(result.buyer.inn, our)
+        if fuzzy:
+            # OCR ошибся на 1 цифру → корректируем, НЕ блокируем
+            warnings.append(UpdWarning(
+                level="warning",
+                code="buyer_inn_ocr_corrected",
+                message=(
+                    f"ИНН покупателя распознан как {result.buyer.inn}, "
+                    f"но ближайший ИНН нашей организации — {fuzzy} (отличие в 1 знаке). "
+                    "Скорее всего, это OCR-ошибка. Использую скорректированное значение."
+                ),
+                details={"ocr_inn": result.buyer.inn, "corrected_inn": fuzzy,
+                         "name": result.buyer.name},
+            ))
+            # Корректируем in-place, чтобы downstream-матчер видел правильный ИНН
+            result.buyer.inn = fuzzy
+        else:
+            warnings.append(UpdWarning(
+                level="error",
+                code="buyer_not_own_org",
+                message=(
+                    "В УПД покупателем указана НЕ наша организация "
+                    f"(ИНН {result.buyer.inn}, «{result.buyer.name}»). "
+                    "Возможно, это УПД не для нас."
+                ),
+                details={"inn": result.buyer.inn, "name": result.buyer.name},
+            ))
 
     # 3. Ни supplier.inn, ни buyer.inn не распознаны
     if not result.supplier.inn and not result.buyer.inn:
