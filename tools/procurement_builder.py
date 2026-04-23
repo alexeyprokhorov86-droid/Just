@@ -199,6 +199,7 @@ def build_ptu_payload(
     upd,                          # UpdExtractResult
     accepter_ref_key: str = "00000000-0000-0000-0000-000000000000",
     accepter_position: str = "",
+    labels: Optional[list] = None,  # list[LabelExtractResult]: этикетки для серий
     now: Optional[datetime.datetime] = None,
 ) -> BuildResult:
     """Собирает payload ПТУ для POST в 1С.
@@ -325,20 +326,76 @@ def build_ptu_payload(
                 ),
             ))
 
-        # Количество и суммы — факт из УПД
+        # Количество — факт из УПД (отражаем реальную приёмку)
         qty = u_item.quantity if u_item.quantity is not None else o_row.get("Количество", 0)
         row_out["Количество"] = qty
         row_out["КоличествоУпаковок"] = qty
-        price = u_item.price if u_item.price is not None else o_row.get("Цена", 0)
-        row_out["Цена"] = price
-        sum_no_nds = u_item.sum_without_nds
+
+        # Цена в ПТУ должна совпасть с ценой в Заказе, иначе 1С не покажет
+        # «Цена в заказе». Выбор правильной цены из УПД по флагу ЦенаВключаетНДС:
+        #   True  → цена с НДС = sum_with_nds / quantity
+        #   False → цена без НДС = sum_without_nds / quantity (= "price" УПД)
+        price_order = float(o_row.get("Цена", 0) or 0)
+        price_includes_vat = bool(payload.get("ЦенаВключаетНДС"))
         sum_nds = u_item.nds_sum or 0
         sum_with_nds = u_item.sum_with_nds if u_item.sum_with_nds is not None else (
-            (sum_no_nds or 0) + (sum_nds or 0)
+            (u_item.sum_without_nds or 0) + sum_nds
         )
+        if qty and qty > 0:
+            if price_includes_vat:
+                price_calc = round(float(sum_with_nds) / qty, 2)
+            else:
+                sum_no_nds = u_item.sum_without_nds if u_item.sum_without_nds is not None else (
+                    (float(sum_with_nds) - sum_nds)
+                )
+                price_calc = round(float(sum_no_nds) / qty, 2)
+        else:
+            price_calc = u_item.price or price_order
+        # Расхождение с Заказом → warning (больше 1 копейки)
+        if price_order and abs(price_calc - price_order) > 0.01:
+            result.warnings.append(BuildWarning(
+                code="price_mismatch",
+                message=(
+                    f"Цена в УПД ({price_calc:.2f} ₽, "
+                    f"{'с НДС' if price_includes_vat else 'без НДС'}) не совпадает с ценой "
+                    f"в Заказе ({price_order:.2f} ₽). «Цена в заказе» не отобразится в ПТУ — "
+                    "проверьте условия приёмки."
+                ),
+            ))
+        row_out["Цена"] = price_calc
+
+        # Серия — если для номенклатуры включены серии и есть этикетка
+        if labels and nomen_key:
+            from tools.onec_series import (
+                resolve_vid_key_by_nomenclature, find_series,
+            )
+            # Для MVP берём первую этикетку (один УПД = одна партия)
+            lbl = labels[0]
+            if lbl.batch_number and lbl.production_date:
+                vid_key = resolve_vid_key_by_nomenclature(nomen_key)
+                if vid_key:
+                    try:
+                        existing = find_series(vid_key, lbl.batch_number, lbl.production_date)
+                    except Exception as e:
+                        existing = None
+                        logger.warning("find_series failed: %s", e)
+                    if existing:
+                        row_out["Серия_Key"] = existing
+                        row_out["СтатусУказанияСерий"] = 2  # полное указание
+                    else:
+                        result.warnings.append(BuildWarning(
+                            code="series_not_found",
+                            message=(
+                                f"Серия № {lbl.batch_number} от {lbl.production_date} не найдена "
+                                "в 1С. Создание серий через OData заблокировано "
+                                "ОбработкойЗаполнения — создайте серию вручную в 1С "
+                                "(Номенклатура → Серии → Создать) и повторите."
+                            ),
+                        ))
         # В 1С для ЦенаВключаетНДС=True: Сумма = сумма с НДС
         row_out["Сумма"] = sum_with_nds
         row_out["СуммаНДС"] = sum_nds
+        row_out["СуммаНДСВзаиморасчетов"] = sum_nds  # было забыто → 0 в ПТУ
         row_out["СуммаСНДС"] = sum_with_nds
         row_out["СуммаВзаиморасчетов"] = sum_with_nds
         row_out["СуммаИтог"] = sum_with_nds
