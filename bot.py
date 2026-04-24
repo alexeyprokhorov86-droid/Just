@@ -3264,7 +3264,7 @@ async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur.execute("""
                 SELECT id, rule_type, value, reason, added_by, created_at
                 FROM km_filter_rules
-                WHERE approval_status = 'pending' AND is_active = true
+                WHERE approval_status = 'pending'
                 ORDER BY created_at DESC
                 LIMIT 20
             """)
@@ -3332,7 +3332,7 @@ async def rules_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE km_filter_rules
-                    SET approval_status = 'approved', updated_at = NOW()
+                    SET approval_status = 'approved', is_active = true, updated_at = NOW()
                     WHERE id = %s
                     RETURNING value
                 """, (rule_id,))
