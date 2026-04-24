@@ -44,6 +44,7 @@ CHECK_URL = "https://api.telegram.org"
 ACTIVE_PROXY_FILE = Path("/tmp/active_proxy.json")
 BOT_SERVICE = "telegram-logger"
 STATUS_FILE = Path("/tmp/proxy_status.json")
+RESTART_COOLDOWN = 120       # минимум секунд между рестартами бота
 
 # ─── Логирование ────────────────────────────────────────────
 
@@ -55,6 +56,7 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("proxy_manager")
+_last_restart_time: float = 0.0
 
 # ─── Функции ────────────────────────────────────────────────
 
@@ -121,13 +123,19 @@ def write_status(statuses: list[dict]):
 
 def restart_bot():
     """Перезапускает бота через systemctl."""
+    global _last_restart_time
+    elapsed = time.time() - _last_restart_time
+    if elapsed < RESTART_COOLDOWN:
+        log.info(f"Skipping {BOT_SERVICE} restart — last restart {elapsed:.0f}s ago (cooldown {RESTART_COOLDOWN}s)")
+        return
+    _last_restart_time = time.time()
     log.info(f"Restarting {BOT_SERVICE}...")
     try:
         result = subprocess.run(
             ["sudo", "systemctl", "restart", BOT_SERVICE],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=120,
         )
         if result.returncode == 0:
             log.info(f"{BOT_SERVICE} restarted successfully")
