@@ -442,6 +442,8 @@ def audit_source_documents(conn):
         LEFT JOIN source_chunks sc ON sc.document_id = sd.id
         WHERE sc.id IS NULL
           AND sd.body_text IS NOT NULL AND LENGTH(sd.body_text) >= 25
+          AND (sd.meta->>'skip_reason' IS NULL
+               OR sd.meta->>'skip_reason' != 'auto_notification')
         GROUP BY sd.source_kind
     """)
     unchunked = {row[0]: row[1] for row in cur.fetchall()}
