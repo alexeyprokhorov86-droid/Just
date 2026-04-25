@@ -56,7 +56,7 @@ ASK_PROMPT_PREFIX = """Ты вызван из Telegram-бота — пользо
 
 Перед ответом прочитай для контекста:
 1. `CLAUDE.md` в корне проекта (project instructions)
-2. Последние 3 файла в `.claude/sessions/` (по mtime) — что было в недавних сессиях
+2. Последние 3 файла в `logs/sessions/` (по mtime) — что было в недавних сессиях
 
 Правила работы:
 - Ты в режиме acceptEdits. Полный доступ: Read/Grep/Glob/Bash/Edit/Write/Task.

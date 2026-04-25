@@ -167,7 +167,7 @@ git add -A && git commit -m "описание" && git push
 
 Двойная регистрация при `python3 -m tools.X`: `tools/__init__.py` импортирует модуль, runner запускает как `__main__` — те же @tool срабатывают второй раз. `registry.py` это штатно обрабатывает (возвращает существующую Tool, не raise).
 
-Детали контракта и проектные решения: `.claude/sessions/2026-04-21_tools-registry.md`. Граф-слой: `TASK_kg_graph.md`.
+Детали контракта и проектные решения: `logs/sessions/2026-04-21_tools-registry.md`. Граф-слой: `TASK_kg_graph.md`.
 
 ## Приоритеты (апрель-май 2026)
 
@@ -258,13 +258,13 @@ curl -x socks5h://127.0.0.1:1080 https://api.anthropic.com
 
 **ЭТО ПРАВИЛО ИМЕЕТ ВЫСШИЙ ПРИОРИТЕТ. Нарушение = потеря контекста для будущих сессий.**
 
-Claude Code ведёт НЕПРЕРЫВНЫЙ лог сессии в `.claude/sessions/YYYY-MM-DD_описание.md`.
+Claude Code ведёт НЕПРЕРЫВНЫЙ лог сессии в `logs/sessions/YYYY-MM-DD_описание.md`.
 
 ### При старте сессии (ОБЯЗАТЕЛЬНАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ):
 1. Прочитать CLAUDE.md (этот файл)
-2. Прочитать последние 3 лога из `.claude/sessions/` для контекста:
+2. Прочитать последние 3 лога из `logs/sessions/` для контекста:
    ```bash
-   ls -t .claude/sessions/ | head -3 | xargs -I {} cat .claude/sessions/{}
+   ls -t logs/sessions/ | head -3 | xargs -I {} cat logs/sessions/{}
    ```
 3. Создать новый файл лога для текущей сессии (даже если задача кажется быстрой!)
 4. Только после этого приступать к задаче

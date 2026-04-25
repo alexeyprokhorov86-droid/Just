@@ -25,6 +25,7 @@ sync_log*.txt
 
 # Claude Code runtime
 .claude/auto_sessions/
+logs/sessions/
 
 # Python
 __pycache__/
