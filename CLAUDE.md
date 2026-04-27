@@ -93,6 +93,11 @@
 - `c1_bank_balances` (3 счёта Фрумелад/НФ)
 - `nomenclature` (7,774 записи, вес: ВесЧислитель/ВесЗнаменатель в кг)
 
+### Дополнительные приобретения (sync_acquisitions_extra.py, 2026-04-27)
+- `c1_purchases_other_assets` + `_items` — Document_ПриобретениеУслугПрочихАктивов (аренда, коммуналка, IT, юр.услуги — то, что НЕ ПТУ). С 2025-01-01.
+- `c1_advance_reports` + `c1_advance_report_other_expenses` + `c1_advance_report_supplier_pmts` — Document_АвансовыйОтчет (подотчётные расходы). На строках subtable есть прямой `cash_flow_item_key` — не нужна эвристика через поставщика.
+- Cron: `--quick` каждые 30 мин (14 дней), `--daily` 5:00 (60 дней), `--full` ВС 3:00 (всё).
+
 ### Materialized views (mart_*) — обновляются каждые 10 мин через cron REFRESH
 - `mart_sales`, `mart_purchases`, `mart_production`, `mart_customer_orders`, `mart_supplier_orders`
 - Используются в Router-driven analytics tools (purchases_by_nomenclature, sales_by_nomenclature, production_by_nomenclature, stock_balance, top_* и т.д.)
