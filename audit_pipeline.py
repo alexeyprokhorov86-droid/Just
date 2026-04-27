@@ -425,12 +425,16 @@ def fix_email_attachments():
 
 def audit_source_documents(conn):
     cur = conn.cursor()
+    # Дистилляция реализована только для telegram_message и email_message.
+    # Остальные source_kinds (email_attachment, matrix_message, c1_event,
+    # rag_answer, synthesized_1c) намеренно исключены из этого пайплайна.
     cur.execute("""
-        SELECT source_kind, COUNT(*) 
-        FROM source_documents 
+        SELECT source_kind, COUNT(*)
+        FROM source_documents
         WHERE (meta->>'distilled') IS NULL
           AND LENGTH(body_text) >= 25
-          AND (source_kind != 'email_message' 
+          AND source_kind IN ('telegram_message', 'email_message')
+          AND (source_kind != 'email_message'
                OR meta->>'email_category' IN ('internal', 'external_business'))
         GROUP BY source_kind
     """)
