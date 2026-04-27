@@ -55,6 +55,10 @@ SNOOZE_PICK    = 2
 SNOOZE_CUSTOM  = 3
 DECLINE_REASON = 4
 TRANSFER_PICK  = 5
+RESULT_TEXT    = 6
+
+
+PRIORITY_LABELS = {0: "🟢 низкий", 1: "🔵 нормальный", 2: "🟠 высокий", 3: "🔴 критический"}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -66,13 +70,14 @@ def fetch_next_task(tg_user_id: int) -> dict | None:
         cur.execute("""
             SELECT id, kind, title, task_text, context_data, assignee_entity_id,
                    assignee_tg_user_id, status, snoozed_until, escalation_level,
-                   created_at, source_table, source_id
+                   created_at, source_table, source_id, priority, deadline,
+                   result_text
             FROM km_tasks
             WHERE assignee_tg_user_id = %s
               AND status = 'open'
               AND kind != 'extracted_from_text'
               AND (snoozed_until IS NULL OR snoozed_until <= NOW())
-            ORDER BY created_at ASC LIMIT 1
+            ORDER BY priority DESC, deadline ASC NULLS LAST, created_at ASC LIMIT 1
         """, (tg_user_id,))
         row = cur.fetchone()
         return dict(row) if row else None
@@ -141,7 +146,28 @@ def render_task(task: dict) -> tuple[str, InlineKeyboardMarkup]:
     if isinstance(ctx, str):
         ctx = json.loads(ctx)
 
-    lines = [f"<b>{task.get('title') or 'Задача'}</b>", ""]
+    pri = task.get("priority") if task.get("priority") is not None else 1
+    pri_str = PRIORITY_LABELS.get(pri, "🔵 нормальный")
+
+    header_meta = [pri_str]
+    if task.get("deadline"):
+        from datetime import date as _d
+        try:
+            ddl = task["deadline"]
+            days_left = (ddl - _d.today()).days
+            if days_left < 0:
+                header_meta.append(f"⚠ просрочка на {-days_left} д")
+            elif days_left == 0:
+                header_meta.append("⚠ дедлайн сегодня")
+            else:
+                header_meta.append(f"дедлайн через {days_left} д ({ddl})")
+        except Exception:
+            pass
+
+    lines = [f"<b>{task.get('title') or 'Задача'}</b>"]
+    if header_meta:
+        lines.append(" · ".join(header_meta))
+    lines.append("")
     if task.get("task_text"):
         lines.append(task["task_text"])
         lines.append("")
@@ -219,20 +245,71 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     task_id = int(q.data.split("_")[-1])
+    context.user_data["done_task_id"] = task_id
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Без комментария", callback_data=f"done_skip_{task_id}")],
+        [InlineKeyboardButton("← Назад", callback_data=f"done_cancel_{task_id}")],
+    ])
+    await q.edit_message_text(
+        "Кратко напиши, что сделано (одним сообщением).\n"
+        "Например: «Оформил ПТУ #234 на 200к», «Аванс по договору, поставка 10.05».",
+        reply_markup=kb,
+    )
+    return RESULT_TEXT
+
+
+async def on_done_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    result = (update.message.text or "").strip()
+    if len(result) < 2:
+        await update.message.reply_text("Слишком коротко. Напиши хотя бы пару слов.")
+        return RESULT_TEXT
+    task_id = context.user_data.get("done_task_id")
+    if not task_id:
+        await update.message.reply_text("Слетел контекст. /tasks ещё раз.")
+        return ConversationHandler.END
+    update_task(task_id, status="resolved", resolved_at=datetime.now(),
+                result_text=result)
+    log_reminder(task_id, 0, "dm", update.message.chat_id, update.message.message_id,
+                 f"resolved: {result}", response="resolved")
+    await update.message.reply_text("✅ Сделано. Зафиксировано.")
+    return await _show_next_or_end(update, context)
+
+
+async def on_done_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    task_id = int(q.data.split("_")[-1])
     update_task(task_id, status="resolved", resolved_at=datetime.now())
     log_reminder(task_id, 0, "dm", q.message.chat_id, q.message.message_id,
-                 "user clicked DONE", response="resolved")
+                 "resolved (no comment)", response="resolved")
     await q.edit_message_text("✅ Сделано. Спасибо.")
-    # show next one
-    next_t = fetch_next_task(update.effective_user.id)
-    if next_t:
-        text, kb = render_task(next_t)
-        msg = await context.bot.send_message(chat_id=q.message.chat_id, text=text,
-                                              reply_markup=kb, parse_mode=ParseMode.HTML)
-        log_reminder(next_t["id"], 0, "dm", msg.chat_id, msg.message_id, text)
-        context.user_data["current_task_id"] = next_t["id"]
+    return await _show_next_or_end(update, context)
+
+
+async def on_done_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query; await q.answer()
+    task_id = int(q.data.split("_")[-1])
+    task = get_task(task_id)
+    if task:
+        text, kb = render_task(task)
+        await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return CHOOSING_ACTION
     return ConversationHandler.END
+
+
+async def _show_next_or_end(update_or_q, context) -> int:
+    """После resolve — показать следующую задачу или END."""
+    user_id = update_or_q.effective_user.id
+    next_t = fetch_next_task(user_id)
+    if not next_t:
+        return ConversationHandler.END
+    text, kb = render_task(next_t)
+    chat_id = (update_or_q.message.chat_id if update_or_q.message
+               else update_or_q.callback_query.message.chat_id)
+    msg = await context.bot.send_message(chat_id=chat_id, text=text,
+                                          reply_markup=kb, parse_mode=ParseMode.HTML)
+    log_reminder(next_t["id"], 0, "dm", msg.chat_id, msg.message_id, text)
+    context.user_data["current_task_id"] = next_t["id"]
+    return CHOOSING_ACTION
 
 
 SNOOZE_OPTIONS = [("1 день", 1), ("3 дня", 3), ("Неделя", 7)]
@@ -444,6 +521,11 @@ def tasks_conversation() -> ConversationHandler:
             TRANSFER_PICK: [
                 CallbackQueryHandler(on_transfer_pick,   pattern=r"^tr_\d+_\d+$"),
                 CallbackQueryHandler(on_transfer_cancel, pattern=r"^tr_cancel_\d+$"),
+            ],
+            RESULT_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_done_text),
+                CallbackQueryHandler(on_done_skip,   pattern=r"^done_skip_\d+$"),
+                CallbackQueryHandler(on_done_cancel, pattern=r"^done_cancel_\d+$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", on_cancel)],
