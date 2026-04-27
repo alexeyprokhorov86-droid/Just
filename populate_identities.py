@@ -214,6 +214,60 @@ Telegram:
         return None
 
 
+def llm_match_employee_to_tg(emp_name: str, tg_candidates: list[dict]) -> int | None:
+    """Обратный матч: для сотрудника LLM выбирает подходящий TG-аккаунт.
+    Используется в Pass 6 (для авторов документов без TG-привязки).
+    Возвращает tg_user_id или None."""
+    if not ROUTER_AI_KEY:
+        return None
+    cand_lines = []
+    for c in tg_candidates[:300]:
+        roles = c.get("roles") or ""
+        cand_lines.append(
+            f"  - {c['tg_user_id']}: display={c.get('display_name')!r} "
+            f"username={c.get('username')!r} first={c.get('first_name')!r} "
+            f"last={c.get('last_name')!r} roles={roles!r}"
+        )
+    prompt = f"""Сматчи сотрудника к Telegram-аккаунту по списку.
+
+Сотрудник: {emp_name!r}
+
+Кандидаты TG (tg_user_id: данные):
+{chr(10).join(cand_lines)}
+
+Учитывай:
+- транслит (Юра↔Юрий, Лиза↔Елизавета, Алексей↔Alex, Прохоров↔prokhorov, Стеценко↔stetsen)
+- username вида @<lastname><firstname> или @<firstname>_<lastname> (@stetsandrev → стеценко андрей)
+- сокращения и инициалы
+- роли в чатах (могут подсказать сферу деятельности)
+
+Если уверен — верни ровно один tg_user_id (целое число).
+Если ни один не подходит или сомневаешься — верни NONE.
+Ответ — только tg_user_id или NONE, без объяснений."""
+    try:
+        r = requests.post(
+            f"{ROUTER_AI_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {ROUTER_AI_KEY}"},
+            json={
+                "model": LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+                "max_tokens": 32,
+            },
+            timeout=60,
+        )
+        ans = r.json()["choices"][0]["message"]["content"].strip()
+        if ans == "NONE":
+            return None
+        try:
+            return int(ans)
+        except ValueError:
+            return None
+    except Exception as e:
+        log(f"  LLM error: {e}")
+        return None
+
+
 def best_match(query_norm: str, candidates: dict[str, list[str]],
                threshold: int = 85) -> list[tuple[str, int]]:
     """candidates: norm_name → list of ref_keys. Returns [(ref_key, score), ...] sorted."""
@@ -533,6 +587,107 @@ def main(dry: bool = False) -> int:
                 if new_emp: filled_emp += 1
     log(f"  filled tg_user_id={filled_tg} c1_employee_key={filled_emp}")
     if not dry: conn.commit()
+
+    # ── Pass 6: обратный LLM-матч для авторов документов без TG-привязки.
+    # Pass 3 матчит TG → employee fuzzy, иногда даёт false positive
+    # (короткое display_name «Андрей» сматчился с Артемьевым вместо Стеценко).
+    # Pass 3.5 не пересматривает уже сматченных. Pass 6 берёт km_entities,
+    # которые реально создают supplier_orders / bank_expenses, но без TG —
+    # и ищет TG среди ВСЕХ comm_users (с учётом username и transliterate).
+    # При конфликте (TG уже привязан к чужой km_entity) — переписывает,
+    # логируя факт.
+    if ROUTER_AI_KEY:
+        log("Pass 6: LLM-match TG для авторов документов без TG-привязки...")
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT ke.id, ke.canonical_name,
+                       ke.attrs->>'c1_user_ref_key' AS c1u_ref
+                FROM km_entities ke
+                WHERE ke.entity_type='person'
+                  AND ke.attrs ? 'c1_user_ref_key'
+                  AND jsonb_array_length(COALESCE(ke.attrs->'tg_user_ids','[]'::jsonb)) = 0
+                  AND (
+                    EXISTS(SELECT 1 FROM c1_supplier_orders so
+                           WHERE so.author_key = ke.attrs->>'c1_user_ref_key'
+                             AND so.doc_date >= '2025-01-01'
+                             AND so.posted=true AND so.is_deleted=false)
+                    OR EXISTS(SELECT 1 FROM c1_bank_expenses be
+                              WHERE be.author_key = ke.attrs->>'c1_user_ref_key'
+                                AND be.doc_date >= '2025-01-01'
+                                AND be.posted=true)
+                  )
+            """)
+            targets = cur.fetchall()
+        log(f"  authors without TG: {len(targets)}")
+
+        tg_cands = []
+        for cu in comm_us:
+            tr = tg_roles.get(cu["tg_user_id"]) or {}
+            tg_cands.append({
+                "tg_user_id": cu["tg_user_id"],
+                "display_name": cu.get("display_name"),
+                "username": cu.get("username"),
+                "first_name": tr.get("first_name"),
+                "last_name": tr.get("last_name"),
+                "roles": tr.get("roles"),
+            })
+
+        p6_matched = 0
+        p6_conflicts = 0
+        p6_nomatch = 0
+        for ent_id, emp_name, _ in targets:
+            tg_id = llm_match_employee_to_tg(emp_name, tg_cands)
+            if not tg_id:
+                p6_nomatch += 1
+                continue
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, canonical_name FROM km_entities "
+                    "WHERE entity_type='person' AND id != %s "
+                    "  AND COALESCE(attrs->'tg_user_ids','[]'::jsonb) @> to_jsonb(%s::bigint)",
+                    (ent_id, tg_id),
+                )
+                other = cur.fetchone()
+
+            if other:
+                log(f"  CONFLICT: tg={tg_id} был у {other[1]!r} (id={other[0]}); "
+                    f"переписываю на {emp_name!r} (id={ent_id})")
+                p6_conflicts += 1
+                if not dry:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE km_entities SET attrs = jsonb_set(attrs, '{tg_user_ids}', "
+                            "  COALESCE("
+                            "    (SELECT jsonb_agg(v) FROM jsonb_array_elements(attrs->'tg_user_ids') v "
+                            "     WHERE (v::text)::bigint != %s), "
+                            "    '[]'::jsonb)), updated_at=NOW() "
+                            "WHERE id=%s",
+                            (tg_id, other[0]),
+                        )
+            log(f"  + {emp_name!r} ← tg={tg_id}")
+            if not dry:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE km_entities SET attrs = jsonb_set("
+                        "  COALESCE(attrs,'{}'::jsonb), '{tg_user_ids}', "
+                        "  COALESCE(attrs->'tg_user_ids','[]'::jsonb) || to_jsonb(%s::bigint)), "
+                        "updated_at=NOW() "
+                        "WHERE id=%s "
+                        "AND NOT (COALESCE(attrs->'tg_user_ids','[]'::jsonb) @> to_jsonb(%s::bigint))",
+                        (tg_id, ent_id, tg_id),
+                    )
+                    cur.execute(
+                        "UPDATE comm_users SET km_entity_id=%s, "
+                        "employee_ref_key=(SELECT source_ref FROM km_entities WHERE id=%s) "
+                        "WHERE tg_user_id=%s",
+                        (ent_id, ent_id, tg_id),
+                    )
+            p6_matched += 1
+        log(f"  matched={p6_matched} conflicts={p6_conflicts} nomatch={p6_nomatch}")
+        if not dry: conn.commit()
+    else:
+        log("Pass 6 SKIPPED — no ROUTER_AI_KEY")
 
     # ── Pass 5: report
     log("Pass 5: coverage report")
