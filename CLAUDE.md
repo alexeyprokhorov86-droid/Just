@@ -86,11 +86,24 @@
 - Rebuild `30 2 * * *` через `python3 -m tools.comm_graph rebuild` (~3 сек для 48 чатов)
 - Цель: Волна 5 (Matrix-миграция по кластерам общения)
 
+### ⚠ Унификация идентичностей — используй ГРАФ, а не новые таблицы
+Когда нужно сматчить «одного человека» между разными системами (1С сотрудник, 1С пользователь, TG user_id, email, Matrix) —
+**не создавай новые таблицы типа `entity_identities`**. Уже есть всё:
+- `km_entities` (entity_type='person') — центральный узел персоны. Aliases + attrs ({employee_ref_key, c1_user_ref_key, tg_user_ids, emails, matrix_user_id, role}).
+- `comm_users.km_entity_id` + `comm_users.employee_ref_key` — связь tg_user → KG → 1С сотрудник.
+- `email_employee_mapping` (81 запись) — email + tg_user_id + c1_employee_key + employee_name_1c. Расширяй её, не создавай параллельную.
+- `c1_employees` (1180), `c1_users` (246, Catalog_Пользователи 1С), `tg_user_roles` (37 user_id × роль).
+Идея: один person — одна km_entity, у которой aliases = все имена/идентификаторы. RAG/агенты ходят через KG.
+
+Скрипт-наполнитель: `populate_identities.py` (FIO match + RapidFuzz + LLM на ambiguous). Запускать после изменений в любом из источников.
+
 ### 1С данные (c1_*)
 - `c1_sales`, `c1_customer_orders`, `c1_dispatch_orders`
 - `c1_specifications`, `c1_spec_materials`
 - `c1_staff_history` (фильтр: `valid_until`, event_type "Перемещение")
 - `c1_bank_balances` (3 счёта Фрумелад/НФ)
+- `c1_users` (Catalog_Пользователи 1С, 246) — на это ссылается `Автор_Key` документов. Sync через `sync_bank_expenses_authors.py`.
+- `c1_bank_expenses` (29.7k) — расширено колонками `author_key, responsible_key, basis_doc_ref, basis_doc_type, bsg_order_ref, bsg_order_type, posted_by_bank, bank_post_date` (добавлены 2026-04-27 через `sync_bank_expenses_authors.py`).
 - `nomenclature` (7,774 записи, вес: ВесЧислитель/ВесЗнаменатель в кг)
 
 ### Дополнительные приобретения (sync_acquisitions_extra.py, 2026-04-27)
