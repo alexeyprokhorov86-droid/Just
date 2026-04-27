@@ -3966,29 +3966,94 @@ class Sync1C:
             for doc in all_docs:
                 ref_key = doc.get('Ref_Key')
                 
+                # NB: расширенные поля (author/manager/counterparty/agreement/
+                # ДДС/план закупок BSG и т.п.) тоже заливаем сразу — раньше их
+                # бэкфиллил sync_supplier_order_authors.py отдельно. Колонки и
+                # индексы обеспечивает ensure_schema этого скрипта.
+                def _v(k):
+                    val = doc.get(k)
+                    return val if val and val != EMPTY_UUID else None
+                def _date10(s):
+                    if not s: return None
+                    s = s[:10]
+                    return None if s.startswith('0001') else s
                 cur.execute("""
                     INSERT INTO c1_supplier_orders (ref_key, doc_number, doc_date, posted,
-                        organization_key, partner_key, warehouse_key, amount, status, 
-                        comment, is_deleted, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        organization_key, partner_key, warehouse_key, amount, status,
+                        comment, is_deleted,
+                        author_key, manager_key, counterparty_key, agreement_key,
+                        contract_key, currency_key, nds_mode, delivery_method,
+                        desired_arrival_date, approved, approved_date,
+                        price_includes_vat, operation, purchase_for_activity,
+                        payment_form, registrar_supplier_prices,
+                        return_multi_turn_containers, contact_person_key,
+                        cash_flow_item_key, bsg_purchase_plan_key, evg_closed,
+                        department_key, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (ref_key) DO UPDATE SET
                         doc_number = EXCLUDED.doc_number,
                         doc_date = EXCLUDED.doc_date,
                         amount = EXCLUDED.amount,
                         status = EXCLUDED.status,
+                        author_key = EXCLUDED.author_key,
+                        manager_key = EXCLUDED.manager_key,
+                        counterparty_key = EXCLUDED.counterparty_key,
+                        agreement_key = EXCLUDED.agreement_key,
+                        contract_key = EXCLUDED.contract_key,
+                        currency_key = EXCLUDED.currency_key,
+                        nds_mode = EXCLUDED.nds_mode,
+                        delivery_method = EXCLUDED.delivery_method,
+                        desired_arrival_date = EXCLUDED.desired_arrival_date,
+                        approved = EXCLUDED.approved,
+                        approved_date = EXCLUDED.approved_date,
+                        price_includes_vat = EXCLUDED.price_includes_vat,
+                        operation = EXCLUDED.operation,
+                        purchase_for_activity = EXCLUDED.purchase_for_activity,
+                        payment_form = EXCLUDED.payment_form,
+                        registrar_supplier_prices = EXCLUDED.registrar_supplier_prices,
+                        return_multi_turn_containers = EXCLUDED.return_multi_turn_containers,
+                        contact_person_key = EXCLUDED.contact_person_key,
+                        cash_flow_item_key = EXCLUDED.cash_flow_item_key,
+                        bsg_purchase_plan_key = EXCLUDED.bsg_purchase_plan_key,
+                        evg_closed = EXCLUDED.evg_closed,
+                        department_key = EXCLUDED.department_key,
                         updated_at = NOW()
                 """, (
                     ref_key,
                     doc.get('Number', '').strip(),
                     doc.get('Date', '')[:10],
                     doc.get('Posted', False),
-                    doc.get('Организация_Key') if doc.get('Организация_Key') != EMPTY_UUID else None,
-                    doc.get('Партнер_Key') if doc.get('Партнер_Key') != EMPTY_UUID else None,
-                    doc.get('Склад_Key') if doc.get('Склад_Key') != EMPTY_UUID else None,
+                    _v('Организация_Key'),
+                    _v('Партнер_Key'),
+                    _v('Склад_Key'),
                     doc.get('СуммаДокумента', 0),
                     doc.get('Статус', ''),
                     doc.get('Комментарий', ''),
-                    doc.get('DeletionMark', False)
+                    doc.get('DeletionMark', False),
+                    _v('Автор_Key'),
+                    _v('Менеджер_Key'),
+                    _v('Контрагент_Key'),
+                    _v('Соглашение_Key'),
+                    _v('Договор_Key'),
+                    _v('Валюта_Key'),
+                    doc.get('НалогообложениеНДС') or None,
+                    doc.get('СпособДоставки') or None,
+                    _date10(doc.get('ЖелаемаяДатаПоступления')),
+                    bool(doc.get('Согласован')),
+                    _date10(doc.get('ДатаСогласования')),
+                    bool(doc.get('ЦенаВключаетНДС')),
+                    doc.get('ХозяйственнаяОперация') or None,
+                    doc.get('ЗакупкаПодДеятельность') or None,
+                    doc.get('ФормаОплаты') or None,
+                    bool(doc.get('РегистрироватьЦеныПоставщика')),
+                    bool(doc.get('ВернутьМногооборотнуюТару')),
+                    _v('КонтактноеЛицо_Key'),
+                    _v('EVG_СтатьяДДС_Key'),
+                    _v('BSG_ПланЗакупок_Key'),
+                    bool(doc.get('EVG_СтатусЗакрыт')),
+                    _v('Подразделение_Key'),
                 ))
                 
                 # Удаляем старые позиции

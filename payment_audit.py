@@ -121,10 +121,8 @@ def ensure_schema(conn) -> None:
 
 
 def get_default_bookkeeper(conn) -> dict | None:
-    """Внутренний бухгалтер по роли в tg_user_roles.
-    Возвращает {tg_user_id, name, km_entity_id, employee_ref_key}."""
+    """Внутренний бухгалтер по роли в tg_user_roles."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # Внутренний (не «Внешний», не «Менеджер внешней»)
         cur.execute("""
             SELECT tr.user_id, MAX(tr.first_name||' '||COALESCE(tr.last_name,'')) AS name,
                    cu.km_entity_id, cu.employee_ref_key
@@ -136,6 +134,63 @@ def get_default_bookkeeper(conn) -> dict | None:
         """)
         row = cur.fetchone()
         return dict(row) if row else None
+
+
+# Админ — DM-получатель когда реальный автор заказа известен по имени,
+# но не сматчен с tg_user_id в km_entities. Лучше DM админу с явной пометкой
+# «обсудить с <ФИО автора>», чем угадывать «закупщика по роли» (Раис попадал
+# из-за «Главный по закупкам» в неподходящем чате).
+ADMIN_TG_USER_ID = 805598873
+
+
+def find_open_supplier_order(conn, organization_key: str,
+                              partner_key: str | None, counterparty_key: str | None,
+                              gap_amount: float | None) -> dict | None:
+    """Ищет лучший open supplier_order для данной пары (org, partner|counterparty).
+    Приоритеты:
+      1. по partner_key + status='Подтвержден' + просрочена доставка (или старый)
+      2. по counterparty_key (если partner-match не дал)
+    Из найденных предпочтение по совпадению суммы с gap.
+    """
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        candidates = []
+        for filter_field, filter_val in [("partner_key", partner_key),
+                                          ("counterparty_key", counterparty_key)]:
+            if not filter_val:
+                continue
+            cur.execute(f"""
+                SELECT ref_key, doc_number, doc_date, author_key, status, amount,
+                       desired_arrival_date::date AS desired_arrival_date,
+                       partner_key, counterparty_key
+                FROM c1_supplier_orders
+                WHERE organization_key = %s AND {filter_field} = %s
+                  AND posted=true AND is_deleted=false
+                  AND status IN ('Подтвержден','Согласован')
+                ORDER BY doc_date DESC LIMIT 30
+            """, (organization_key, filter_val))
+            for r in cur.fetchall():
+                candidates.append(dict(r))
+            if candidates:
+                break  # партнёр-матч приоритетнее
+    if not candidates:
+        return None
+    # Скоринг: совпадение по amount + просрочка
+    today = date.today()
+
+    def score(o: dict) -> tuple:
+        amt_match = 0.0
+        if gap_amount and o.get("amount"):
+            ratio = abs(float(o["amount"]) - gap_amount) / max(gap_amount, 1)
+            amt_match = 1.0 - min(ratio, 1.0)  # 1 при точном совпадении
+        # просрочка (по desired_arrival или по возрасту 30+ дней)
+        overdue = 0.0
+        if o.get("desired_arrival_date") and o["desired_arrival_date"] < today:
+            overdue = 1.0
+        elif o.get("doc_date") and (today - o["doc_date"]).days > 30:
+            overdue = 0.5
+        return (overdue + amt_match,)
+    candidates.sort(key=score, reverse=True)
+    return candidates[0]
 
 
 def detect_gaps(conn, period_from: date, period_to: date, dry: bool) -> int:
@@ -235,12 +290,9 @@ def detect_gaps(conn, period_from: date, period_to: date, dry: bool) -> int:
         })
     log(f"  gaps (paid > acquired): {len(gaps_to_write)}")
 
-    # Default bookkeeper assignee (для платежей без author — типично, импорт из клиент-банка)
     bookkeeper = get_default_bookkeeper(conn)
     if bookkeeper:
         log(f"  default bookkeeper: {bookkeeper['name']} (tg={bookkeeper['user_id']})")
-    else:
-        log("  warning: no internal Бухгалтер role found in tg_user_roles")
 
     # Enrich each gap: fetch sample payment, look for supplier_order link, get authors
     enriched = []
@@ -272,47 +324,38 @@ def detect_gaps(conn, period_from: date, period_to: date, dry: bool) -> int:
                 if be["bsg_order_ref"]:
                     so_ref = be["bsg_order_ref"]; break
 
-            # 2) Эвристика: open overdue supplier_order для этого партнёра
-            if not so_ref:
-                cur.execute("""
-                    SELECT ref_key, doc_number, doc_date, author_key, status,
-                           desired_arrival_date::date AS desired_arrival_date,
-                           amount
-                    FROM c1_supplier_orders
-                    WHERE organization_key = %s AND partner_key = %s
-                      AND posted=true AND is_deleted=false
-                      AND status IN ('Подтвержден','Согласован')
-                      AND desired_arrival_date IS NOT NULL
-                      AND desired_arrival_date::date < CURRENT_DATE
-                    ORDER BY desired_arrival_date ASC LIMIT 1
-                """, (g["org"], g["partner"]))
-                row = cur.fetchone()
-                if row:
-                    so_ref = row["ref_key"]
-
-            # Fetch supplier_order info (по найденному ref)
+            # 2) Эвристика: ищем открытый supplier_order для партнёра ИЛИ контрагента
             so_info = None
-            if so_ref:
+            if not so_ref:
+                so_info = find_open_supplier_order(
+                    conn, g["org"], g["partner"], g["ctp"], gap_amount=g["gap"],
+                )
+            else:
                 cur.execute("""
                     SELECT ref_key, doc_number, doc_date, author_key, status,
                            desired_arrival_date::date AS desired_arrival_date,
-                           organization_key
-                    FROM c1_supplier_orders
-                    WHERE ref_key = %s
+                           organization_key, amount
+                    FROM c1_supplier_orders WHERE ref_key = %s
                 """, (so_ref,))
                 so_info = cur.fetchone()
 
             # Determine case + assignee
-            if so_info and so_info.get("desired_arrival_date") and \
-               so_info["desired_arrival_date"] < today:
+            so_overdue = False
+            if so_info:
+                if so_info.get("desired_arrival_date") and \
+                   so_info["desired_arrival_date"] < today:
+                    so_overdue = True
+                elif so_info.get("doc_date") and (today - so_info["doc_date"]).days > 30:
+                    so_overdue = True
+
+            if so_info and so_overdue:
                 case = "case_with_order_overdue"
-                assignee_user_ref = so_info["author_key"]
+                assignee_user_ref = so_info.get("author_key")
             elif so_info:
                 case = "case_with_order_in_progress"
-                assignee_user_ref = so_info["author_key"]
+                assignee_user_ref = so_info.get("author_key")
             else:
                 case = "case_no_order"
-                # Author / Responsible / fallback bookkeeper
                 assignee_user_ref = (be_rows[0]["author_key"] if be_rows else None)
                 if not assignee_user_ref and be_rows:
                     assignee_user_ref = be_rows[0]["responsible_key"]
@@ -338,13 +381,25 @@ def detect_gaps(conn, period_from: date, period_to: date, dry: bool) -> int:
                     ent_id = row["km_entity_id"]
                     tg_ids = row["tg_user_ids"]
                     emp_ref = row["employee_ref_key"]
-            # Если case_no_order и автора нет — дефолт-бухгалтер
-            if case == "case_no_order" and not assignee_name and bookkeeper:
+            # Логика выбора DM-получателя:
+            #  • автор известен И сматчен с TG → DM прямо ему
+            #  • автор известен по имени, но без TG-привязки в km_entities →
+            #    DM админу с пометкой «обсудить с <ФИО>» (НЕ дефолт-закупщик —
+            #    Раис попадал из-за чужого описания роли)
+            #  • case_no_order без автора → дефолт-бухгалтер (импорт из клиент-банка)
+            if assignee_name and not tg_ids:
+                # Автор есть в 1С, но не сматчен с tg_user_id
+                assignee_name = f"{assignee_name} (через админа — нет TG-привязки)"
+                tg_ids = [ADMIN_TG_USER_ID]
+            elif case == "case_no_order" and not assignee_name and bookkeeper:
                 assignee_name = bookkeeper["name"] + " (дефолт-бухгалтер)"
                 ent_id = bookkeeper["km_entity_id"]
                 emp_ref = bookkeeper["employee_ref_key"]
                 tg_ids = [bookkeeper["user_id"]] if bookkeeper["user_id"] else None
-                # assignee_user_ref остаётся None — потому что он c1_user_ref, а bookkeeper мы знаем только по tg
+            elif not assignee_name:
+                # case_with_order_* без автора (редкий: 0.14% после backfill)
+                assignee_name = "Не определён (через админа)"
+                tg_ids = [ADMIN_TG_USER_ID]
 
             # Names
             cur.execute("SELECT name FROM c1_organizations WHERE ref_key=%s", (g["org"],))
