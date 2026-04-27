@@ -85,6 +85,10 @@ DDL = [
     "CREATE INDEX IF NOT EXISTS idx_bnk_exp_author ON c1_bank_expenses(author_key)",
     "CREATE INDEX IF NOT EXISTS idx_bnk_exp_basis  ON c1_bank_expenses(basis_doc_ref)",
     "CREATE INDEX IF NOT EXISTS idx_bnk_exp_bsg    ON c1_bank_expenses(bsg_order_ref)",
+    # ОбъектРасчетов_Key — мост от платежа к Заказу поставщику / договору
+    "ALTER TABLE c1_bank_expense_items ADD COLUMN IF NOT EXISTS settlement_object_key VARCHAR(50)",
+    "ALTER TABLE c1_bank_expense_items ADD COLUMN IF NOT EXISTS settlement_object_type VARCHAR(150)",
+    "CREATE INDEX IF NOT EXISTS idx_bei_settlement ON c1_bank_expense_items(settlement_object_key)",
     # Catalog_Пользователи 1С — на него ссылается Автор_Key (и Ответственный_Key,
     # и Автор у других документов)
     """
@@ -224,6 +228,54 @@ def fetch_period(date_from: date, date_to: date) -> list[dict]:
     return out
 
 
+def backfill_settlement(conn, date_from: date, date_to: date) -> int:
+    """ОбъектРасчетов_Key из РасшифровкаПлатежа → c1_bank_expense_items."""
+    log(f"backfill settlement_object on bank_expense_items {date_from}..{date_to}")
+    # Pull all bank_expense ref_keys in window
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT ref_key FROM c1_bank_expenses "
+            "WHERE bank_date >= %s AND bank_date <= %s "
+            "  AND posted=true AND is_deleted=false",
+            (date_from, date_to),
+        )
+        ref_keys = [r[0] for r in cur.fetchall()]
+    log(f"  bank docs in window: {len(ref_keys)}")
+    if not ref_keys:
+        return 0
+
+    # For each ref_key, fetch РасшифровкаПлатежа
+    encoded = quote("Document_СписаниеБезналичныхДенежныхСредств_РасшифровкаПлатежа", safe="_")
+    updated = 0
+    for i, rk in enumerate(ref_keys, 1):
+        url = f"{ODATA_BASE}/{encoded}?$format=json&$filter=Ref_Key%20eq%20guid'{rk}'&$top=200"
+        r = S.get(url, timeout=60)
+        if r.status_code != 200:
+            continue
+        try:
+            lines = r.json().get("value", [])
+        except Exception:
+            continue
+        with conn.cursor() as cur:
+            for ln in lines:
+                so_key = _val(ln, "ОбъектРасчетов_Key")
+                so_type = ln.get("ОбъектРасчетов_Type") or None
+                cur.execute(
+                    "UPDATE c1_bank_expense_items "
+                    "SET settlement_object_key=%s, settlement_object_type=%s "
+                    "WHERE doc_key=%s AND line_number=%s",
+                    (so_key, so_type, rk, int(ln.get("LineNumber") or 0)),
+                )
+                if cur.rowcount > 0:
+                    updated += 1
+        if i % 200 == 0:
+            log(f"  processed {i}/{len(ref_keys)}, updated_lines={updated}")
+            conn.commit()
+    conn.commit()
+    log(f"  total updated lines: {updated}")
+    return updated
+
+
 def backfill(conn, date_from: date, date_to: date) -> int:
     log(f"backfill bank_expenses authors {date_from}..{date_to}")
     docs = fetch_period(date_from, date_to)
@@ -310,6 +362,7 @@ def main() -> int:
             return 0
         sync_users(conn)
         backfill(conn, df, dt)
+        backfill_settlement(conn, df, dt)
     finally:
         conn.close()
     log("done.")
