@@ -583,15 +583,31 @@ def extract_time_context(question: str) -> dict:
         (r'в последнее время', lambda m: 30),
     ]
     
-    for pattern, days_func in patterns:
-        match = re.search(pattern, question_lower)
-        if match:
-            result["has_time_filter"] = True
-            result["decay_days"] = days_func(match)
-            result["date_from"] = now - timedelta(days=result["decay_days"])
-            result["date_to"] = now
-            result["freshness_weight"] = 0.4
-            break
+    # "вчера"/"сегодня" — точные границы дня, не "за N дней до сейчас"
+    if re.search(r'\bвчера\b', question_lower) and not result["find_earliest"]:
+        yesterday = (now - timedelta(days=1)).date()
+        result["has_time_filter"] = True
+        result["date_from"] = datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0)
+        result["date_to"] = datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59)
+        result["decay_days"] = 2
+        result["freshness_weight"] = 0.5
+    elif re.search(r'\bсегодня\b', question_lower) and not result["find_earliest"]:
+        today_d = now.date()
+        result["has_time_filter"] = True
+        result["date_from"] = datetime(today_d.year, today_d.month, today_d.day, 0, 0, 0)
+        result["date_to"] = now
+        result["decay_days"] = 1
+        result["freshness_weight"] = 0.5
+    else:
+        for pattern, days_func in patterns:
+            match = re.search(pattern, question_lower)
+            if match:
+                result["has_time_filter"] = True
+                result["decay_days"] = days_func(match)
+                result["date_from"] = now - timedelta(days=result["decay_days"])
+                result["date_to"] = now
+                result["freshness_weight"] = 0.4
+                break
     
     # Паттерны для конкретных месяцев
     months = {
@@ -959,6 +975,48 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
                               AND table_name != 'tg_chats_metadata' AND table_name != 'tg_user_roles'""")
                 chat_tables = [row[0] for row in cur.fetchall()]
 
+            # Дайджест-режим: пустые keywords + date filter → берём все сообщения за период
+            if not keyword_terms and date_from and chat_tables:
+                for table_name in chat_tables[:20]:
+                    try:
+                        dq_sql = (
+                            "SELECT id, timestamp, first_name, message_text, media_analysis, "
+                            "message_type, content_text FROM {} "
+                            "WHERE message_text IS NOT NULL AND LENGTH(message_text) > 10 "
+                        )
+                        dq_params: list = []
+                        if date_from:
+                            dq_sql += "AND timestamp >= %s "
+                            dq_params.append(date_from)
+                        if date_to:
+                            dq_sql += "AND timestamp <= %s "
+                            dq_params.append(date_to)
+                        dq_sql += f"ORDER BY timestamp {'ASC' if find_earliest else 'DESC'} LIMIT %s"
+                        dq_params.append(min(limit, 20))
+                        cur.execute(sql.SQL(dq_sql).format(sql.Identifier(table_name)), dq_params)
+                        for row in cur.fetchall():
+                            chat_name = table_name.replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
+                            content = row[3] or ""
+                            if row[6]:
+                                content += f"\n[Документ]: {row[6][:300]}"
+                            ts = row[1]
+                            freshness = freshness_by_time(ts, decay_days)
+                            results.append({
+                                "source": f"Чат: {chat_name}",
+                                "content": content,
+                                "timestamp": ts,
+                                "date": ts.strftime("%d.%m.%Y") if ts else "",
+                                "similarity": 0.6,
+                                "freshness": freshness,
+                                "final_score": 0.6 * (1 - freshness_weight) + freshness * freshness_weight,
+                                "search_type": "chat_sql_digest",
+                                "source_id": f"{table_name}_{row[0]}",
+                            })
+                    except Exception:
+                        conn.rollback()
+                logger.info(f"Chat SQL digest: {len(results)} сообщений за {date_from.date() if date_from else '?'}")
+                return results[:limit]
+
             for table_name in chat_tables:
                 for keyword in keyword_terms:
                     try:
@@ -1163,24 +1221,43 @@ def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) ->
     try:
         with conn.cursor() as cur:
             fts_query = ' | '.join(keyword_terms[:8]) if keyword_terms else retrieval_query
-            fts_sql = """
-                SELECT id, subject, body_text, from_address, received_at
-                FROM email_messages
-                WHERE to_tsvector('russian', COALESCE(subject, '') || ' ' || COALESCE(body_text, ''))
-                      @@ to_tsquery('russian', %s)
-            """
-            fts_params = [fts_query]
-            if date_from:
-                fts_sql += " AND received_at >= %s"
-                fts_params.append(date_from)
-            if date_to:
-                fts_sql += " AND received_at <= %s"
-                fts_params.append(date_to)
-            fts_sql += f" ORDER BY received_at {sort_order} LIMIT %s"
-            fts_params.append(limit * 3)
-            cur.execute(fts_sql, fts_params)
 
-            fts_results = cur.fetchall()
+            # Для дайджест-запросов (пустые keywords + есть date filter) — возвращаем все
+            # внутренние/бизнесовые письма за период без FTS-фильтра по тексту.
+            if not keyword_terms and date_from:
+                date_sql = """
+                    SELECT id, subject, body_text, from_address, received_at
+                    FROM email_messages
+                    WHERE email_category IN ('internal', 'external_business')
+                """
+                date_params: list = []
+                date_sql += " AND received_at >= %s"
+                date_params.append(date_from)
+                if date_to:
+                    date_sql += " AND received_at <= %s"
+                    date_params.append(date_to)
+                date_sql += f" ORDER BY received_at {sort_order} LIMIT %s"
+                date_params.append(limit * 3)
+                cur.execute(date_sql, date_params)
+                fts_results = cur.fetchall()
+            else:
+                fts_sql = """
+                    SELECT id, subject, body_text, from_address, received_at
+                    FROM email_messages
+                    WHERE to_tsvector('russian', COALESCE(subject, '') || ' ' || COALESCE(body_text, ''))
+                          @@ to_tsquery('russian', %s)
+                """
+                fts_params = [fts_query]
+                if date_from:
+                    fts_sql += " AND received_at >= %s"
+                    fts_params.append(date_from)
+                if date_to:
+                    fts_sql += " AND received_at <= %s"
+                    fts_params.append(date_to)
+                fts_sql += f" ORDER BY received_at {sort_order} LIMIT %s"
+                fts_params.append(limit * 3)
+                cur.execute(fts_sql, fts_params)
+                fts_results = cur.fetchall()
 
             # Fallback по ILIKE если FTS ничего не дал
             if not fts_results:
@@ -3674,8 +3751,34 @@ async def process_rag_query(question, chat_context="", user_info: dict = None,
     primary_intent = get_primary_intent(question)
     
     time_context = extract_time_context(question)
+    # Если Router явно вернул period — дополняем/уточняем time_context его данными.
+    # extract_time_context парсит текст и может промахнуться (напр. "вчера" → wrong range),
+    # а Router видит семантику запроса точнее.
+    _router_period = plan.get("period")
+    if _router_period and _router_period not in (None, "null") and period_date:
+        if _router_period == "yesterday":
+            d = period_date  # date object
+            time_context["date_from"] = datetime(d.year, d.month, d.day, 0, 0, 0)
+            time_context["date_to"] = datetime(d.year, d.month, d.day, 23, 59, 59)
+            time_context["has_time_filter"] = True
+            time_context["decay_days"] = 2
+            time_context["freshness_weight"] = 0.5
+        elif _router_period == "today":
+            d = period_date
+            time_context["date_from"] = datetime(d.year, d.month, d.day, 0, 0, 0)
+            time_context["date_to"] = datetime.now()
+            time_context["has_time_filter"] = True
+            time_context["decay_days"] = 1
+            time_context["freshness_weight"] = 0.5
+        elif not time_context["has_time_filter"]:
+            # Для остальных периодов — подставляем если extract_time_context ничего не нашёл
+            time_context["date_from"] = datetime(period_date.year, period_date.month, period_date.day)
+            if period_end:
+                time_context["date_to"] = datetime(period_end.year, period_end.month, period_end.day, 23, 59, 59)
+            time_context["has_time_filter"] = True
     if time_context["has_time_filter"]:
-        logger.info(f"Временной контекст: decay_days={time_context['decay_days']}")
+        logger.info(f"Временной контекст: decay_days={time_context['decay_days']}, "
+                    f"date_from={time_context.get('date_from')}, date_to={time_context.get('date_to')}")
     
     db_results = []
     web_results = ""
