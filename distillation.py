@@ -9,7 +9,12 @@ import os
 import time
 import requests
 from dotenv import load_dotenv
-from embedding_service_e5 import create_embedding
+from chunkers.embedder import embed_document_v2 as _embed_doc
+
+def create_embedding(text: str):
+    """Wrapper: Qwen3 document embedding, возвращает list для совместимости с кодом ниже."""
+    v = _embed_doc(str(text)[:1000] if text else '')
+    return v.tolist() if v is not None and hasattr(v, 'tolist') else (v or [])
 
 load_dotenv('/home/admin/telegram_logger_bot/.env')
 
@@ -279,14 +284,14 @@ def resolve_entity(cur, name, entity_type=None):
         if row:
             try:
                 emb = create_embedding(name)
-                cur.execute("UPDATE km_entities SET embedding = %s WHERE id = %s", (str(emb), row[0]))
+                cur.execute("UPDATE km_entities SET embedding_v2 = %s WHERE id = %s", (str(emb), row[0]))
             except Exception:
                 pass
             return row[0]
         if row:
             try:
                 emb = create_embedding(name)
-                cur.execute("UPDATE km_entities SET embedding = %s WHERE id = %s", (str(emb), row[0]))
+                cur.execute("UPDATE km_entities SET embedding_v2 = %s WHERE id = %s", (str(emb), row[0]))
             except Exception:
                 pass
             return row[0]
@@ -410,7 +415,7 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
             fact['_id'] = fact_id
             try:
                 emb = create_embedding(fact.get('text', ''))
-                cur.execute("UPDATE km_facts SET embedding = %s WHERE id = %s", (str(emb), fact_id))
+                cur.execute("UPDATE km_facts SET embedding_v2 = %s WHERE id = %s", (str(emb), fact_id))
             except Exception:
                 pass
     
@@ -440,7 +445,7 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
             dec['_id'] = dec_id
             try:
                 emb = create_embedding(dec.get('text', ''))
-                cur.execute("UPDATE km_decisions SET embedding = %s WHERE id = %s", (str(emb), dec_id))
+                cur.execute("UPDATE km_decisions SET embedding_v2 = %s WHERE id = %s", (str(emb), dec_id))
             except Exception:
                 pass
     
@@ -484,7 +489,7 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
         if task_id:
             try:
                 emb = create_embedding(task.get('task_text', ''))
-                cur.execute("UPDATE km_tasks SET embedding = %s WHERE id = %s", (str(emb), task_id))
+                cur.execute("UPDATE km_tasks SET embedding_v2 = %s WHERE id = %s", (str(emb), task_id))
             except Exception:
                 pass
 
@@ -498,7 +503,7 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
         pol_id = cur.fetchone()[0]
         try:
             emb = create_embedding(pol.get('text', ''))
-            cur.execute("UPDATE km_policies SET embedding = %s WHERE id = %s", (str(emb), pol_id))
+            cur.execute("UPDATE km_policies SET embedding_v2 = %s WHERE id = %s", (str(emb), pol_id))
         except Exception:
             pass
         stats['policies'] = stats.get('policies', 0) + 1

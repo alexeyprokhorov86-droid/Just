@@ -723,26 +723,24 @@ def _group_messages(messages: list, window_minutes: int = 3) -> list:
     return groups
 
 def search_knowledge(query: str, limit: int = 30) -> list:
-    """Поиск по базе знаний: km_facts, km_decisions, km_tasks, km_policies."""
-    from embedding_service_e5 import create_query_embedding
-    query_embedding = create_query_embedding(query)
-    emb_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+    """Поиск по базе знаний: km_facts, km_decisions, km_tasks, km_policies (Qwen3 embedding_v2)."""
+    from chunkers.embedder import embed_query_v2
+    query_vec = embed_query_v2(query)
+    if query_vec is None:
+        logger.warning("search_knowledge: embed_query_v2 вернул None")
+        return []
+    emb_list = query_vec.tolist() if hasattr(query_vec, 'tolist') else list(query_vec)
 
     conn = get_db_connection()
-    conn.autocommit = True  # ошибка в одной таблице не должна ронять остальные
+    conn.autocommit = True
     results = []
 
-    # (table, text_col, type_col, has_verification_status)
-    # km_decisions не имеет verification_status и *_type; используем scope_type.
-    # km_tasks имеет status (не task_type).
-    # km_policies имеет scope_type + verification_status.
     tables = [
-        ("km_facts", "fact_text", "fact_type", True),
+        ("km_facts",     "fact_text",     "fact_type",  True),
         ("km_decisions", "decision_text", "scope_type", False),
-        ("km_tasks", "task_text", "status", True),
-        ("km_policies", "policy_text", "scope_type", True),
+        ("km_tasks",     "task_text",     "status",     True),
+        ("km_policies",  "policy_text",   "scope_type", True),
     ]
-
     per_table = max(limit // len(tables), 5)
 
     try:
@@ -755,12 +753,12 @@ def search_knowledge(query: str, limit: int = 30) -> list:
                     )
                     cur.execute(f"""
                         SELECT id, {text_col}, {type_col}, confidence, created_at,
-                               1 - (embedding <=> %s::vector) as similarity
+                               1 - (embedding_v2 <=> %s::vector) AS similarity
                         FROM {table}
-                        WHERE {where_verif}embedding IS NOT NULL
-                        ORDER BY embedding <=> %s::vector
+                        WHERE {where_verif}embedding_v2 IS NOT NULL
+                        ORDER BY embedding_v2 <=> %s::vector
                         LIMIT %s
-                    """, (emb_str, emb_str, per_table))
+                    """, (emb_list, emb_list, per_table))
 
                     for row in cur.fetchall():
                         sim = float(row[5]) if row[5] else 0
@@ -780,7 +778,7 @@ def search_knowledge(query: str, limit: int = 30) -> list:
                     logger.warning(f"search_knowledge {table}: {e}")
     finally:
         conn.close()
-    
+
     results.sort(key=lambda x: x["similarity"], reverse=True)
     logger.info(f"search_knowledge: {len(results)} результатов по запросу '{query[:50]}'")
     return results[:limit]
