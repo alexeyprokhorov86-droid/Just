@@ -1,15 +1,15 @@
-"""tasks_flow — Telegram-флоу для задач (Phase 2 payment_audit).
+"""tasks_flow — задачи payment_audit (Phase 2/3).
 
-Команда /tasks → одна открытая задача из km_tasks → кнопки:
-  [✅ Сделано] [⏰ Отложить] [👥 Передать] [❌ Отклонить]
+Top-level handlers (без ConversationHandler), чтобы callback-кнопки работали
+и на сообщениях, отправленных из cron-эскалатора (через HTTP API), не только
+на ответах /tasks.
 
-Snooze: пресеты (1д/3д/неделя/своя дата).
-Decline: запрашивает причину текстом.
-Transfer: показывает список активных TG-юзеров → передача.
+Состояние ожидания текстового ввода — в context.user_data['await']:
+  {'kind': 'done|snooze_custom|decline', 'task_id': N}
 
 Регистрация:
-  from tasks_flow import tasks_conversation
-  application.add_handler(tasks_conversation())
+  from tasks_flow import register_tasks_handlers
+  register_tasks_handlers(application)
 """
 from __future__ import annotations
 
@@ -29,10 +29,10 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
+    Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -44,25 +44,15 @@ DB_NAME = os.getenv("DB_NAME", "knowledge_base")
 DB_USER = os.getenv("DB_USER", "knowledge")
 DB_PASS = os.getenv("DB_PASSWORD")
 
+PRIORITY_LABELS = {0: "🟢 низкий", 1: "🔵 нормальный", 2: "🟠 высокий", 3: "🔴 критический"}
+
 
 def _conn():
     return psycopg2.connect(host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS)
 
 
-# Conversation states
-CHOOSING_ACTION = 1
-SNOOZE_PICK    = 2
-SNOOZE_CUSTOM  = 3
-DECLINE_REASON = 4
-TRANSFER_PICK  = 5
-RESULT_TEXT    = 6
-
-
-PRIORITY_LABELS = {0: "🟢 низкий", 1: "🔵 нормальный", 2: "🟠 высокий", 3: "🔴 критический"}
-
-
 # ─────────────────────────────────────────────────────────────────────
-#  DB
+#  DB helpers
 # ─────────────────────────────────────────────────────────────────────
 
 def fetch_next_task(tg_user_id: int) -> dict | None:
@@ -112,7 +102,6 @@ def update_task(task_id: int, **kwargs) -> None:
 
 
 def list_active_tg_assignees() -> list[dict]:
-    """Активные TG-юзеры, у которых есть km_entity (можно передать задачу)."""
     with _conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT cu.tg_user_id, cu.display_name, cu.km_entity_id,
@@ -127,7 +116,8 @@ def list_active_tg_assignees() -> list[dict]:
 
 
 def log_reminder(task_id: int, level: int, channel: str, chat_id: int | None,
-                 message_id: int | None, text: str | None, response: str | None = None) -> None:
+                 message_id: int | None, text: str | None,
+                 response: str | None = None) -> None:
     with _conn() as conn, conn.cursor() as cur:
         cur.execute("""
             INSERT INTO task_reminders (task_id, level, channel, chat_id, message_id,
@@ -148,7 +138,6 @@ def render_task(task: dict) -> tuple[str, InlineKeyboardMarkup]:
 
     pri = task.get("priority") if task.get("priority") is not None else 1
     pri_str = PRIORITY_LABELS.get(pri, "🔵 нормальный")
-
     header_meta = [pri_str]
     if task.get("deadline"):
         from datetime import date as _d
@@ -156,7 +145,7 @@ def render_task(task: dict) -> tuple[str, InlineKeyboardMarkup]:
             ddl = task["deadline"]
             days_left = (ddl - _d.today()).days
             if days_left < 0:
-                header_meta.append(f"⚠ просрочка на {-days_left} д")
+                header_meta.append(f"⚠ просрочка {-days_left} д")
             elif days_left == 0:
                 header_meta.append("⚠ дедлайн сегодня")
             else:
@@ -171,7 +160,6 @@ def render_task(task: dict) -> tuple[str, InlineKeyboardMarkup]:
     if task.get("task_text"):
         lines.append(task["task_text"])
         lines.append("")
-
     if ctx.get("partner_name"):
         lines.append(f"Поставщик: <b>{ctx['partner_name']}</b>")
     if ctx.get("organization_name"):
@@ -187,12 +175,6 @@ def render_task(task: dict) -> tuple[str, InlineKeyboardMarkup]:
         lines.append(f"Заказ поставщику: <code>{ctx['supplier_order_number']}</code>")
         if ctx.get("supplier_order_desired_arrival"):
             lines.append(f"Желаемая дата поставки: {ctx['supplier_order_desired_arrival']}")
-
-    lines.append("")
-    if task["kind"] == "payment_no_acquisition":
-        lines.append("Что сделать:")
-        lines.append("— Оформить недостающие приёмные документы")
-        lines.append("— Или подтвердить аванс / отклонить с причиной")
 
     text = "\n".join(lines)
     kb = InlineKeyboardMarkup([
@@ -212,40 +194,24 @@ def render_task(task: dict) -> tuple[str, InlineKeyboardMarkup]:
 #  Handlers
 # ─────────────────────────────────────────────────────────────────────
 
-async def _show_one_task(update_or_q, context, user_id: int, prefix: str = "") -> int:
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
     task = fetch_next_task(user_id)
     if not task:
-        text = "✨ Открытых задач нет."
-        if hasattr(update_or_q, "message") and update_or_q.message:
-            await update_or_q.message.reply_text(text)
-        else:
-            await update_or_q.callback_query.edit_message_text(text)
-        return ConversationHandler.END
+        await update.message.reply_text("✨ Открытых задач нет.")
+        return
     text, kb = render_task(task)
     pending = count_pending(user_id)
     if pending > 1:
-        text = f"<i>{prefix}Задача 1 из {pending}</i>\n\n" + text
-    if hasattr(update_or_q, "message") and update_or_q.message:
-        msg = await update_or_q.message.reply_text(text, reply_markup=kb,
-                                                   parse_mode=ParseMode.HTML)
-    else:
-        await update_or_q.callback_query.edit_message_text(
-            text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        msg = update_or_q.callback_query.message
-    log_reminder(task["id"], level=0, channel="dm",
-                 chat_id=msg.chat_id, message_id=msg.message_id, text=text)
-    context.user_data["current_task_id"] = task["id"]
-    return CHOOSING_ACTION
+        text = f"<i>Задача 1 из {pending}</i>\n\n" + text
+    msg = await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    log_reminder(task["id"], 0, "dm", msg.chat_id, msg.message_id, text)
 
 
-async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _show_one_task(update, context, update.effective_user.id)
-
-
-async def on_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def on_task_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query; await q.answer()
     task_id = int(q.data.split("_")[-1])
-    context.user_data["done_task_id"] = task_id
+    context.user_data["await"] = {"kind": "done", "task_id": task_id}
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Без комментария", callback_data=f"done_skip_{task_id}")],
         [InlineKeyboardButton("← Назад", callback_data=f"done_cancel_{task_id}")],
@@ -255,176 +221,44 @@ async def on_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Например: «Оформил ПТУ #234 на 200к», «Аванс по договору, поставка 10.05».",
         reply_markup=kb,
     )
-    return RESULT_TEXT
 
 
-async def on_done_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    result = (update.message.text or "").strip()
-    if len(result) < 2:
-        await update.message.reply_text("Слишком коротко. Напиши хотя бы пару слов.")
-        return RESULT_TEXT
-    task_id = context.user_data.get("done_task_id")
-    if not task_id:
-        await update.message.reply_text("Слетел контекст. /tasks ещё раз.")
-        return ConversationHandler.END
-    update_task(task_id, status="resolved", resolved_at=datetime.now(),
-                result_text=result)
-    log_reminder(task_id, 0, "dm", update.message.chat_id, update.message.message_id,
-                 f"resolved: {result}", response="resolved")
-    await update.message.reply_text("✅ Сделано. Зафиксировано.")
-    return await _show_next_or_end(update, context)
-
-
-async def on_done_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def on_task_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query; await q.answer()
     task_id = int(q.data.split("_")[-1])
-    update_task(task_id, status="resolved", resolved_at=datetime.now())
-    log_reminder(task_id, 0, "dm", q.message.chat_id, q.message.message_id,
-                 "resolved (no comment)", response="resolved")
-    await q.edit_message_text("✅ Сделано. Спасибо.")
-    return await _show_next_or_end(update, context)
-
-
-async def on_done_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query; await q.answer()
-    task_id = int(q.data.split("_")[-1])
-    task = get_task(task_id)
-    if task:
-        text, kb = render_task(task)
-        await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        return CHOOSING_ACTION
-    return ConversationHandler.END
-
-
-async def _show_next_or_end(update_or_q, context) -> int:
-    """После resolve — показать следующую задачу или END."""
-    user_id = update_or_q.effective_user.id
-    next_t = fetch_next_task(user_id)
-    if not next_t:
-        return ConversationHandler.END
-    text, kb = render_task(next_t)
-    chat_id = (update_or_q.message.chat_id if update_or_q.message
-               else update_or_q.callback_query.message.chat_id)
-    msg = await context.bot.send_message(chat_id=chat_id, text=text,
-                                          reply_markup=kb, parse_mode=ParseMode.HTML)
-    log_reminder(next_t["id"], 0, "dm", msg.chat_id, msg.message_id, text)
-    context.user_data["current_task_id"] = next_t["id"]
-    return CHOOSING_ACTION
-
-
-SNOOZE_OPTIONS = [("1 день", 1), ("3 дня", 3), ("Неделя", 7)]
-
-
-async def on_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query; await q.answer()
-    task_id = int(q.data.split("_")[-1])
-    context.user_data["snooze_task_id"] = task_id
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=f"snz_d_{days}_{task_id}")
-         for label, days in SNOOZE_OPTIONS],
+        [InlineKeyboardButton("1 день", callback_data=f"snz_d_1_{task_id}"),
+         InlineKeyboardButton("3 дня",  callback_data=f"snz_d_3_{task_id}"),
+         InlineKeyboardButton("Неделя", callback_data=f"snz_d_7_{task_id}")],
         [InlineKeyboardButton("Своя дата…", callback_data=f"snz_custom_{task_id}")],
         [InlineKeyboardButton("← Назад", callback_data=f"snz_cancel_{task_id}")],
     ])
     await q.edit_message_reply_markup(reply_markup=kb)
-    return SNOOZE_PICK
 
 
-async def on_snooze_preset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query; await q.answer()
-    parts = q.data.split("_")
-    days = int(parts[2]); task_id = int(parts[3])
-    until = datetime.now() + timedelta(days=days)
-    update_task(task_id, snoozed_until=until)
-    log_reminder(task_id, 0, "dm", q.message.chat_id, q.message.message_id,
-                 f"snoozed +{days}d", response=f"snoozed_until_{until.date().isoformat()}")
-    await q.edit_message_text(f"⏰ Отложено до {until.strftime('%Y-%m-%d %H:%M')}")
-    return ConversationHandler.END
-
-
-async def on_snooze_custom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text(
-        "Введи дату <code>YYYY-MM-DD</code> (например <code>2026-05-15</code>).\n/cancel — отмена.",
-        parse_mode=ParseMode.HTML)
-    return SNOOZE_CUSTOM
-
-
-async def on_snooze_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.message.text or "").strip()
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", text)
-    if not m:
-        await update.message.reply_text("Не понял дату. YYYY-MM-DD или /cancel.")
-        return SNOOZE_CUSTOM
-    try:
-        until = datetime(int(m[1]), int(m[2]), int(m[3]), 9, 0)
-    except ValueError:
-        await update.message.reply_text("Неверная дата. Попробуй ещё раз.")
-        return SNOOZE_CUSTOM
-    task_id = context.user_data.get("snooze_task_id")
-    if not task_id:
-        await update.message.reply_text("Слетел контекст. /tasks ещё раз.")
-        return ConversationHandler.END
-    update_task(task_id, snoozed_until=until)
-    log_reminder(task_id, 0, "dm", update.message.chat_id, update.message.message_id,
-                 f"snoozed to {until}", response=f"snoozed_until_{until.date().isoformat()}")
-    await update.message.reply_text(f"⏰ Отложено до {until.strftime('%Y-%m-%d %H:%M')}")
-    return ConversationHandler.END
-
-
-async def on_snooze_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def on_task_decline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query; await q.answer()
     task_id = int(q.data.split("_")[-1])
-    task = get_task(task_id)
-    if task:
-        text, kb = render_task(task)
-        await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        return CHOOSING_ACTION
-    return ConversationHandler.END
-
-
-async def on_decline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query; await q.answer()
-    task_id = int(q.data.split("_")[-1])
-    context.user_data["decline_task_id"] = task_id
+    context.user_data["await"] = {"kind": "decline", "task_id": task_id}
     await q.edit_message_text(
         "Напиши причину одним сообщением. Например:\n"
-        "«Это аванс по договору №123, поставка к 15.05»\n"
+        "«Это аванс по договору №123, поставка 15.05»\n"
         "«Платёж ошибочный, инициирован возврат»\n"
         "/cancel — отмена."
     )
-    return DECLINE_REASON
 
 
-async def on_decline_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reason = (update.message.text or "").strip()
-    if len(reason) < 5:
-        await update.message.reply_text("Слишком короткая причина. Опиши подробнее.")
-        return DECLINE_REASON
-    task_id = context.user_data.get("decline_task_id")
-    if not task_id:
-        await update.message.reply_text("Слетел контекст. /tasks ещё раз.")
-        return ConversationHandler.END
-    update_task(task_id, status="declined", declined_at=datetime.now(), decline_reason=reason)
-    log_reminder(task_id, 0, "dm", update.message.chat_id, update.message.message_id,
-                 f"declined: {reason}", response="declined")
-    await update.message.reply_text("❌ Отклонено. Зафиксировано.")
-    return ConversationHandler.END
-
-
-async def on_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def on_task_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query; await q.answer()
     task_id = int(q.data.split("_")[-1])
-    context.user_data["transfer_task_id"] = task_id
     candidates = list_active_tg_assignees()
+    candidates = [c for c in candidates if c["tg_user_id"] != update.effective_user.id]
     if not candidates:
-        await q.edit_message_text("Нет других активных TG-юзеров для передачи.")
-        return ConversationHandler.END
-    # Build keyboard — 2 in row, max 18 candidates (9 rows)
+        await q.edit_message_text("Нет других активных юзеров для передачи.")
+        return
     rows = []
     cur_row = []
     for c in candidates[:18]:
-        if c["tg_user_id"] == update.effective_user.id:
-            continue
         label = (c["person_name"] or c["display_name"] or str(c["tg_user_id"]))[:25]
         cur_row.append(InlineKeyboardButton(label, callback_data=f"tr_{task_id}_{c['tg_user_id']}"))
         if len(cur_row) == 2:
@@ -432,103 +266,199 @@ async def on_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if cur_row: rows.append(cur_row)
     rows.append([InlineKeyboardButton("← Назад", callback_data=f"tr_cancel_{task_id}")])
     await q.edit_message_text("Кому передать задачу?", reply_markup=InlineKeyboardMarkup(rows))
-    return TRANSFER_PICK
 
 
-async def on_transfer_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# Snooze flow
+
+async def on_snooze_preset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query; await q.answer()
     parts = q.data.split("_")
-    task_id = int(parts[1]); new_tg = int(parts[2])
-    # find km_entity for new assignee
-    with _conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT km_entity_id, display_name, "
-                    "  (SELECT canonical_name FROM km_entities WHERE id=km_entity_id) AS person_name "
-                    "FROM comm_users WHERE tg_user_id=%s", (new_tg,))
-        c = cur.fetchone()
-    if not c:
-        await q.edit_message_text("Не нашёл получателя.")
-        return ConversationHandler.END
-
-    # Read current task to record transferred_from
-    task = get_task(task_id)
-    update_task(
-        task_id,
-        assignee_tg_user_id=new_tg,
-        assignee_entity_id=c["km_entity_id"],
-        transferred_from_entity_id=task.get("assignee_entity_id"),
-        transferred_at=datetime.now(),
-    )
+    days = int(parts[2]); task_id = int(parts[3])
+    until = datetime.now() + timedelta(days=days)
+    update_task(task_id, snoozed_until=until)
     log_reminder(task_id, 0, "dm", q.message.chat_id, q.message.message_id,
-                 f"transferred to tg={new_tg}", response=f"transferred_to_{new_tg}")
-
-    name = c["person_name"] or c["display_name"] or str(new_tg)
-    await q.edit_message_text(f"👥 Передано: {name}")
-
-    # DM new assignee
-    try:
-        text, kb = render_task(get_task(task_id))
-        text = f"<i>Тебе передали задачу</i>\n\n" + text
-        msg = await context.bot.send_message(chat_id=new_tg, text=text,
-                                              reply_markup=kb, parse_mode=ParseMode.HTML)
-        log_reminder(task_id, 0, "dm", msg.chat_id, msg.message_id,
-                     "transferred-in DM", response=None)
-    except Exception as e:
-        logger.warning(f"Could not DM new assignee {new_tg}: {e}")
-    return ConversationHandler.END
+                 f"snoozed +{days}d", response=f"snoozed_until_{until.date()}")
+    await q.edit_message_text(f"⏰ Отложено до {until.strftime('%Y-%m-%d %H:%M')}")
 
 
-async def on_transfer_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def on_snooze_custom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query; await q.answer()
+    task_id = int(q.data.split("_")[-1])
+    context.user_data["await"] = {"kind": "snooze_custom", "task_id": task_id}
+    await q.edit_message_text(
+        "Введи дату <code>YYYY-MM-DD</code> (например <code>2026-05-15</code>). /cancel — отмена.",
+        parse_mode=ParseMode.HTML)
+
+
+async def on_snooze_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query; await q.answer()
     task_id = int(q.data.split("_")[-1])
     task = get_task(task_id)
     if task:
         text, kb = render_task(task)
         await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        return CHOOSING_ACTION
-    return ConversationHandler.END
 
 
-async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message:
+# Done flow (skip / cancel)
+
+async def on_done_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query; await q.answer()
+    task_id = int(q.data.split("_")[-1])
+    update_task(task_id, status="resolved", resolved_at=datetime.now())
+    log_reminder(task_id, 0, "dm", q.message.chat_id, q.message.message_id,
+                 "resolved (no comment)", response="resolved")
+    context.user_data.pop("await", None)
+    await q.edit_message_text("✅ Сделано. Спасибо.")
+    await _maybe_show_next(update, context, update.effective_user.id, q.message.chat_id)
+
+
+async def on_done_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query; await q.answer()
+    task_id = int(q.data.split("_")[-1])
+    context.user_data.pop("await", None)
+    task = get_task(task_id)
+    if task:
+        text, kb = render_task(task)
+        await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+# Transfer
+
+async def on_transfer_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query; await q.answer()
+    parts = q.data.split("_")
+    task_id = int(parts[1]); new_tg = int(parts[2])
+    with _conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT km_entity_id, display_name, "
+                    "(SELECT canonical_name FROM km_entities WHERE id=km_entity_id) AS pname "
+                    "FROM comm_users WHERE tg_user_id=%s", (new_tg,))
+        c = cur.fetchone()
+    if not c:
+        await q.edit_message_text("Не нашёл получателя.")
+        return
+    task = get_task(task_id)
+    update_task(task_id, assignee_tg_user_id=new_tg, assignee_entity_id=c["km_entity_id"],
+                transferred_from_entity_id=task.get("assignee_entity_id"),
+                transferred_at=datetime.now())
+    log_reminder(task_id, 0, "dm", q.message.chat_id, q.message.message_id,
+                 f"transferred to tg={new_tg}", response=f"transferred_to_{new_tg}")
+    name = c["pname"] or c["display_name"] or str(new_tg)
+    await q.edit_message_text(f"👥 Передано: {name}")
+    try:
+        text, kb = render_task(get_task(task_id))
+        text = "<i>Тебе передали задачу</i>\n\n" + text
+        msg = await context.bot.send_message(chat_id=new_tg, text=text,
+                                              reply_markup=kb, parse_mode=ParseMode.HTML)
+        log_reminder(task_id, 0, "dm", msg.chat_id, msg.message_id,
+                     "transferred-in DM", response=None)
+    except Exception as e:
+        logger.warning(f"Could not DM new assignee {new_tg}: {e}")
+
+
+async def on_transfer_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query; await q.answer()
+    task_id = int(q.data.split("_")[-1])
+    task = get_task(task_id)
+    if task:
+        text, kb = render_task(task)
+        await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Text input dispatcher
+# ─────────────────────────────────────────────────────────────────────
+
+async def on_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик текста — диспетчер по user_data['await']."""
+    aw = context.user_data.get("await")
+    if not aw:
+        return  # не наше — ничего не делаем
+    kind = aw["kind"]
+    task_id = aw["task_id"]
+    text = (update.message.text or "").strip()
+    if text.startswith("/"):
+        return  # команда — не обрабатываем
+
+    if kind == "done":
+        if len(text) < 2:
+            await update.message.reply_text("Слишком коротко. Опиши хотя бы пару слов.")
+            return
+        update_task(task_id, status="resolved", resolved_at=datetime.now(),
+                    result_text=text)
+        log_reminder(task_id, 0, "dm", update.message.chat_id, update.message.message_id,
+                     f"resolved: {text}", response="resolved")
+        context.user_data.pop("await", None)
+        await update.message.reply_text("✅ Сделано. Зафиксировано.")
+        await _maybe_show_next(update, context, update.effective_user.id,
+                                update.message.chat_id)
+        return
+
+    if kind == "snooze_custom":
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", text)
+        if not m:
+            await update.message.reply_text("Не понял дату. YYYY-MM-DD или /cancel.")
+            return
+        try:
+            until = datetime(int(m[1]), int(m[2]), int(m[3]), 9, 0)
+        except ValueError:
+            await update.message.reply_text("Неверная дата.")
+            return
+        update_task(task_id, snoozed_until=until)
+        log_reminder(task_id, 0, "dm", update.message.chat_id, update.message.message_id,
+                     f"snoozed to {until}", response=f"snoozed_until_{until.date()}")
+        context.user_data.pop("await", None)
+        await update.message.reply_text(f"⏰ Отложено до {until.strftime('%Y-%m-%d %H:%M')}")
+        return
+
+    if kind == "decline":
+        if len(text) < 5:
+            await update.message.reply_text("Слишком коротко. Опиши подробнее.")
+            return
+        update_task(task_id, status="declined", declined_at=datetime.now(),
+                    decline_reason=text)
+        log_reminder(task_id, 0, "dm", update.message.chat_id, update.message.message_id,
+                     f"declined: {text}", response="declined")
+        context.user_data.pop("await", None)
+        await update.message.reply_text("❌ Отклонено. Зафиксировано.")
+        return
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.pop("await", None):
         await update.message.reply_text("Окей, отменил.")
-    elif update.callback_query:
-        q = update.callback_query; await q.answer()
-        await q.edit_message_text("Отменил.")
-    return ConversationHandler.END
 
 
-def tasks_conversation() -> ConversationHandler:
-    return ConversationHandler(
-        entry_points=[CommandHandler("tasks", cmd_tasks)],
-        states={
-            CHOOSING_ACTION: [
-                CallbackQueryHandler(on_done,     pattern=r"^task_done_\d+$"),
-                CallbackQueryHandler(on_snooze,   pattern=r"^task_snooze_\d+$"),
-                CallbackQueryHandler(on_decline,  pattern=r"^task_decline_\d+$"),
-                CallbackQueryHandler(on_transfer, pattern=r"^task_transfer_\d+$"),
-            ],
-            SNOOZE_PICK: [
-                CallbackQueryHandler(on_snooze_preset, pattern=r"^snz_d_\d+_\d+$"),
-                CallbackQueryHandler(on_snooze_custom, pattern=r"^snz_custom_\d+$"),
-                CallbackQueryHandler(on_snooze_cancel, pattern=r"^snz_cancel_\d+$"),
-            ],
-            SNOOZE_CUSTOM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_snooze_custom_text),
-            ],
-            DECLINE_REASON: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_decline_reason),
-            ],
-            TRANSFER_PICK: [
-                CallbackQueryHandler(on_transfer_pick,   pattern=r"^tr_\d+_\d+$"),
-                CallbackQueryHandler(on_transfer_cancel, pattern=r"^tr_cancel_\d+$"),
-            ],
-            RESULT_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_done_text),
-                CallbackQueryHandler(on_done_skip,   pattern=r"^done_skip_\d+$"),
-                CallbackQueryHandler(on_done_cancel, pattern=r"^done_cancel_\d+$"),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", on_cancel)],
-        per_message=False, per_chat=True, per_user=True,
-        name="tasks_conv",
+async def _maybe_show_next(update, context, user_id: int, chat_id: int) -> None:
+    nxt = fetch_next_task(user_id)
+    if not nxt:
+        return
+    text, kb = render_task(nxt)
+    msg = await context.bot.send_message(chat_id=chat_id, text=text,
+                                          reply_markup=kb, parse_mode=ParseMode.HTML)
+    log_reminder(nxt["id"], 0, "dm", msg.chat_id, msg.message_id, text)
+
+
+def register_tasks_handlers(application: Application) -> None:
+    application.add_handler(CommandHandler("tasks", cmd_tasks))
+    application.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    application.add_handler(CallbackQueryHandler(on_task_done,    pattern=r"^task_done_\d+$"))
+    application.add_handler(CallbackQueryHandler(on_task_snooze,  pattern=r"^task_snooze_\d+$"))
+    application.add_handler(CallbackQueryHandler(on_task_decline, pattern=r"^task_decline_\d+$"))
+    application.add_handler(CallbackQueryHandler(on_task_transfer,pattern=r"^task_transfer_\d+$"))
+
+    application.add_handler(CallbackQueryHandler(on_snooze_preset, pattern=r"^snz_d_\d+_\d+$"))
+    application.add_handler(CallbackQueryHandler(on_snooze_custom, pattern=r"^snz_custom_\d+$"))
+    application.add_handler(CallbackQueryHandler(on_snooze_cancel, pattern=r"^snz_cancel_\d+$"))
+
+    application.add_handler(CallbackQueryHandler(on_done_skip,   pattern=r"^done_skip_\d+$"))
+    application.add_handler(CallbackQueryHandler(on_done_cancel, pattern=r"^done_cancel_\d+$"))
+
+    application.add_handler(CallbackQueryHandler(on_transfer_pick,   pattern=r"^tr_\d+_\d+$"))
+    application.add_handler(CallbackQueryHandler(on_transfer_cancel, pattern=r"^tr_cancel_\d+$"))
+
+    # Глобальный текстовый обработчик — приоритет ниже команд (group=10)
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_input),
+        group=10,
     )

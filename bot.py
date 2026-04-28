@@ -28,7 +28,7 @@ from openai import OpenAI
 from telegram.ext import CallbackQueryHandler
 from rag_agent import process_rag_query, index_new_message
 from receive_flow import receive_conversation
-from tasks_flow import tasks_conversation
+from tasks_flow import register_tasks_handlers
 from fix_flow import fix_conversation
 from telegram.helpers import escape_markdown
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -2436,6 +2436,12 @@ async def handle_private_rag(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not question:
         return
 
+    # Если юзер в середине /tasks-флоу (нажал [Сделано] / [Своя дата] / [Отклонить]
+    # и сейчас вводит текст-ответ) — tasks_flow.on_text_input в group=10 обработает.
+    # RAG-ответ был бы шумом + лишние 30с + деньги.
+    if context.user_data.get("await"):
+        return
+
     # Если у user-а pending identification — его ответ обрабатывает
     # handle_identification_reply в другой группе, RAG не нужен.
     try:
@@ -4832,8 +4838,8 @@ def main():
     application.add_handler(CommandHandler("bom", bom_command))
     # /receive — приёмка УПД (Фаза 1: OCR; Фаза 2+: матчинг заказа и ПТУ)
     application.add_handler(receive_conversation())
-    # /tasks — задачи payment_audit (Phase 2)
-    application.add_handler(tasks_conversation())
+    # /tasks — задачи payment_audit (Phase 2/3)
+    register_tasks_handlers(application)
     # /fix — задача на исправление от членов чата Руководство → Claude Code
     application.add_handler(fix_conversation())
     # Команда /rules — управление правилами фильтрации
