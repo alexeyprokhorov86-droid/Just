@@ -267,17 +267,21 @@ def process(conn, dry: bool) -> tuple[int, int, int]:
                 sent_to_users.add(tg)
                 continue
             res = tg_send(tg_id, text)
+            # throttle one-per-user-per-run даже при error (403 Forbidden,
+            # 400 chat not found): иначе для user'а с 19 задачами будет 19
+            # неудачных попыток подряд за один прогон.
+            sent_to_users.add(tg)
             if res:
                 log_reminder(conn, task["id"], level, "dm", tg_id,
                              res.get("message_id"), text)
                 update_task(conn, task["id"], level)
                 sent[level] += 1
-                sent_to_users.add(tg)
         else:
             # L2 — пост в групповой чат
             target = find_group_chat_for_user(conn, tg)
             if not target:
                 log(f"  task#{task['id']} L2 — нет групп. чата для tg={tg}")
+                sent_to_users.add(tg)  # не пытаемся остальные task'и того же user'а
                 continue
             chat_id, name = target
             uname = get_username(conn, task["assignee_tg_user_id"])
@@ -289,12 +293,12 @@ def process(conn, dry: bool) -> tuple[int, int, int]:
                 sent_to_users.add(tg)
                 continue
             res = tg_send(chat_id, full_text)
+            sent_to_users.add(tg)
             if res:
                 log_reminder(conn, task["id"], level, "group", chat_id,
                              res.get("message_id"), full_text)
                 update_task(conn, task["id"], level)
                 sent[level] += 1
-                sent_to_users.add(tg)
     if not dry:
         conn.commit()
     return sent[0], sent[1], sent[2]
