@@ -1228,7 +1228,7 @@ def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) ->
                 date_sql = """
                     SELECT id, subject, body_text, from_address, received_at
                     FROM email_messages
-                    WHERE email_category IN ('internal', 'external_business')
+                    WHERE category IN ('internal', 'external_business')
                 """
                 date_params: list = []
                 date_sql += " AND received_at >= %s"
@@ -1328,6 +1328,8 @@ def search_emails_vector(query: str, limit: int = 30, time_context: dict = None)
 
     decay_days = time_context.get("decay_days", 90)
     freshness_weight = time_context.get("freshness_weight", 0.25)
+    date_from = time_context.get("date_from")
+    date_to = time_context.get("date_to")
 
     pre_limit = max(limit * 3, 30)
     max_chunks_per_email = 2
@@ -1342,6 +1344,25 @@ def search_emails_vector(query: str, limit: int = 30, time_context: dict = None)
             freshness_weight=freshness_weight,
             decay_days=decay_days
         )
+
+        # Жёсткий date-фильтр — freshness scoring только смягчает score,
+        # не исключает записи вне периода.
+        if date_from or date_to:
+            def _in_range(r):
+                dt = r.get("received_at")
+                if not dt:
+                    return True  # нет даты — не фильтруем
+                if isinstance(dt, str):
+                    try:
+                        dt = datetime.fromisoformat(dt)
+                    except Exception:
+                        return True
+                if date_from and dt < date_from:
+                    return False
+                if date_to and dt > date_to:
+                    return False
+                return True
+            email_candidates = [r for r in email_candidates if _in_range(r)]
 
         diversified = diversify_by_source_id(
             email_candidates,
