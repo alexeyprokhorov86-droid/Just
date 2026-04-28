@@ -312,6 +312,21 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("нет активной сессии — следующее сообщение и так создаст новую")
 
 
+async def _post_init(app: Application) -> None:
+    """После инициализации бота — поднять fix_worker на фоне.
+
+    Worker читает /tmp/fix_queue/*.json (от main bot fix_flow), запускает
+    `claude -p` и шлёт ответ пользователю в DM через main bot Bot API.
+    """
+    main_bot_token = os.getenv("BOT_TOKEN", "")
+    if not main_bot_token:
+        logger.warning("BOT_TOKEN не задан — /fix worker не сможет отвечать пользователям, не запускаю")
+        return
+    from claude_tg_bridge.fix_worker import fix_worker_loop
+    asyncio.create_task(fix_worker_loop(main_bot_token))
+    logger.info("fix_worker spawned")
+
+
 def main():
     proxy = os.getenv("PROXY_URL")
     req_kwargs = dict(read_timeout=120, write_timeout=120, connect_timeout=30)
@@ -325,6 +340,7 @@ def main():
            .token(BOT_TOKEN)
            .request(request)
            .get_updates_request(get_updates_request)
+           .post_init(_post_init)
            .build())
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -336,7 +352,7 @@ def main():
     # /ask — любой не-командный текст от админа
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Claude Code Bridge bot started (hook-mode + /ask)")
+    logger.info("Claude Code Bridge bot started (hook-mode + /ask + fix_worker)")
     app.run_polling(drop_pending_updates=True)
 
 

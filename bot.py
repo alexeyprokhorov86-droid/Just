@@ -29,6 +29,7 @@ from telegram.ext import CallbackQueryHandler
 from rag_agent import process_rag_query, index_new_message
 from receive_flow import receive_conversation
 from tasks_flow import tasks_conversation
+from fix_flow import fix_conversation
 from telegram.helpers import escape_markdown
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -4833,6 +4834,8 @@ def main():
     application.add_handler(receive_conversation())
     # /tasks — задачи payment_audit (Phase 2)
     application.add_handler(tasks_conversation())
+    # /fix — задача на исправление от членов чата Руководство → Claude Code
+    application.add_handler(fix_conversation())
     # Команда /rules — управление правилами фильтрации
     application.add_handler(CommandHandler("rules", rules_command))
     application.add_handler(CommandHandler("rules_find", rules_find_command))
