@@ -34,7 +34,7 @@ ROUTERAI_BASE_URL = os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1")
 
 # Импорт векторного поиска
 try:
-    from embedding_service_e5 import vector_search, vector_search_weighted, index_telegram_message
+    pass  # e5 removed from read-path; email/chat vector search uses source_chunks (Qwen3)
     VECTOR_SEARCH_ENABLED = True
     logger.info("Векторный поиск включен")
 except ImportError:
@@ -1136,57 +1136,83 @@ def search_telegram_chats_sql(query: str, limit: int = 30, target_tables: list =
 
 def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict = None,
                                  target_tables: list = None) -> list:
-    """Векторный (семантический) поиск по чатам с учётом свежести."""
+    """Векторный поиск по чатам через source_chunks (Qwen3, embedding_v2, HNSW)."""
     if not VECTOR_SEARCH_ENABLED:
         return []
-    
+
     if time_context is None:
         time_context = extract_time_context(query)
-    
+
     decay_days = time_context.get("decay_days", 90)
     freshness_weight = time_context.get("freshness_weight", 0.25)
-    
-    retrieval_query = expand_query_for_retrieval(query)
+    date_from = time_context.get("date_from")
+    date_to = time_context.get("date_to")
 
     try:
-        vector_results = vector_search_weighted(
-            retrieval_query,
-            limit=limit, 
-            source_type='telegram',
-            freshness_weight=freshness_weight,
-            decay_days=decay_days,
-            source_tables=target_tables if target_tables else None
-        )
-        
-        results = []
-        for r in vector_results:
-            chat_name = r['source_table'].replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
-            
-            result = {
-                "source": f"Чат: {chat_name}",
-                "content": r['content'][:1000],
-                "type": "text",
-                "similarity": r.get('similarity', 0),
-                "freshness": r.get('freshness', 0),
-                "final_score": r.get('final_score', r.get('similarity', 0)),
-                "search_type": "vector",
-                "source_id": f"{r.get('source_table')}:{r.get('source_id')}",
-                "source_table": r.get('source_table'),
-            }
-            
-            if r.get('timestamp'):
-                result["date"] = r['timestamp'].strftime("%d.%m.%Y %H:%M")
-            
-            results.append(result)
-        
-        logger.info(
-            f"Векторный поиск (decay={decay_days}d, fw={freshness_weight}, "
-            f"targets={len(target_tables) if target_tables else 'all'}): {len(results)} результатов"
-        )
-        return results
-        
+        from chunkers.embedder import embed_query_v2
+        q_emb = embed_query_v2(query)
+        if q_emb is None:
+            return []
+        emb_list = q_emb.tolist() if hasattr(q_emb, 'tolist') else list(q_emb)
+
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                q = """
+                    SELECT sc.chunk_text, sd.channel_name, sd.channel_ref,
+                           sd.author_name, sd.doc_date, sc.id,
+                           sc.embedding_v2 <=> %s::vector AS distance
+                    FROM source_chunks sc
+                    JOIN source_documents sd ON sd.id = sc.document_id
+                    WHERE sd.source_kind = 'telegram_message'
+                      AND sc.embedding_v2 IS NOT NULL
+                """
+                params: list = [emb_list]
+                if target_tables:
+                    q += " AND sd.channel_ref = ANY(%s)"
+                    params.append(target_tables)
+                if date_from:
+                    q += " AND sd.doc_date >= %s"
+                    params.append(date_from)
+                if date_to:
+                    q += " AND sd.doc_date <= %s"
+                    params.append(date_to)
+                q += " ORDER BY sc.embedding_v2 <=> %s::vector LIMIT %s"
+                params.extend([emb_list, limit * 2])
+                cur.execute(q, params)
+
+                results = []
+                for chunk_text, channel_name, channel_ref, author_name, doc_date, sc_id, distance in cur.fetchall():
+                    similarity = max(0.0, 1.0 - float(distance))
+                    freshness = freshness_by_time(doc_date, decay_days)
+                    final_score = similarity * (1 - freshness_weight) + freshness * freshness_weight
+                    chat_name = channel_name or (
+                        (channel_ref or '').replace('tg_chat_', '').split('_', 1)[-1].replace('_', ' ').title()
+                    )
+                    results.append({
+                        "source": f"Чат: {chat_name}",
+                        "content": (chunk_text or "")[:1000],
+                        "author": author_name or "",
+                        "date": doc_date.strftime("%d.%m.%Y %H:%M") if doc_date else "",
+                        "similarity": similarity,
+                        "freshness": freshness,
+                        "final_score": final_score,
+                        "search_type": "chat_vector_qwen",
+                        "source_id": f"{channel_ref}:{sc_id}",
+                        "source_table": channel_ref,
+                        "_ts": doc_date,
+                    })
+
+                results.sort(key=lambda x: x["final_score"], reverse=True)
+                logger.info(
+                    f"Chat vector Qwen3: {len(results)} результатов "
+                    f"(targets={len(target_tables) if target_tables else 'all'})"
+                )
+                return results[:limit]
+        finally:
+            conn.close()
     except Exception as e:
-        logger.error(f"Ошибка векторного поиска: {e}")
+        logger.error(f"Ошибка векторного поиска чатов (Qwen3): {e}")
         return []
 
 
@@ -1319,7 +1345,7 @@ def search_emails_sql(query: str, limit: int = 30, time_context: dict = None) ->
 
 
 def search_emails_vector(query: str, limit: int = 30, time_context: dict = None) -> list:
-    """Семантический поиск по email с учётом свежести + diversity."""
+    """Семантический поиск по email через source_chunks (Qwen3, embedding_v2, HNSW)."""
     if not VECTOR_SEARCH_ENABLED:
         return []
 
@@ -1331,81 +1357,87 @@ def search_emails_vector(query: str, limit: int = 30, time_context: dict = None)
     date_from = time_context.get("date_from")
     date_to = time_context.get("date_to")
 
-    pre_limit = max(limit * 3, 30)
-    max_chunks_per_email = 2
-
-    results = []
     try:
-        retrieval_query = expand_query_for_retrieval(query)
-        email_candidates = vector_search_weighted(
-            retrieval_query,
-            limit=pre_limit,
-            source_type='email',
-            freshness_weight=freshness_weight,
-            decay_days=decay_days
-        )
+        from chunkers.embedder import embed_query_v2
+        q_emb = embed_query_v2(query)
+        if q_emb is None:
+            return []
+        emb_list = q_emb.tolist() if hasattr(q_emb, 'tolist') else list(q_emb)
 
-        # Жёсткий date-фильтр — freshness scoring только смягчает score,
-        # не исключает записи вне периода.
-        if date_from or date_to:
-            def _in_range(r):
-                dt = r.get("received_at")
-                if not dt:
-                    return True  # нет даты — не фильтруем
-                if isinstance(dt, str):
-                    try:
-                        dt = datetime.fromisoformat(dt)
-                    except Exception:
-                        return True
-                if date_from and dt < date_from:
-                    return False
-                if date_to and dt > date_to:
-                    return False
-                return True
-            email_candidates = [r for r in email_candidates if _in_range(r)]
+        conn = get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                q = """
+                    SELECT sc.chunk_text, sd.title, sd.author_name, sd.author_ref,
+                           sd.doc_date, sc.id,
+                           sc.embedding_v2 <=> %s::vector AS distance
+                    FROM source_chunks sc
+                    JOIN source_documents sd ON sd.id = sc.document_id
+                    WHERE sd.source_kind = 'email_message'
+                      AND sc.embedding_v2 IS NOT NULL
+                """
+                params: list = [emb_list]
+                if date_from:
+                    q += " AND sd.doc_date >= %s"
+                    params.append(date_from)
+                if date_to:
+                    q += " AND sd.doc_date <= %s"
+                    params.append(date_to)
+                q += " ORDER BY sc.embedding_v2 <=> %s::vector LIMIT %s"
+                params.extend([emb_list, limit * 2])
+                cur.execute(q, params)
 
-        diversified = diversify_by_source_id(
-            email_candidates,
-            total_limit=limit,
-            max_per_source=max_chunks_per_email,
-            score_key="final_score",
-            source_id_key="source_id",
-        )
+                seen_docs: set = set()
+                results = []
+                for chunk_text, subject, from_name, from_addr, doc_date, sc_id, distance in cur.fetchall():
+                    doc_key = f"{from_addr}:{subject}:{doc_date.date() if doc_date else ''}"
+                    if doc_key in seen_docs:
+                        continue
+                    seen_docs.add(doc_key)
 
-        for r in diversified:
-            received_str = ""
-            if r.get("received_at"):
-                received_str = r["received_at"].strftime("%d.%m.%Y")
+                    similarity = max(0.0, 1.0 - float(distance))
+                    freshness = freshness_by_time(doc_date, decay_days)
+                    final_score = similarity * (1 - freshness_weight) + freshness * freshness_weight
+                    results.append({
+                        "source": "Email",
+                        "content": (chunk_text or "")[:800],
+                        "subject": subject or "",
+                        "from_address": from_addr or from_name or "",
+                        "date": doc_date.strftime("%d.%m.%Y") if doc_date else "",
+                        "similarity": similarity,
+                        "freshness": freshness,
+                        "final_score": final_score,
+                        "search_type": "email_vector_qwen",
+                        "source_id": str(sc_id),
+                        "received_at": doc_date,
+                    })
 
-            results.append({
-                "source": "Email",
-                "content": r.get("content", ""),
-                "subject": r.get("subject", ""),
-                "from_address": r.get("from_address", ""),
-                "date": received_str,
-                "similarity": r.get("similarity", 0),
-                "freshness": r.get("freshness", 0),
-                "final_score": r.get("final_score", r.get("similarity", 0)),
-                "search_type": "email_vector",
-                "source_id": r.get("source_id"),
-            })
-
-        logger.info(
-            f"Email vector search: pre_limit={pre_limit}, diversified={len(results)} "
-            f"(max_per_email={max_chunks_per_email}, decay={decay_days}d, fw={freshness_weight})"
-        )
-
+                results.sort(key=lambda x: x["final_score"], reverse=True)
+                logger.info(f"Email vector Qwen3: {len(results)} результатов")
+                return results[:limit]
+        finally:
+            conn.close()
     except Exception as e:
-        logger.error(f"Ошибка поиска email: {e}")
-
-    return results
+        logger.error(f"Ошибка векторного поиска email (Qwen3): {e}")
+        return []
 
 
 def search_emails(query: str, limit: int = 30, time_context: dict = None) -> list:
-    """Комбинированный поиск по email: вектор + SQL."""
+    """Комбинированный поиск по email: вектор + SQL.
+    Для точного дня (yesterday/today) — только SQL: vector не нужен, дата важнее семантики."""
+    date_from = (time_context or {}).get("date_from")
+    date_to = (time_context or {}).get("date_to")
+    is_exact_day = (
+        date_from and date_to
+        and isinstance(date_from, datetime) and isinstance(date_to, datetime)
+        and (date_to - date_from).total_seconds() <= 86400
+    )
+    if is_exact_day:
+        return search_emails_sql(query, limit=limit, time_context=time_context)
+
     results = []
     seen_ids = set()
-    
+
     vector_results = search_emails_vector(query, limit=limit, time_context=time_context)
     for r in vector_results:
         source_id = r.get('source_id')
@@ -1434,11 +1466,24 @@ def search_telegram_chats(query: str, limit: int = 30, time_context: dict = None
                           target_tables: list = None) -> list:
     """
     Комбинированный поиск по чатам: вектор + SQL.
+    Для точного дня (yesterday/today) — только SQL: vector не нужен, дата важнее семантики.
     target_tables: если задан — SQL ищет ТОЛЬКО в этих таблицах.
     """
+    date_from = (time_context or {}).get("date_from")
+    date_to = (time_context or {}).get("date_to")
+    is_exact_day = (
+        date_from and date_to
+        and isinstance(date_from, datetime) and isinstance(date_to, datetime)
+        and (date_to - date_from).total_seconds() <= 86400
+    )
+    if is_exact_day:
+        return search_telegram_chats_sql(
+            query, limit=limit, time_context=time_context, target_tables=target_tables
+        )
+
     results = []
     seen_content = set()
-    
+
     # Векторный поиск (пока по всем чатам, фильтрация по source_table)
     vector_results = search_telegram_chats_vector(
         query, limit=limit, time_context=time_context, target_tables=target_tables
@@ -4070,15 +4115,5 @@ def _log_rag_query(data: dict):
 
 
 async def index_new_message(table_name: str, message_id: int, content: str):
-    """Индексирует новое сообщение для векторного поиска."""
-    if not VECTOR_SEARCH_ENABLED:
-        return
-    
-    if not content or len(content.strip()) < 10:
-        return
-    
-    try:
-        index_telegram_message(table_name, message_id, content)
-        logger.debug(f"Проиндексировано сообщение {message_id} из {table_name}")
-    except Exception as e:
-        logger.error(f"Ошибка индексации сообщения: {e}")
+    """No-op: e5 legacy indexing removed. New messages are indexed via build_source_chunks.py (Qwen3)."""
+    pass
