@@ -4829,7 +4829,33 @@ def main():
     async def post_init(app):
         scheduler.start()
         logger.info(f"🕐 Планировщик запущен. Анализ документов для '{DELAYED_ANALYSIS_CHAT}' будет проводиться в 23:55")
-    
+        # TG bot-меню (popup при наборе "/") — отдельные scope для DM и групп.
+        from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("search", "поиск по базе знаний"),
+                BotCommand("tasks", "мои открытые задачи"),
+                BotCommand("bom", "состав продукции и калькуляции"),
+                BotCommand("fix", "задача на исправление в Claude Code"),
+                BotCommand("element", "данные для входа в Element X"),
+                BotCommand("rooms", "приглашения в комнаты Element"),
+                BotCommand("threads", "открытые цепочки email"),
+                BotCommand("search_email", "поиск по email"),
+                BotCommand("email_stats", "статистика входящих"),
+                BotCommand("notify", "отправить рассылку (для админа)"),
+                BotCommand("notify_status", "статус подтверждений"),
+                BotCommand("notify_remind", "повторно напомнить"),
+                BotCommand("rag_stats", "статистика RAG-агента"),
+            ], scope=BotCommandScopeAllPrivateChats())
+            await app.bot.set_my_commands([
+                BotCommand("roles", "пользователи без ролей"),
+                BotCommand("stats", "статистика чата"),
+                BotCommand("analysis", "настройка ежедневного анализа документов"),
+            ], scope=BotCommandScopeAllGroupChats())
+            logger.info("✅ TG bot-меню зарегистрировано (DM 13 команд / groups 3)")
+        except Exception as e:
+            logger.warning(f"set_my_commands failed: {e}")
+
     application.post_init = post_init
     
     # Команды
