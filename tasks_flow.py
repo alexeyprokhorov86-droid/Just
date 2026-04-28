@@ -102,15 +102,27 @@ def update_task(task_id: int, **kwargs) -> None:
 
 
 def list_active_tg_assignees() -> list[dict]:
+    """Кандидаты на передачу задачи: все TG-юзера с km_entity, у которых есть
+    активная запись в v_current_staff (не уволены, не архив).
+
+    JOIN по canonical_name = full_name ловит человека даже если
+    comm_users.employee_ref_key указывает на старую увольнительную карточку
+    (бывает у тех, кого приняли повторно — у них несколько c1_employees).
+    """
     with _conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
+            WITH active_persons AS (
+                SELECT DISTINCT TRIM(full_name) AS full_name
+                FROM v_current_staff
+                WHERE dismissal_date IS NULL AND is_archived = false
+            )
             SELECT cu.tg_user_id, cu.display_name, cu.km_entity_id,
                    e.canonical_name AS person_name
             FROM comm_users cu
-            LEFT JOIN km_entities e ON e.id = cu.km_entity_id
-            WHERE cu.km_entity_id IS NOT NULL
-              AND COALESCE(cu.is_external, false) = false
-            ORDER BY e.canonical_name NULLS LAST, cu.display_name
+            JOIN km_entities e ON e.id = cu.km_entity_id
+            JOIN active_persons ap ON ap.full_name = TRIM(e.canonical_name)
+            WHERE COALESCE(cu.is_external, false) = false
+            ORDER BY e.canonical_name, cu.display_name
         """)
         return [dict(r) for r in cur.fetchall()]
 
@@ -258,8 +270,16 @@ async def on_task_transfer(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     rows = []
     cur_row = []
-    for c in candidates[:18]:
-        label = (c["person_name"] or c["display_name"] or str(c["tg_user_id"]))[:25]
+    for c in candidates:
+        # Если у одного km_entity несколько TG (рабочий+личный) — показываем все,
+        # различая по display_name. Сейчас 17 активных юзеров → ≤9 строк по 2 кнопки,
+        # запас до TG-лимита (~100 кнопок) большой.
+        person = c.get("person_name") or ""
+        display = c.get("display_name") or ""
+        if person and display and display.lower() not in person.lower():
+            label = f"{person} ({display})"[:30]
+        else:
+            label = (person or display or str(c["tg_user_id"]))[:30]
         cur_row.append(InlineKeyboardButton(label, callback_data=f"tr_{task_id}_{c['tg_user_id']}"))
         if len(cur_row) == 2:
             rows.append(cur_row); cur_row = []
