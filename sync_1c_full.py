@@ -1675,17 +1675,21 @@ class Sync1C:
     def sync_bank_balances(self, conn):
         """Синхронизация остатков на банковских счетах."""
         from urllib.parse import quote
-        
+
         print("\n[Остатки на счетах]")
-        
+
         encoded = quote("InformationRegister_ОстаткиНаБанковскихСчетахПоДаннымВыписок", safe='_')
         all_items = []
         skip = 0
         while True:
-            resp = self.session.get(
-                f'{self.base_url}/{encoded}?$format=json&$top=500&$skip={skip}&$orderby=Period desc',
-                timeout=60
-            )
+            try:
+                resp = self.session.get(
+                    f'{self.base_url}/{encoded}?$format=json&$top=500&$skip={skip}&$orderby=Period desc',
+                    timeout=60
+                )
+            except Exception as e:
+                print(f"  ⚠️ sync_bank_balances: сетевая ошибка (skip={skip}): {e}")
+                break
             if resp.status_code != 200:
                 break
             batch = resp.json().get('value', [])
