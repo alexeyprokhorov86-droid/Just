@@ -5677,7 +5677,12 @@ def main_hourly(sync, conn):
     sync.sync_cost_allocation(conn, date_from, date_to)
     sync.sync_material_orders(conn, date_from, date_to)
     sync.sync_material_transfers(conn, date_from, date_to)
-   
+
+    # Планы производства создаются заранее (doc_date за ~1-2 недели до периода).
+    # Без этого изменения плана в 1С отражались бы только раз в сутки (--daily 6 AM).
+    date_from_plan = date_to - timedelta(days=60)
+    sync.sync_production_plan_light(conn, date_from_plan, date_to)
+
 def main_daily(sync, conn):
     """Ежедневная синхронизация — все документы за 14 дней."""
     print("\n" + "=" * 60)
