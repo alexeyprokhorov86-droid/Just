@@ -224,11 +224,15 @@ git add -A && git commit -m "описание" && git push
 
 ### RAG (основной фокус):
 1. ✅ **TASK_rag_quality_v2 Фазы 1-6** (готовы 2026-04-17): Router v2, Evaluator+Escalation, Text-to-SQL, km_fixation, Reply-chain, Periodic Synthesis.
-2. **P0 — RAG quality улучшения** (текущая сессия 2026-04-20):
-   - `top_*` analytics tools → `v_sales_adjusted` (учёт возвратов в top_clients/top_products/top_suppliers, sales_summary)
-   - Дедупликация `km_facts` по embedding-similarity (в `review_knowledge.py`)
-   - 👍/👎 inline-кнопки под RAG-ответами → `rag_query_log.user_feedback`
-3. **P1** — full_rag_battery прогон после P0, сравнить с baseline 2026-04-17 (73% с 1С-evidence)
+2. ✅ **P0 — RAG quality улучшения** (закрыт 2026-04-20 + дополнен 2026-05-03):
+   - ✅ `top_*` analytics tools → net-выручка с Корректировками (2026-04-20)
+   - ✅ `sales_summary` / `purchase_summary` — добавлен ИТОГО (34.37M без НДС) как первый result (2026-05-03)
+   - ✅ `bank_balance` — новый analytics_type, прямой запрос c1_bank_balances (643K точно) (2026-05-03)
+   - ✅ Email search — entity-aware ILIKE + порог 0.42 (2026-05-03 dcf2ff6)
+   - ✅ TG vector search — убран фильтр target_tables из HNSW (Q16 силикагель 0→16 ev) (2026-05-03)
+   - ✅ Дедупликация `km_facts` по embedding-similarity (в `review_knowledge.py`) (2026-04-20)
+   - ✅ 👍/👎 inline-кнопки под RAG-ответами → `rag_query_log.user_feedback` (2026-04-20)
+3. **P1** — full_rag_battery прогон (30 вопросов) для оценки прогресса vs baseline 20.04 (63%, latency 52.8s)
 4. **P2 backlog (отложено):**
    - Бот в Element X (Matrix-транспорт `/search`, `/analysis`)
    - Latency optimization (64s avg → цель ≤45s для Tier 3)
