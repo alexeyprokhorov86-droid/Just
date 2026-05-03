@@ -75,10 +75,28 @@ def get_db_connection():
 
 
 def clean_keywords(query: str) -> list:
-    """Очищает ключевые слова от пунктуации."""
+    """Очищает ключевые слова от пунктуации. Нормализует ё→е (ILIKE не уравнивает их)."""
     clean_query = re.sub(r'[,.:;!?()"\']', ' ', query)
-    keywords = [w.strip() for w in clean_query.split() if len(w.strip()) > 2]
-    return keywords if keywords else [query]
+    keywords = [w.strip().replace('ё', 'е').replace('Ё', 'Е') for w in clean_query.split() if len(w.strip()) > 2]
+    return keywords if keywords else [query.replace('ё', 'е').replace('Ё', 'Е')]
+
+
+# Алиасы торговых названий клиентов → фрагменты юр.наименований в mart_sales
+CLIENT_ALIASES: dict[str, str] = {
+    "магнит": "тандер",
+    "пятёрочка": "агроторг",
+    "пятерочка": "агроторг",
+    "пятёрка": "агроторг",
+    "пятерка": "агроторг",
+    "озон": "интернет решения",
+    "ozon": "ozon",
+    "икея": "ikea",
+    "лента": "лента",          # уже совпадает, оставим для полноты
+}
+
+def _resolve_client_name(name: str) -> str:
+    """Переводит торговое название клиента в фрагмент юридического имени для ILIKE."""
+    return CLIENT_ALIASES.get(name.lower(), name)
 
 
 SEARCH_STOP_WORDS = {
@@ -1973,13 +1991,14 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                     if entities and entities.get("clients"):
                         client_filters = []
                         for client in entities["clients"]:
+                            resolved = _resolve_client_name(client)
                             client_filters.append("client_name ILIKE %s")
-                            params.append(f"%{client}%")
+                            params.append(f"%{resolved}%")
                         q += " AND (" + " OR ".join(client_filters) + ")"
                     q += " GROUP BY client_name ORDER BY revenue DESC LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
-                    
+
                     for row in cur.fetchall():
                         revenue = f"{row[2]:,.0f}" if row[2] else "0"
                         period = ""
@@ -2307,8 +2326,9 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                         if pr and pr.lower() not in " ".join(kw_set).lower():
                             q += " AND ms.nomenclature_name ILIKE %s"; params.append(f"%{pr}%")
                     for cl in (entities or {}).get("clients", [])[:3]:
+                        resolved_cl = _resolve_client_name(cl)
                         q += " AND (ms.client_name ILIKE %s OR ms.consignee_name ILIKE %s)"
-                        params.append(f"%{cl}%"); params.append(f"%{cl}%")
+                        params.append(f"%{resolved_cl}%"); params.append(f"%{resolved_cl}%")
                     q += " GROUP BY ms.nomenclature_name ORDER BY rub DESC NULLS LAST LIMIT %s"
                     params.append(limit)
                     cur.execute(q, params)
@@ -3533,9 +3553,18 @@ A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_typ
 Q: "Остатки упаковки по складу УПАКОВКИ"
 A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"stock_balance","keywords":"упаковк"}}],"entities":{{"products":["упаковка"],"warehouses":["УПАКОВКИ"]}}}}
 
+Q: "Сколько упаковочной плёнки на складе УПАКОВКИ СКЛАД?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"stock_balance","keywords":"пленка"}}],"entities":{{"products":["плёнка"],"warehouses":["УПАКОВКИ"]}}}}
+
 # С конкретным клиентом или поставщиком
 Q: "Что мы продали клиенту Дикси за 4 квартал 2025?"
 A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"sales_by_nomenclature","keywords":""}}],"entities":{{"clients":["Дикси"]}},"period":"q4_2025"}}
+
+Q: "Что продали Магниту в марте 2026?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"sales_by_nomenclature","keywords":""}}],"entities":{{"clients":["Магнит"]}},"period":"march"}}
+
+Q: "Продажи Пятёрочке за первый квартал 2026"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"sales_by_nomenclature","keywords":""}}],"entities":{{"clients":["Пятерочка"]}},"period":"q1_2026"}}
 
 Q: "Что купили у ИП Кутабаевой в марте?"
 A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"purchases_by_nomenclature","keywords":""}}],"entities":{{"suppliers":["Кутабаева"]}},"period":"march"}}
@@ -3623,6 +3652,8 @@ A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_typ
 - Если "остатки"/"остаток"/"запас" → stock_balance
 - Если "топ N"/"лучшие"/"самые" → top_*
 - Если есть название клиента (ИП, ООО, название сети) → entities.clients + sales_*
+  АЛИАСЫ клиентов (пиши торговое название в entities, система сама переведёт):
+  Магнит = Тандер, Пятёрочка/Пятёрка = Агроторг, Озон = Интернет Решения
 - Если есть название поставщика → entities.suppliers + purchases_*
 - Если есть название склада → entities.warehouses + stock_balance
 - Если "когда впервые"/"первое упоминание"/"когда началось"/"с каких пор"/"самое раннее" →
