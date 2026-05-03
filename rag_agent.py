@@ -1188,9 +1188,10 @@ def search_telegram_chats_vector(query: str, limit: int = 30, time_context: dict
                       AND sc.embedding_v2 IS NOT NULL
                 """
                 params: list = [emb_list]
-                if target_tables:
-                    q += " AND sd.channel_ref = ANY(%s)"
-                    params.append(target_tables)
+                # Намеренно НЕ фильтруем по target_tables в векторном поиске:
+                # HNSW возвращает ограниченное число кандидатов, при фильтре по
+                # одному чату практически все они отсеиваются → 0 результатов.
+                # SQL-поиск остаётся точным по target_tables.
                 if date_from:
                     q += " AND sd.doc_date >= %s"
                     params.append(date_from)
