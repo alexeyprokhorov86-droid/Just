@@ -4049,56 +4049,53 @@ async def process_rag_query(question, chat_context="", user_info: dict = None,
     web_results = ""
     web_citations = []
     
-    # === Шаг 2: Выполняем шаги плана ===
-    for step in plan.get("steps", []):
-        source = step.get("source", "")
-        step_keywords = step.get("keywords", keywords)
-        analytics_type = step.get("analytics_type")
-        
-        if source == "1С_ANALYTICS" and analytics_type:
-            results = search_1c_analytics(
-                analytics_type=analytics_type,
-                keywords=step_keywords,
-                period_date=period_date,
-                period_end=period_end,
-                entities=entities,
-                limit=20
+    # === Шаг 2: Выполняем шаги плана (параллельно через asyncio.gather) ===
+    def _run_step(step):
+        src = step.get("source", "")
+        kw = step.get("keywords", keywords)
+        atype = step.get("analytics_type")
+        if src == "1С_ANALYTICS" and atype:
+            r = search_1c_analytics(
+                analytics_type=atype, keywords=kw,
+                period_date=period_date, period_end=period_end,
+                entities=entities, limit=20
             )
-            db_results.extend(results)
-            logger.info(f"Step [{source}/{analytics_type}]: {len(results)} результатов")
-        
-        elif source == "1С_SEARCH":
-            results = search_1c_data(
-                query=step_keywords,
-                limit=30,
-                period_date=period_date,
-                period_end=period_end,
+            logger.info(f"Step [{src}/{atype}]: {len(r)} результатов")
+            return r
+        elif src == "1С_SEARCH":
+            r = search_1c_data(
+                query=kw, limit=30,
+                period_date=period_date, period_end=period_end,
                 entities=entities
             )
-            db_results.extend(results)
-            logger.info(f"Step [{source}]: {len(results)} результатов")
-        
-        elif source == "CHATS":
-            # Используем target_chats из Router
-            results = search_telegram_chats(
-                step_keywords, limit=30, time_context=time_context,
+            logger.info(f"Step [{src}]: {len(r)} результатов")
+            return r
+        elif src == "CHATS":
+            r = search_telegram_chats(
+                kw, limit=30, time_context=time_context,
                 target_tables=target_chats if target_chats else None
             )
-            db_results.extend(results)
-            logger.info(f"Step [{source}]: {len(results)} результатов (target={len(target_chats)} чатов)")
-        
-        elif source == "EMAIL":
-            results = search_emails(step_keywords, limit=30, time_context=time_context)
-            db_results.extend(results)
-            logger.info(f"Step [{source}]: {len(results)} результатов")
-        
-        elif source == "KNOWLEDGE":
+            logger.info(f"Step [{src}]: {len(r)} результатов (target={len(target_chats)} чатов)")
+            return r
+        elif src == "EMAIL":
+            r = search_emails(kw, limit=30, time_context=time_context)
+            logger.info(f"Step [{src}]: {len(r)} результатов")
+            return r
+        elif src == "KNOWLEDGE":
             if os.getenv("USE_EMBEDDING_V2", "false").lower() == "true":
-                results = search_unified(step_keywords, limit=30)
+                r = search_unified(kw, limit=30)
             else:
-                results = search_knowledge(step_keywords, limit=30)
-            db_results.extend(results)
-            logger.info(f"Step [{source}]: {len(results)} результатов")
+                r = search_knowledge(kw, limit=30)
+            logger.info(f"Step [{src}]: {len(r)} результатов")
+            return r
+        return []
+
+    steps = plan.get("steps", [])
+    step_results_list = await asyncio.gather(
+        *[asyncio.to_thread(_run_step, s) for s in steps]
+    )
+    for r in step_results_list:
+        db_results.extend(r)
     
     executed_sources = [step.get("source") for step in plan.get("steps", [])]
     db_results = deduplicate_results(db_results)
@@ -4150,9 +4147,14 @@ async def process_rag_query(question, chat_context="", user_info: dict = None,
         logger.info(f"Intent fallback done: total={len(db_results)} chat_hits={sum(1 for r in db_results if _source_bucket(r) == 'chat')}")
     
     # === Шаг 3: Evaluator — проверяем достаточность (макс 1 итерация) ===
-    for retry_num in range(1):
+    # Для analytics/search запросов данные из 1С детерминированы — пропускаем LLM-оценку.
+    _query_type = plan.get("query_type", "")
+    if _query_type in ("analytics", "search"):
+        evaluation = {"sufficient": True, "missing": "", "retry_keywords": "", "retry_chats": []}
+        logger.info("Evaluator: skipped for analytics/search query")
+    for retry_num in range(1 if _query_type not in ("analytics", "search") else 0):
         evaluation = evaluate_results(question, db_results, plan)
-        
+
         if evaluation.get("sufficient", True):
             logger.info(f"Evaluator: данные достаточны (итерация {retry_num})")
             break
@@ -4198,7 +4200,8 @@ async def process_rag_query(question, chat_context="", user_info: dict = None,
     logger.info(f"Итого после ReAct: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
 
     # === Шаг 4: Reranking ===
-    if len(db_results) > 12:
+    # Для analytics/search: данные из 1С уже отсортированы DB — LLM-ранжирование излишне.
+    if len(db_results) > 12 and _query_type not in ("analytics", "search"):
         db_results = rerank_results(question, db_results, top_k=24)
 
     db_results = apply_relevance_filters(deduplicate_results(db_results))
