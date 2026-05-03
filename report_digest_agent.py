@@ -161,7 +161,7 @@ def parse_review_issues(report: str) -> list[dict]:
     if m_rejected and m_total:
         rejected = int(m_rejected.group(1))
         total = int(m_total.group(1))
-        if total > 0 and rejected / total > 0.3:
+        if total >= 5 and rejected / total > 0.3:
             issues.append({
                 "source": "review_knowledge",
                 "type": "high_rejection_rate",
