@@ -4199,10 +4199,15 @@ async def process_rag_query(question, chat_context="", user_info: dict = None,
 
     logger.info(f"Итого после ReAct: {len(db_results)} результатов за {time.time() - start_time:.1f}с")
 
-    # === Шаг 4: Reranking ===
-    # Для analytics/search: данные из 1С уже отсортированы DB — LLM-ранжирование излишне.
+    # === Шаг 4: Reranking (Qwen3-Reranker-0.6B) ===
+    # Для analytics/search: данные из 1С уже отсортированы DB — реранк излишен.
     if len(db_results) > 12 and _query_type not in ("analytics", "search"):
-        db_results = rerank_results(question, db_results, top_k=24)
+        try:
+            from chunkers.reranker import rerank as qwen_rerank
+            db_results = qwen_rerank(question, db_results[:60], text_key="content", top_k=24)
+        except Exception as e:
+            logger.warning(f"Qwen3 rerank failed, falling back to LLM rerank: {e}")
+            db_results = rerank_results(question, db_results, top_k=24)
 
     db_results = apply_relevance_filters(deduplicate_results(db_results))
     db_results = apply_recent_intent_boost(db_results, question, time_context=time_context)
