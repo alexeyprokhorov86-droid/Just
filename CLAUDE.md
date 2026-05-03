@@ -232,15 +232,16 @@ git add -A && git commit -m "описание" && git push
    - ✅ TG vector search — убран фильтр target_tables из HNSW (Q16 силикагель 0→16 ev) (2026-05-03)
    - ✅ Дедупликация `km_facts` по embedding-similarity (в `review_knowledge.py`) (2026-04-20)
    - ✅ 👍/👎 inline-кнопки под RAG-ответами → `rag_query_log.user_feedback` (2026-04-20)
-3. **P1** — full_rag_battery прогон (30 вопросов) для оценки прогресса vs baseline 20.04 (63%, latency 52.8s)
-4. **P2 backlog (отложено):**
+3. ✅ **P1** — full_rag_battery 30 вопросов (2026-05-03): **76.7% has_1c_evidence** (+13.7pp vs 63% baseline 20.04), **28.3s avg latency** (−46% vs 52.8s). Слабые кейсы: Q8/Q10 (остатки — Router берёт source_chunks вместо stock_balance).
+4. **P1.5 (следующий)** — stock_balance роутинг: добавить few-shot в Router для запросов об остатках сырья/упаковки (сейчас идут в KNOWLEDGE вместо 1С_ANALYTICS/stock_balance).
+5. **P2 backlog (отложено):**
    - Бот в Element X (Matrix-транспорт `/search`, `/analysis`)
-   - Latency optimization (64s avg → цель ≤45s для Tier 3)
+   - Latency optimization (уже 28.3s — цель ≤20s для Tier 3)
 
 ### Прочее:
-5. ✅ **TASK_rules_manage** — /rules_find и /rules_off через tools/km_rules (2026-04-21).
-6. Хвосты: iOS ссылка в /element, --invite-rooms прогнать, sync_bank_balances проверить
-7. `v_plan_fact_weekly` в synthesize_1c_facts.py — починить 5-vs-6 колонок
+6. ✅ **TASK_rules_manage** — /rules_find и /rules_off через tools/km_rules (2026-04-21).
+7. Хвосты: iOS ссылка в /element, --invite-rooms прогнать, sync_bank_balances проверить
+8. ~~`v_plan_fact_weekly` в synthesize_1c_facts.py — починить 5-vs-6 колонок~~ — не баг, SELECT явно именует 5 колонок, распаковка корректна.
 
 ### Tool Registry — следующие волны (после 2026-04-21 шага 1):
 - **Волна 2** — approval workflow + review_knowledge: /rules_pending, rule_approve/rule_reject (bot.py:3365-3474), apply_verdicts/apply_new_rules из review_knowledge.py. Завершает домен `km_rules`.
