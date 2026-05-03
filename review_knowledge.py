@@ -56,7 +56,7 @@ def get_conn():
 
 
 def call_llm(messages, model="openai/gpt-4.1", temperature=0.1):
-    """Вызов LLM через RouterAI."""
+    """Вызов LLM через RouterAI с retry/backoff для 429/5xx/402."""
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {ROUTER_AI_KEY}'
@@ -67,14 +67,36 @@ def call_llm(messages, model="openai/gpt-4.1", temperature=0.1):
         'temperature': temperature,
         'max_tokens': 4000
     }
-    resp = requests.post(
-        f'{ROUTER_AI_URL}/chat/completions',
-        headers=headers,
-        json=payload,
-        timeout=120
-    )
-    resp.raise_for_status()
-    return resp.json()['choices'][0]['message']['content']
+    last_exc = None
+    for attempt in range(4):
+        try:
+            resp = requests.post(
+                f'{ROUTER_AI_URL}/chat/completions',
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+            if resp.status_code == 429 or resp.status_code >= 500:
+                wait = 2 ** attempt  # 1, 2, 4, 8s
+                logger.warning(f"RouterAI {resp.status_code}, retry {attempt+1} in {wait}s")
+                time.sleep(wait)
+                last_exc = f"HTTP {resp.status_code}"
+                continue
+            if resp.status_code == 402:
+                if attempt == 0:
+                    logger.warning("RouterAI 402 Payment Required, retry in 30s")
+                    time.sleep(30)
+                    last_exc = "HTTP 402"
+                    continue
+                raise requests.HTTPError(f"402 Payment Required after retry", response=resp)
+            resp.raise_for_status()
+            return resp.json()['choices'][0]['message']['content']
+        except (requests.Timeout, requests.ConnectionError) as e:
+            wait = 2 ** attempt
+            logger.warning(f"RouterAI connection error attempt {attempt+1}: {e}, retry in {wait}s")
+            time.sleep(wait)
+            last_exc = e
+    raise requests.HTTPError(f"RouterAI failed after retries: {last_exc}")
 
 
 # ============================================================

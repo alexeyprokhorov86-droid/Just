@@ -110,7 +110,7 @@ async def run_one(q: str) -> dict:
         "elapsed_sec": round(elapsed, 1),
         "error": error,
         "answer_length": len(answer),
-        "has_1c_evidence": has_1c_evidence(body),
+        "has_1c_evidence": has_1c_evidence(answer),
         "citations_count": count_citations(body),
         "first_line": first_line,
     }
