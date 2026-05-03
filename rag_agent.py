@@ -3393,6 +3393,11 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
 7) Если в evidence есть цифра-ответ и ед.изм. — сформулируй по-человечески:
    "Купили 10 тонн муки на 255 тыс ₽ — один раз, 15 февраля" лучше чем
    "Было закуплено 10000 ед. муки на 255000 руб."
+8) ПРИОРИТЕТ ИСТОЧНИКОВ: если в evidence есть источники «1С:...» — для количественных
+   тезисов (суммы, объёмы, остатки, штуки, рубли) ссылайся ТОЛЬКО на них [n].
+   Письма и чаты уместны только для причин, договорённостей, контекста — но НЕ как
+   подтверждение цифр когда есть 1С-данные. Если 1С-источник есть в списке, а ты
+   цитируешь вместо него переписку — это ошибка.
 
 ФОРМАТ ОТВЕТА:
 - Краткий ответ (1-2 предложения, по-человечески, с главной цифрой/фактом и ссылкой [n])
@@ -3416,7 +3421,10 @@ def generate_response(question, db_results, web_results, web_citations=None, cha
         # Post-answer evaluator → escalation
         quality = evaluate_answer_quality(question, response_text, evidence_items)
         meta["evaluator"] = quality
-        if not quality.get("good", True):
+        # Skip escalation when evidence is thin: Opus can't conjure data that doesn't exist
+        _has_1c_ev = any((i.get("source", "") or "").startswith("1С") for i in evidence_items)
+        _escalate_ok = len(evidence_items) >= 3 or _has_1c_ev
+        if not quality.get("good", True) and _escalate_ok:
             issues = quality.get("issues") or [quality.get("reasoning", "")]
             logger.info(f"Escalation: answer weak ({issues[:2]}), retry with Claude Opus 4.7")
             escalate_prompt = (
