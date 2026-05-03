@@ -2035,6 +2035,81 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                 except Exception as e:
                     logger.debug(f"Ошибка аналитики товаров: {e}")
             
+            if analytics_type == "sales_summary":
+                try:
+                    q = """
+                        SELECT SUM(sum_without_vat) as total_no_vat,
+                               SUM(sum_with_vat) as total_with_vat,
+                               SUM(quantity) as total_qty,
+                               COUNT(DISTINCT doc_number) as docs_count,
+                               COUNT(DISTINCT client_name) as clients_count,
+                               MIN(doc_date) as date_from,
+                               MAX(doc_date) as date_to
+                        FROM mart_sales
+                        WHERE 1=1
+                    """
+                    params = []
+                    if period_date:
+                        q += " AND doc_date >= %s"; params.append(period_date)
+                    if period_end:
+                        q += " AND doc_date <= %s"; params.append(period_end)
+                    cur.execute(q, params)
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        no_vat = f"{row[0]:,.0f}"
+                        with_vat = f"{row[1]:,.0f}"
+                        period_str = ""
+                        if row[5] and row[6]:
+                            period_str = f" за {row[5].strftime('%d.%m.%Y')}–{row[6].strftime('%d.%m.%Y')}"
+                        results.insert(0, {
+                            "source": "1С: ИТОГИ ПРОДАЖ",
+                            "date": row[6].strftime("%d.%m.%Y") if row[6] else "",
+                            "content": (
+                                f"ИТОГО продаж{period_str}: {no_vat} руб. без НДС "
+                                f"({with_vat} руб. с НДС), "
+                                f"отгрузок: {row[2]:.0f} шт., документов: {row[3]}, "
+                                f"клиентов: {row[4]}"
+                            ),
+                            "type": "analytics_sales_total"
+                        })
+                except Exception as e:
+                    logger.debug(f"Ошибка итогов продаж: {e}")
+
+            if analytics_type == "purchase_summary":
+                try:
+                    q = """
+                        SELECT SUM(sum_total) as total,
+                               COUNT(*) as positions,
+                               COUNT(DISTINCT contractor_name) as suppliers_count,
+                               MIN(doc_date) as date_from,
+                               MAX(doc_date) as date_to
+                        FROM mart_purchases
+                        WHERE 1=1
+                    """
+                    params = []
+                    if period_date:
+                        q += " AND doc_date >= %s"; params.append(period_date)
+                    if period_end:
+                        q += " AND doc_date <= %s"; params.append(period_end)
+                    cur.execute(q, params)
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        total_str = f"{row[0]:,.0f}"
+                        period_str = ""
+                        if row[3] and row[4]:
+                            period_str = f" за {row[3].strftime('%d.%m.%Y')}–{row[4].strftime('%d.%m.%Y')}"
+                        results.insert(0, {
+                            "source": "1С: ИТОГИ ЗАКУПОК",
+                            "date": row[4].strftime("%d.%m.%Y") if row[4] else "",
+                            "content": (
+                                f"ИТОГО закупок{period_str}: {total_str} руб., "
+                                f"{row[1]} позиций, поставщиков: {row[2]}"
+                            ),
+                            "type": "analytics_purchases_total"
+                        })
+                except Exception as e:
+                    logger.debug(f"Ошибка итогов закупок: {e}")
+
             if analytics_type in ("top_suppliers", "purchase_summary"):
                 try:
                     q = """
@@ -2106,6 +2181,54 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                         })
                 except Exception as e:
                     logger.debug(f"Ошибка аналитики производства: {e}")
+
+            if analytics_type == "bank_balance":
+                try:
+                    # Берём ближайшую дату ≤ period_end (или самую свежую доступную)
+                    target_date = period_end or period_date
+                    if target_date:
+                        cur.execute("""
+                            SELECT bb.period, ba.bank_name, ba.org_name,
+                                   bb.opening_balance, bb.closing_balance
+                            FROM c1_bank_balances bb
+                            JOIN c1_bank_accounts ba ON ba.ref_key::text = bb.bank_account_key::text
+                            WHERE bb.period <= %s
+                            ORDER BY bb.period DESC, bb.closing_balance DESC
+                            LIMIT 9
+                        """, [target_date])
+                    else:
+                        cur.execute("""
+                            SELECT bb.period, ba.bank_name, ba.org_name,
+                                   bb.opening_balance, bb.closing_balance
+                            FROM c1_bank_balances bb
+                            JOIN c1_bank_accounts ba ON ba.ref_key::text = bb.bank_account_key::text
+                            ORDER BY bb.period DESC, bb.closing_balance DESC
+                            LIMIT 9
+                        """)
+                    rows = cur.fetchall()
+                    if rows:
+                        # Группируем по дате (берём самую свежую)
+                        latest_date = rows[0][0]
+                        total = sum(r[4] for r in rows if r[0] == latest_date and r[4])
+                        total_str = f"{total:,.2f}"
+                        date_str = latest_date.strftime("%d.%m.%Y") if latest_date else ""
+                        results.insert(0, {
+                            "source": "1С: БАНКОВСКИЕ ОСТАТКИ",
+                            "date": date_str,
+                            "content": f"Общий остаток по банковским счетам на {date_str}: {total_str} руб.",
+                            "type": "analytics_bank_balance"
+                        })
+                        for row in rows:
+                            if row[0] == latest_date:
+                                bal = f"{row[4]:,.2f}" if row[4] else "0.00"
+                                results.append({
+                                    "source": "1С: БАНКОВСКИЕ ОСТАТКИ",
+                                    "date": row[0].strftime("%d.%m.%Y") if row[0] else "",
+                                    "content": f"{row[2]} / {row[1]}: остаток {bal} руб.",
+                                    "type": "analytics_bank_balance"
+                                })
+                except Exception as e:
+                    logger.debug(f"Ошибка банковских остатков: {e}")
 
             # ---------- Новые SQL-tools (keyword-driven) ----------
 
@@ -3351,16 +3474,17 @@ def route_query(question, chat_context=""):
 - KNOWLEDGE: база знаний компании (факты, решения, задачи, политики). Для вопросов про правила, процессы, решения, кто за что отвечает, что было решено/сделано.
 
 ТИПЫ АНАЛИТИКИ (analytics_type для 1С_ANALYTICS):
-- top_clients / sales_summary — топ клиентов по выручке за период
+- top_clients / sales_summary — топ клиентов по выручке за период + итоговая сумма
 - top_products — топ продукции по выручке
-- top_suppliers / purchase_summary — топ поставщиков по суммам
+- top_suppliers / purchase_summary — топ поставщиков по суммам + итоговая сумма закупок
 - production_summary — сводка производства (без фильтра)
 - purchases_by_nomenclature — СКОЛЬКО куплено номенклатуры X за период (mart_purchases; keyword фильтр по названию номенклатуры). Для "сколько муки/сахара/упаковки купили в феврале".
 - sales_by_nomenclature — СКОЛЬКО/ВЫРУЧКА по номенклатуре X за период (mart_sales). Для "сколько Медовика продали в марте", "выручка от продаж Медовика 500г за 2026", "объём продаж Птички за квартал".
 - stock_balance — текущие ОСТАТКИ номенклатуры X на складах. Для "остатки муки", "сколько сахара на складе".
 - production_by_nomenclature — СКОЛЬКО произведено номенклатуры X за период (mart_production). Для "сколько тортов Медовик произвели в феврале".
 - plan_vs_fact — недельный план/факт (v_plan_fact_weekly). Для "план/факт за март", "выполнение плана".
-- custom_sql — универсальный text-to-SQL через Claude Opus 4.7 (дорого, медленно). Использовать ТОЛЬКО когда никакой из *_by_nomenclature/top_*/stock_balance/plan_vs_fact не подходит. Типичные кейсы: "средний чек клиента X", "динамика продаж помесячно за год", "маржинальность SKU", "сравнение двух периодов", "расход vs закупки по категориям", агрегаты по 2+ сущностям одновременно. В keywords клади полную формулировку вопроса на русском (не ключевые слова).
+- bank_balance — остатки по банковским счетам (c1_bank_balances). Для "сколько денег на счетах", "остаток на Т-Банке", "остаток на 28 апреля". period = дата на которую нужен остаток.
+- custom_sql — универсальный text-to-SQL через Claude Opus 4.7 (дорого, медленно). Использовать ТОЛЬКО когда никакой из *_by_nomenclature/top_*/stock_balance/plan_vs_fact/bank_balance не подходит. Типичные кейсы: "средний чек клиента X", "динамика продаж помесячно за год", "маржинальность SKU", "сравнение двух периодов", "расход vs закупки по категориям", агрегаты по 2+ сущностям одновременно. В keywords клади полную формулировку вопроса на русском (не ключевые слова).
 
 ВАЖНО: если в вопросе есть конкретное название товара/сырья И слова количества/суммы/остатка — используй *_by_nomenclature или stock_balance с keywords = название номенклатуры.
 
@@ -3419,6 +3543,16 @@ A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_typ
 # План-факт
 Q: "Выполнение плана за март"
 A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"plan_vs_fact","keywords":""}}],"period":"march"}}
+
+# Банковские остатки
+Q: "Каков остаток по банковским счетам?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"bank_balance","keywords":""}}]}}
+
+Q: "Сколько денег на счетах на 28 апреля 2026?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"bank_balance","keywords":""}}],"period":"2026-04-28"}}
+
+Q: "Остаток на Т-Банке сегодня"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"bank_balance","keywords":""}}],"period":"today"}}
 
 # Кастомный SQL (когда стандартные tools не подходят)
 Q: "Средний чек продаж клиенту Магнит за 2 квартал 2025?"
