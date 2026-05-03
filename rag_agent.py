@@ -2456,7 +2456,7 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                 try:
                     q = """
                         SELECT "Неделя", "Заказы (план)", "Ордера (факт)",
-                               "Передачи ФМ", "Отклонение", "Выполнение %"
+                               "Передачи ФМ", "Отклонение", "Выполнение %%"
                         FROM v_plan_fact_weekly
                         WHERE 1=1
                     """
@@ -2485,7 +2485,7 @@ def search_1c_analytics(analytics_type, keywords="", period_date=None,
                             "type": "analytics_plan_vs_fact",
                         })
                 except Exception as e:
-                    logger.debug(f"plan_vs_fact: {e}")
+                    logger.warning(f"plan_vs_fact: {e}")
 
     finally:
         conn.close()
