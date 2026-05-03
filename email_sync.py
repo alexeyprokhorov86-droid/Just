@@ -33,7 +33,6 @@ import psycopg2
 from psycopg2 import sql
 import requests
 import json
-from embedding_service_e5 import index_email_chunk
 from email_text_processing import build_email_chunks
 
 try:
@@ -1266,19 +1265,6 @@ def process_email(cur, parsed: ParsedEmail, mailbox_id: int, folder: str, direct
         # Коммитим email перед индексацией, чтобы избежать сирот-embeddings
         cur.connection.commit()
 
-        # Индексируем для векторного поиска
-        chunks = build_email_chunks(
-            subject=parsed.subject,
-            body_text=parsed.body_text,
-            body_html=parsed.body_html
-        )
-
-        for idx, chunk in enumerate(chunks):
-            try:
-                index_email_chunk(email_id=email_id, chunk_index=idx, content=chunk)
-            except Exception as e:
-                logger.warning(f"Email chunk indexing failed for email_id={email_id}, chunk={idx}: {e}")
-        logger.debug(f"Indexed email {email_id} into {len(chunks)} chunks")
     
     # Обновляем статистику ветки
     update_thread_stats(cur, thread_id, parsed)

@@ -723,7 +723,7 @@ def _group_messages(messages: list, window_minutes: int = 3) -> list:
     return groups
 
 def search_knowledge(query: str, limit: int = 30) -> list:
-    """Поиск по базе знаний: km_facts, km_decisions, km_tasks, km_policies (Qwen3 embedding_v2)."""
+    """Поиск по базе знаний: km_facts, km_decisions, km_tasks, km_policies, km_procedures, km_cases (Qwen3 embedding_v2)."""
     from chunkers.embedder import embed_query_v2
     query_vec = embed_query_v2(query)
     if query_vec is None:
@@ -739,7 +739,9 @@ def search_knowledge(query: str, limit: int = 30) -> list:
         ("km_facts",     "fact_text",     "fact_type",  True),
         ("km_decisions", "decision_text", "scope_type", False),
         ("km_tasks",     "task_text",     "status",     True),
-        ("km_policies",  "policy_text",   "scope_type", True),
+        ("km_policies",    "policy_text",   "scope_type",    True),
+        ("km_procedures",  "procedure_text", "process_type", False),
+        ("km_cases",       "problem_text || ' → ' || COALESCE(resolution_text, '')", "outcome", False),
     ]
     per_table = max(limit // len(tables), 5)
 
@@ -788,7 +790,7 @@ def search_source_chunks(query: str, limit: int = 30, min_similarity: float = 0.
     """
     Поиск по source_chunks через Qwen3 embedding_v2 (HNSW индекс).
 
-    В отличие от search_knowledge (km_*, дистиллированные факты на e5), эта
+    В отличие от search_knowledge (km_*, дистиллированные факты Qwen3), эта
     функция возвращает сырые документные чанки: telegram-сообщения, email,
     matrix-события, 1С-документы. Формат результатов совместим с
     search_knowledge для объединения в общий RAG pipeline.
@@ -866,10 +868,10 @@ def search_source_chunks(query: str, limit: int = 30, min_similarity: float = 0.
 
 def search_unified(query: str, limit: int = 30) -> list:
     """
-    Гибридный поиск: km_* (legacy e5) + source_chunks (Qwen3) + dedup + opt rerank.
+    Гибридный поиск: km_* (Qwen3) + source_chunks (Qwen3) + dedup + opt rerank.
 
     Логика:
-    1) Параллельно search_knowledge (km_facts/decisions/tasks/policies через e5)
+    1) Параллельно search_knowledge (km_* через Qwen3 embedding_v2)
        и search_source_chunks (source_chunks.embedding_v2 через Qwen3 HNSW).
     2) Дедуп по первым 200 символам content (режет повторы между km_* и
        source_chunks:km_* — дистиллированные факты часто дублируются).

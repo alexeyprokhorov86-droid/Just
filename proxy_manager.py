@@ -16,6 +16,7 @@ proxy_manager.py — Proxy health checker & failover manager.
 import subprocess
 import time
 import logging
+import re
 import sys
 import json
 from pathlib import Path
@@ -45,6 +46,11 @@ ACTIVE_PROXY_FILE = Path("/tmp/active_proxy.json")
 BOT_SERVICE = "telegram-logger"
 STATUS_FILE = Path("/tmp/proxy_status.json")
 RESTART_COOLDOWN = 120       # минимум секунд между рестартами бота
+PRIVOXY_CONFIG = Path("/etc/privoxy/config")
+PRIVOXY_FORWARD_RE = re.compile(
+    r"^forward-socks5\s+/\s+127\.0\.0\.1:(\d+)\s+\.\s*$",
+    re.MULTILINE,
+)
 
 # ─── Логирование ────────────────────────────────────────────
 
@@ -145,6 +151,63 @@ def restart_bot():
         log.error(f"Exception restarting {BOT_SERVICE}: {e}")
 
 
+def update_privoxy_forward(port: int) -> None:
+    """
+    Перенаправляет Privoxy на активный SOCKS5-порт (1080 / 1081).
+    Без этого Privoxy всегда форвардит на 1080 → при failover на Helsinki
+    HTTP-клиенты через 127.0.0.1:8118 перестают работать.
+    """
+    try:
+        cfg = PRIVOXY_CONFIG.read_text()
+    except Exception as e:
+        log.error(f"privoxy: cannot read {PRIVOXY_CONFIG}: {e}")
+        return
+
+    m = PRIVOXY_FORWARD_RE.search(cfg)
+    if not m:
+        log.warning(f"privoxy: no forward-socks5 line in {PRIVOXY_CONFIG}")
+        return
+    current = int(m.group(1))
+    if current == port:
+        log.debug(f"privoxy: forward already 127.0.0.1:{port}")
+        return
+
+    new_cfg = PRIVOXY_FORWARD_RE.sub(
+        f"forward-socks5 / 127.0.0.1:{port} .", cfg, count=1
+    )
+    if f"127.0.0.1:{port}" not in new_cfg:
+        log.error("privoxy: regex substitution did not produce expected line")
+        return
+
+    try:
+        proc = subprocess.run(
+            ["sudo", "tee", str(PRIVOXY_CONFIG)],
+            input=new_cfg,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            log.error(f"privoxy: sudo tee failed: {proc.stderr}")
+            return
+        # Graceful reload: privoxy на SIGHUP перечитывает config (включая forward-socks5)
+        # без перезапуска процесса — активные TCP-соединения клиентов не рвутся.
+        # Проверено эмпирически 2026-04-29 на privoxy 3.0.33.
+        sighup = subprocess.run(
+            ["sudo", "systemctl", "kill", "-s", "HUP", "privoxy"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if sighup.returncode != 0:
+            log.error(f"privoxy: SIGHUP failed, falling back to restart: {sighup.stderr}")
+            subprocess.run(
+                ["sudo", "systemctl", "restart", "privoxy"],
+                capture_output=True, text=True, timeout=15,
+            )
+        log.info(f"privoxy: forward-socks5 → 127.0.0.1:{port} (was {current}), SIGHUP")
+    except Exception as e:
+        log.error(f"privoxy: failed to update: {e}")
+
+
 def try_restart_tunnel(proxy: dict):
     """Пытается перезапустить упавший SSH-туннель."""
     service = proxy["service"]
@@ -202,9 +265,12 @@ def main():
                 old_name = current.get("name", "none") if current else "none"
                 log.info(f"SWITCHING: {old_name} → {best_proxy['name']} ({best_proxy['url']})")
                 write_active_proxy(best_proxy)
+                update_privoxy_forward(best_proxy["port"])
                 restart_bot()
             else:
                 log.debug(f"Active proxy unchanged: {best_proxy['name']}")
+                # Идемпотентная синхронизация privoxy на случай ручного редактирования
+                update_privoxy_forward(best_proxy["port"])
 
             # Попробовать перезапустить мёртвые туннели (фоново)
             for proxy, status in zip(PROXIES, statuses):

@@ -524,7 +524,7 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
         proc_id = cur.fetchone()[0]
         try:
             emb = create_embedding(proc.get('text', ''))
-            cur.execute("UPDATE km_procedures SET embedding = %s WHERE id = %s", (str(emb), proc_id))
+            cur.execute("UPDATE km_procedures SET embedding_v2 = %s WHERE id = %s", (str(emb), proc_id))
         except Exception:
             pass
         stats['procedures'] = stats.get('procedures', 0) + 1
@@ -546,7 +546,7 @@ def save_extraction(cur, extracted, doc_ids, conn=None):
         try:
             case_text = f"{case.get('problem', '')} {case.get('resolution', '')}"
             emb = create_embedding(case_text)
-            cur.execute("UPDATE km_cases SET embedding = %s WHERE id = %s", (str(emb), case_id))
+            cur.execute("UPDATE km_cases SET embedding_v2 = %s WHERE id = %s", (str(emb), case_id))
         except Exception:
             pass
         stats['cases'] = stats.get('cases', 0) + 1

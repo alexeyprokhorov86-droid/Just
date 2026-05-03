@@ -66,6 +66,7 @@
 7. **Systemd сервисы**: `telegram-logger`, `email-sync`, `matrix-listener`, `auth-bom` — перезапуск через `sudo systemctl restart <service>`.
 8. **OData пагинация**: всегда `$orderby=Ref_Key asc`.
 9. **Тестирование**: перед деплоем проверять скрипты локально (`python3 script.py`).
+10. **izibo / vibebot — ОТДЕЛЬНЫЙ ПРОЕКТ**. Любые работы по @izibo_bot, конструктору ботов, wizard, discovery, compiler/runtime izibo делаются ТОЛЬКО в `~/vibebot/` (отдельный git repo, свой `CLAUDE.md`). НИКОГДА не править izibo-код в `~/telegram_logger_bot/`. ТЗ от Опуса по izibo (SPRINT*, WIZARD_*, RUNTIME_*, STOREFRONT_* и т.п.) кладутся в `.tmp_input/` этого репо как «приёмник», но имплементация — `cd ~/vibebot && ...`. Это правило 100% и не обсуждается.
 
 ## Ключевые таблицы БД
 
@@ -141,6 +142,38 @@ conn = psycopg2.connect(
 ```bash
 docker exec -it knowledge_db psql -U knowledge -d knowledge_base
 ```
+
+## Бэкапы БД (3-2-1+, настроено 2026-04-29)
+
+**Схема — 4 копии, 3 носителя, 3 offsite, 2 юрисдикции:**
+
+| Локация | Retention | Скрипт | Cron |
+|---|---|---|---|
+| VPS-локал `~/telegram_logger_bot/backups/` | 1 день (`BACKUP_DAYS_TO_KEEP=1`) | `backup.sh` (pg_dump → gzip) | `30 3 * * *` |
+| Cloud.ru S3 `s3://bucket-318efd/db_backups/` | 30 дней (`S3_BACKUP_RETENTION_DAYS=30`) | `backup_to_s3.py` (boto3 + sha256 verify + cleanup) | внутри backup.sh |
+| Amsterdam VPS `root@109.234.38.39:/root/db_backups/` | 5 дней (`REMOTE_BACKUP_RETENTION_DAYS=5`) | `backup_to_remote.py` (rsync -tW + size verify) | внутри backup.sh |
+| Helsinki VPS `root@77.42.83.103:/root/db_backups/` | 5 дней | тот же `backup_to_remote.py` | внутри backup.sh |
+
+**Verify (раз в неделю):**
+- `verify_backup.py` — суббота 7:00 — скачивает последний S3-объект, проверяет sha256/gzip integrity/SQL signature/CREATE TABLE+COPY signatures
+- `test_restore_remote.py` — воскресенье 5:00 МСК — ssh на Helsinki → docker `pgvector/pgvector:pg15` → реальный pg_restore последнего дампа → count check (`source_chunks ≥ 500k`, `km_facts ≥ 30k`, `source_documents ≥ 200k`, `c1_employees ≥ 1k`) → cleanup container
+
+**Правила:**
+- Дамп ~5 GB compressed / ~17 GB raw. На VPS 33 GB free → полный pg_restore локально невозможен, делаем на Helsinki (67 GB free, 3.7 GB RAM, Docker).
+- Перед предложением апгрейда диска/железа — проверь имеющиеся VPS (Amsterdam, Helsinki, любые другие платные ресурсы). Они часто простаивают и могут принять копии бесплатно.
+- Soft-fail на удалённых: если один VPS недоступен — другие копии всё равно создаются, TG-алерт. Pipeline не падает целиком из-за одного недоступного offsite.
+- Любое изменение `backup.sh` тестировать на существующем дампе (smoke-test через прямой вызов скрипта на готовом файле).
+
+**Ключи ssh:**
+- Amsterdam: `/home/admin/.ssh/amsterdam_proxy`
+- Helsinki: `/home/admin/.ssh/id_rsa`
+- Эти же ключи используются autossh в `proxy-tunnel-{amsterdam,helsinki}.service`.
+
+**При восстановлении из бэкапа** (если prod БД умерла):
+1. Скачать свежий дамп из любой из 4 локаций (приоритет: VPS-локал → S3 → Helsinki → Amsterdam).
+2. `gunzip -c backup_*.sql.gz | docker exec -i knowledge_db psql -U knowledge -d knowledge_base`
+3. Если pgvector отсутствует — `CREATE EXTENSION vector;` вручную.
+4. Перезапустить сервисы: `sudo systemctl restart telegram-logger email-sync matrix-listener auth-bom`.
 
 ## Деплой
 
