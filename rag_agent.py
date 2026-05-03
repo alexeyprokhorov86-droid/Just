@@ -5,6 +5,7 @@ ReAct архитектура: Smart Router → Поиск → Evaluator → (п�
 """
 
 import os
+import asyncio
 import pathlib
 from dotenv import load_dotenv
 from company_context import get_company_profile
@@ -4234,11 +4235,17 @@ async def process_rag_query(question, chat_context="", user_info: dict = None,
     answer_eval = gen_meta.get("evaluator") or {}
 
     # === Фиксация ответа в source_chunks (Фаза 4.1) ===
-    # Ранний retrieval на повторных вопросах — через Qwen3 HNSW.
-    try:
-        _fixate_answer_as_source_chunk(question, response, evidence_results, gen_meta)
-    except Exception as e:
-        logger.warning(f"fixate wrapper: {e}")
+    # Запускаем в фоне через to_thread — embed_document_v2 блокирует CPU
+    # и при конкурентной нагрузке (батарея) задерживал sendMessage на 2+ мин.
+    async def _fixate_bg():
+        try:
+            await asyncio.to_thread(
+                _fixate_answer_as_source_chunk, question, response, evidence_results, gen_meta
+            )
+        except Exception as e:
+            logger.warning(f"fixate wrapper: {e}")
+
+    asyncio.create_task(_fixate_bg())
 
     # === Логирование ===
     log_id = _log_rag_query({
