@@ -234,17 +234,17 @@ git add -A && git commit -m "описание" && git push
    - ✅ 👍/👎 inline-кнопки под RAG-ответами → `rag_query_log.user_feedback` (2026-04-20)
 3. ✅ **P1** — full_rag_battery 30 вопросов (2026-05-03): **76.7% has_1c_evidence** (+13.7pp vs 63% baseline 20.04), **28.3s avg latency** (−46% vs 52.8s). Слабые кейсы: Q8/Q10 (остатки — Router берёт source_chunks вместо stock_balance).
 4. **P1.5 (следующий)** — stock_balance роутинг: добавить few-shot в Router для запросов об остатках сырья/упаковки (сейчас идут в KNOWLEDGE вместо 1С_ANALYTICS/stock_balance).
-5. **P2 — Latency optimization** (in progress 2026-05-03):
-   - Baseline (2026-05-03 первый прогон): **28.3s avg** (после P0/P1 фиксов)
-   - Три оптимизации задеплоены (15fbeda): parallel search steps (asyncio.gather), skip evaluator для analytics/search, skip LLM reranker для analytics/search
-   - Qwen3-Reranker вместо gpt-4.1-mini на шаге 4 (fe9e903)
-   - Результат (2026-05-03 третий прогон): **25.5s avg / 80% 1C evidence** (+17pp vs baseline 63%, −52% latency). Analytics: 10-20s, non-analytics: 40-80s
+5. **P2 — RAG quality deep fixes** (2026-05-04):
+   - ✅ **plan_vs_fact 0 results** — `"Выполнение %"` в имени колонки: psycopg2 трактовал `%` как format char → list index out of range, глушилось logger.debug. Фикс: `%%` (2862b6f).
+   - ✅ **Answerer 1С priority** — добавлено правило 8 в промпт: при количественных вопросах цитировать 1С-источники, не переписку (9d4810a).
+   - ✅ **Escalation gate** — skip Opus когда evidence < 3 И нет 1С (данных нет, Opus не поможет, -30-60s на бесполезный вызов) (9d4810a).
+   - Latency (2026-05-03 третий прогон): **25.5s avg / 80% 1C evidence** (+17pp vs baseline 63%, −52% latency). Analytics: 10-20s, non-analytics: 40-80s.
    - Бот в Element X (Matrix-транспорт `/search`, `/analysis`) — отложено до Волны 3
 
 ### Прочее:
 6. ✅ **TASK_rules_manage** — /rules_find и /rules_off через tools/km_rules (2026-04-21).
 7. Хвосты: iOS ссылка в /element, --invite-rooms прогнать, sync_bank_balances проверить
-8. ~~`v_plan_fact_weekly` в synthesize_1c_facts.py — починить 5-vs-6 колонок~~ — не баг, SELECT явно именует 5 колонок, распаковка корректна.
+8. ~~`v_plan_fact_weekly` в synthesize_1c_facts.py — починить 5-vs-6 колонок~~ — было реальным багом: `"Выполнение %"` в SQL строке с params → psycopg2 list index out of range. Исправлено 2026-05-04.
 
 ### Tool Registry — следующие волны (после 2026-04-21 шага 1):
 - **Волна 2** — approval workflow + review_knowledge: /rules_pending, rule_approve/rule_reject (bot.py:3365-3474), apply_verdicts/apply_new_rules из review_knowledge.py. Завершает домен `km_rules`.
