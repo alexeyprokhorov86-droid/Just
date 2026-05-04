@@ -360,7 +360,17 @@ async def fix_tg_media(conn, items):
             logger.info(f"  [{source}] {item['table']} msg={item['message_id']} ({filename})")
             
             analysis, content = analyze_file(gpt_client, file_data, filename, item['media_type'])
-            
+
+            # Fallback 1: неподдерживаемый формат (.cdr, без расширения и т.п.) → помечаем
+            ext = ('.' + filename.rsplit('.', 1)[-1].lower()) if '.' in filename else ''
+            if not analysis and not content:
+                analysis = f'[формат не поддерживается{": " + ext if ext else ""}]'
+                content = analysis
+
+            # Fallback 2: изображение — OCR пустой, но LLM-описание есть → используем как content
+            if analysis and not content:
+                content = analysis
+
             updates = []
             params = []
             if analysis and not item['has_analysis']:
