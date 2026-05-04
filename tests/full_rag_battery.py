@@ -77,7 +77,8 @@ QUESTIONS = [
 
 
 def has_1c_evidence(text: str) -> bool:
-    return bool(re.search(r"1С:\s|1С\s*:", text))
+    # "1С:" citation, "по данным 1С", "из 1С", "analytics_" type markers
+    return bool(re.search(r"1С[:\s]|по данным 1С|из 1С|данные 1С|analytics_", text))
 
 
 def count_citations(text: str) -> int:
