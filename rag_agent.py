@@ -3600,6 +3600,12 @@ A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_typ
 Q: "Какие SKU выросли в продажах больше всего между январём и мартом 2026?"
 A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Какие SKU выросли в продажах больше всего между январём и мартом 2026? Сравни sum_with_vat помесячно."}}],"period":"2026-01-01..2026-03-31"}}
 
+Q: "Сколько тратится на молоко ежемесячно?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Расходы на молоко по месяцам. SELECT year_month, SUM(sum_total) as total FROM mart_purchases WHERE nomenclature_name ILIKE '%молоко%' GROUP BY year_month ORDER BY year_month DESC LIMIT 12"}}],"entities":{{"products":["молоко"]}}}}
+
+Q: "Динамика закупок сахара по месяцам за 2026?"
+A: {{"query_type":"analytics","steps":[{{"source":"1С_ANALYTICS","analytics_type":"custom_sql","keywords":"Закупки сахара помесячно за 2026. SELECT year_month, SUM(quantity) as qty, SUM(sum_total) as rub FROM mart_purchases WHERE nomenclature_name ILIKE '%сахар%' AND year >= 2026 GROUP BY year_month ORDER BY year_month"}}],"entities":{{"products":["сахар"]}},"period":"2026"}}
+
 # Конкретные документы
 Q: "По какой цене покупали муку в последний раз?"
 A: {{"query_type":"search","steps":[{{"source":"1С_SEARCH","keywords":"мука"}}],"entities":{{"products":["мука"]}},"period":"2weeks"}}
